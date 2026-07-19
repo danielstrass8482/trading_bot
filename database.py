@@ -164,6 +164,16 @@ def get_total_pnl(session: Session) -> float:
     return result or 0.0
 
 
+def get_daily_pnl(session: Session) -> float:
+    """Realisierter P&L der heute geschlossenen Trades (für das Daily-Loss-Limit)."""
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    result = session.query(func.sum(Trade.pnl_usd)).filter(
+        Trade.status.in_(["CLOSED_SL", "CLOSED_TP", "CLOSED_MANUAL"]),
+        Trade.closed_at >= today_start
+    ).scalar()
+    return result or 0.0
+
+
 def close_trade(session: Session, trade: Trade, exit_price: float, reason: str) -> Trade:
     """Schließt einen Trade und berechnet P&L."""
     trade.exit_price = exit_price

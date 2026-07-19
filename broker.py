@@ -13,7 +13,7 @@ from config import (
 from database import (
     get_session, Trade, get_open_trades,
     get_daily_trade_count, get_total_capital_in_trades,
-    get_total_pnl, close_trade, BotState
+    get_total_pnl, get_daily_pnl, close_trade, BotState
 )
 from rule_engine import SignalResult
 
@@ -68,13 +68,13 @@ def check_guardrails(signal: SignalResult) -> None:
             )
 
         # 6. Tägliches Verlustlimit
-        total_pnl = get_total_pnl(session)
+        daily_pnl = get_daily_pnl(session)
         daily_loss_limit = MAX_CAPITAL_TOTAL * DAILY_LOSS_LIMIT_PCT
-        if total_pnl < 0 and abs(total_pnl) >= daily_loss_limit:
+        if daily_pnl < 0 and abs(daily_pnl) >= daily_loss_limit:
             BotState.set(session, "bot_paused", "true")
             session.commit()
             raise GuardrailViolation(
-                f"Tägliches Verlustlimit erreicht (${abs(total_pnl):.2f} / ${daily_loss_limit:.2f}). "
+                f"Tägliches Verlustlimit erreicht (${abs(daily_pnl):.2f} / ${daily_loss_limit:.2f}). "
                 f"Bot pausiert automatisch."
             )
 

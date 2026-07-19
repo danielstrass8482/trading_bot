@@ -12,13 +12,14 @@ from config import (
     MAX_CAPITAL_TOTAL, MAX_CAPITAL_PER_TRADE, MAX_TRADES_PER_DAY,
     STOP_LOSS_PCT, TAKE_PROFIT_PCT, MIN_SIGNAL_SCORE,
     VIX_PAUSE_THRESHOLD, TRADING_MODE, LONG_WATCHLIST,
-    ACTIVE_SHORT_INSTRUMENTS
+    ACTIVE_SHORT_INSTRUMENTS, PROFIT_ALERT_TARGET
 )
 from database import (
     init_db, get_session, get_open_trades, get_total_pnl,
     get_daily_trade_count, DailyLog, Trade, BotState
 )
 from rule_engine import analyze_ticker, check_vix
+from broker import get_portfolio_value
 
 # ── PAGE CONFIG ────────────────────────────────────────────────────
 st.set_page_config(
@@ -212,7 +213,7 @@ with tab1:
         realized_pnl = get_total_pnl(session)
         open_trades  = get_open_trades(session)
 
-    portfolio_value = MAX_CAPITAL_TOTAL + realized_pnl
+    portfolio_value = get_portfolio_value()
     pnl_pct = (portfolio_value - MAX_CAPITAL_TOTAL) / MAX_CAPITAL_TOTAL * 100
 
     col1, col2, col3, col4 = st.columns(4)
@@ -242,17 +243,17 @@ with tab1:
         </div>""", unsafe_allow_html=True)
 
     with col4:
-        target_pct = portfolio_value / 1000 * 100
+        target_pct = portfolio_value / PROFIT_ALERT_TARGET * 100
         st.markdown(f"""
         <div class="kpi-card">
-            <div class="kpi-label">Ziel $1.000 (→ Kapital raus)</div>
+            <div class="kpi-label">Ziel ${PROFIT_ALERT_TARGET:,.0f} (→ Kapital raus)</div>
             <div class="kpi-value neutral">{target_pct:.0f}%</div>
             <div class="score-bar-bg"><div class="score-bar-fill" style="width:{min(target_pct,100):.0f}%"></div></div>
         </div>""", unsafe_allow_html=True)
 
     # Profit-Alert
-    if portfolio_value >= 1000:
-        st.success("🎯 **Profit-Ziel erreicht!** Du kannst jetzt $500 entnehmen – dein Startkapital ist draußen.")
+    if portfolio_value >= PROFIT_ALERT_TARGET:
+        st.success(f"🎯 **Profit-Ziel erreicht!** Du kannst jetzt ${MAX_CAPITAL_TOTAL:,.0f} entnehmen – dein Startkapital ist draußen.")
 
     st.markdown("<br>", unsafe_allow_html=True)
 

@@ -44,11 +44,11 @@ class SignalResult:
     sma200:           Optional[float] = None
 
 
-def fetch_market_data(ticker: str, period: str = "6mo") -> Optional[pd.DataFrame]:
+def fetch_market_data(ticker: str, period: str = "1y", min_rows: int = 50) -> Optional[pd.DataFrame]:
     """Lädt historische OHLCV-Daten via yfinance."""
     try:
         df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
-        if df.empty or len(df) < 50:
+        if df.empty or len(df) < min_rows:
             return None
         # Spaltennamen normalisieren (yfinance gibt MultiIndex zurück bei manchen Versionen)
         if isinstance(df.columns, pd.MultiIndex):
@@ -75,7 +75,7 @@ def fetch_fundamentals(ticker: str) -> dict:
 
 def check_vix() -> tuple[float, bool]:
     """Prüft ob VIX unter dem Pausenschwellwert liegt."""
-    df = fetch_market_data("^VIX", period="5d")
+    df = fetch_market_data("^VIX", period="5d", min_rows=1)
     if df is None:
         return 0.0, True  # Im Zweifel: nicht pausieren
     vix = float(df["Close"].iloc[-1])
