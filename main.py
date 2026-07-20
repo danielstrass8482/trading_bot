@@ -98,6 +98,14 @@ def run_bot_cycle():
     if portfolio_value >= PROFIT_ALERT_TARGET:
         print(f"\n🎯 PROFIT-ALERT: Portfolio hat ${PROFIT_ALERT_TARGET:.2f} erreicht!")
         print(f"   → Empfehlung: ${MAX_CAPITAL_TOTAL:.2f} entnehmen (Startkapital zurück)")
+        send_email(
+            subject="🎯 Trading Bot – Profit-Alert",
+            body=(
+                f"Portfolio-Wert: ${portfolio_value:.2f}\n"
+                f"Ziel erreicht: ${PROFIT_ALERT_TARGET:.2f}\n\n"
+                f"Empfehlung: ${MAX_CAPITAL_TOTAL:.2f} entnehmen (Startkapital zurück)."
+            )
+        )
 
     # 3. Positionen überwachen (SL/TP prüfen)
     print(f"\n--- Positions-Check ---")
