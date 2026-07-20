@@ -47,7 +47,15 @@ if DATABASE_URL.startswith("postgres://"):
 # ─────────────────────────────────────────────
 # ALERTS
 # ─────────────────────────────────────────────
-ALERT_EMAIL = os.getenv("ALERT_EMAIL", "")
+ALERT_EMAIL   = os.getenv("ALERT_EMAIL", "")
+
+# SMTP – E-Mail-Versand via smtplib (Standardbibliothek, kein externes Package).
+# Wenn SMTP_HOST/SMTP_USER/SMTP_PASSWORD fehlen, wird nicht versendet,
+# sondern nur in die Logs geschrieben (siehe send_email() in main.py).
+SMTP_HOST     = os.getenv("SMTP_HOST", "")
+SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER     = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 
 # ─────────────────────────────────────────────
 # WATCHLISTS

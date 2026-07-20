@@ -6,18 +6,46 @@ Ablauf: VIX-Check → Watchlist scannen → Guardrails → LLM → Trade
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime
+import smtplib
+from email.mime.text import MIMEText
 import pytz
 
 from config import (
     LONG_WATCHLIST, ACTIVE_SHORT_INSTRUMENTS,
     PROFIT_ALERT_TARGET, MAX_CAPITAL_TOTAL,
-    SCAN_HOUR_ET, SCAN_MINUTE_ET, validate_config
+    SCAN_HOUR_ET, SCAN_MINUTE_ET, validate_config,
+    ALERT_EMAIL, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD
 )
 from database import init_db, get_session, save_daily_snapshot, BotState
 from rule_engine import scan_all_watchlists, check_vix
 from llm_analyst import analyze_with_llm
 from broker import place_trade, monitor_open_positions, get_portfolio_value, GuardrailViolation
 from backlook import run_backlook
+
+
+def send_email(subject: str, body: str):
+    """
+    Verschickt eine E-Mail via smtplib (Standardbibliothek, kein externes Package).
+    Fallback: Ohne ALERT_EMAIL oder SMTP-Zugangsdaten wird nur in die Logs
+    geschrieben – der Bot darf dadurch nie abstürzen.
+    """
+    if not ALERT_EMAIL or not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+        print(f"📧 [E-Mail nicht konfiguriert – nur Log] {subject}\n{body}")
+        return
+
+    try:
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = SMTP_USER
+        msg["To"] = ALERT_EMAIL
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_USER, [ALERT_EMAIL], msg.as_string())
+        print(f"📧 E-Mail versendet: {subject}")
+    except Exception as e:
+        print(f"⚠️  E-Mail-Versand fehlgeschlagen: {e}")
 
 
 def run_bot_cycle():
