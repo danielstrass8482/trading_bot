@@ -141,6 +141,16 @@ def run_bot_cycle():
                 print(f"   ✅ Trade #{trade.id} ausgeführt")
         except GuardrailViolation as gv:
             print(f"   🛡️  Guardrail: {gv}")
+            if "Verlustlimit" in str(gv):
+                send_email(
+                    subject="🛑 Trading Bot – Daily Loss Limit erreicht",
+                    body=(
+                        f"{gv}\n\n"
+                        f"Portfolio-Wert: ${portfolio_value:.2f}\n"
+                        f"Der Bot wurde automatisch pausiert und handelt erst nach "
+                        f"manueller Freigabe wieder."
+                    )
+                )
             break  # Wenn Tageslimit, weitere Trades sinnlos
 
     # 6. Tages-Snapshot speichern
