@@ -32,7 +32,12 @@ LLM_MAX_TOKENS    = 512
 # ─────────────────────────────────────────────
 # DATENBANK
 # ─────────────────────────────────────────────
+# Railway (und Heroku) liefern DATABASE_URL im Format "postgres://...".
+# SQLAlchemy 1.4+/2.0 akzeptiert nur "postgresql://" – daher hier korrigieren.
+# Ohne gesetzte DATABASE_URL läuft lokal weiterhin SQLite als Fallback.
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///trading_bot.db")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 # ─────────────────────────────────────────────
 # ALERTS
