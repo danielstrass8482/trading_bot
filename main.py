@@ -48,6 +48,26 @@ def send_email(subject: str, body: str):
         print(f"⚠️  E-Mail-Versand fehlgeschlagen: {e}")
 
 
+def send_daily_summary(scanned_count: int, executed_trades: list, portfolio_value: float, vix: float):
+    """Verschickt die tägliche Zusammenfassung nach Abschluss eines Bot-Zyklus."""
+    lines = [
+        f"Gescannte Ticker: {scanned_count}",
+        f"Portfolio-Wert: ${portfolio_value:.2f}",
+        f"VIX: {vix:.1f}",
+        "",
+        f"Ausgeführte Trades heute: {len(executed_trades)}",
+    ]
+    for trade in executed_trades:
+        lines.append(
+            f"  - {trade.ticker} | Score: {trade.rule_score}/100 | "
+            f"Entry: ${trade.entry_price:.2f} | SL: ${trade.stop_loss:.2f} | TP: ${trade.take_profit:.2f}"
+        )
+
+    body = "\n".join(lines)
+    subject = f"📊 Trading Bot – Tageszusammenfassung {datetime.now().strftime('%Y-%m-%d')}"
+    send_email(subject, body)
+
+
 def run_bot_cycle():
     """
     Haupt-Bot-Zyklus. Wird täglich zur Marktöffnung ausgeführt.
@@ -91,7 +111,7 @@ def run_bot_cycle():
     print(f"\n✅ {len(approved)} Trade-Signale über Schwellwert:")
 
     # 5. Für jedes freigegebene Signal: LLM + Trade
-    trades_today = 0
+    executed_trades = []
     for signal in approved:
         print(f"\n--- Trade-Kandidat: {signal.ticker} (Score: {signal.score}/100) ---")
 
@@ -109,7 +129,7 @@ def run_bot_cycle():
         try:
             trade = place_trade(signal, llm_result)
             if trade:
-                trades_today += 1
+                executed_trades.append(trade)
                 print(f"   ✅ Trade #{trade.id} ausgeführt")
         except GuardrailViolation as gv:
             print(f"   🛡️  Guardrail: {gv}")
@@ -121,8 +141,11 @@ def run_bot_cycle():
         session.commit()
 
     print(f"\n{'='*60}")
-    print(f"✅ Zyklus abgeschlossen. Heute ausgeführte Trades: {trades_today}")
+    print(f"✅ Zyklus abgeschlossen. Heute ausgeführte Trades: {len(executed_trades)}")
     print(f"{'='*60}\n")
+
+    # 7. Tägliche Zusammenfassung per E-Mail
+    send_daily_summary(len(signals), executed_trades, portfolio_value, vix)
 
 
 def run_monitoring_cycle():
