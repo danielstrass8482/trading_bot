@@ -14,12 +14,17 @@ load_dotenv()
 # ─────────────────────────────────────────────
 ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-TRADING_MODE      = os.getenv("TRADING_MODE", "PAPER")  # "PAPER" oder "LIVE"
+# "PAPER" oder "LIVE" – normalisiert, damit z.B. "paper" oder ein Tippfehler
+# nicht versehentlich als LIVE durchgeht.
+TRADING_MODE      = os.getenv("TRADING_MODE", "PAPER").strip().upper()
 
+# Fail-safe: NUR ein exaktes "LIVE" schaltet auf den Live-Endpoint um.
+# Jeder andere Wert (Tippfehler, leerer String, etc.) bleibt bewusst PAPER –
+# ein Fehler soll nie versehentlich zu echten Live-Orders führen.
 ALPACA_BASE_URL = (
-    "https://paper-api.alpaca.markets"
-    if TRADING_MODE == "PAPER"
-    else "https://api.alpaca.markets"
+    "https://api.alpaca.markets"
+    if TRADING_MODE == "LIVE"
+    else "https://paper-api.alpaca.markets"
 )
 
 # ─────────────────────────────────────────────
@@ -119,6 +124,8 @@ def validate_config() -> list[str]:
     warnings = []
     if not ANTHROPIC_API_KEY:
         warnings.append("ANTHROPIC_API_KEY fehlt – LLM-Analyse deaktiviert (degraded mode)")
+    if TRADING_MODE not in ("PAPER", "LIVE"):
+        warnings.append(f"TRADING_MODE='{TRADING_MODE}' unbekannt – Bot läuft sicherheitshalber im PAPER-Modus")
     if TRADING_MODE == "LIVE" and (not ALPACA_API_KEY or not ALPACA_SECRET_KEY):
         warnings.append("ALPACA Credentials fehlen – Live Trading nicht möglich")
     if sum(SCORE_WEIGHTS.values()) != 100:
