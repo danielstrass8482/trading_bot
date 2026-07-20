@@ -12,7 +12,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from contextlib import contextmanager
 import json
 
-from config import DATABASE_URL
+from config import DATABASE_URL, SCORE_WEIGHTS
 
 Base = declarative_base()
 engine = create_engine(DATABASE_URL, echo=False)
@@ -41,6 +41,7 @@ class Trade(Base):
     llm_sentiment  = Column(Integer, nullable=True)        # 1–10
     llm_summary    = Column(Text, nullable=True)
     llm_risks      = Column(Text, nullable=True)           # JSON-Array als String
+    score_breakdown = Column(Text, nullable=True)          # JSON-Objekt: Kriterium -> {score, max, value}
     status         = Column(String(20), default="OPEN")   # OPEN / CLOSED_SL / CLOSED_TP / CLOSED_MANUAL
     exit_price     = Column(Float, nullable=True)
     closed_at      = Column(DateTime, nullable=True)
@@ -60,6 +61,19 @@ class Trade(Base):
     def set_llm_risks(self, risks: list):
         """Serialisiert Risiken-Liste zu JSON-String."""
         self.llm_risks = json.dumps(risks, ensure_ascii=False)
+
+    def get_score_breakdown(self) -> dict:
+        """Deserialisiert score_breakdown JSON-String zu Dict."""
+        if self.score_breakdown:
+            try:
+                return json.loads(self.score_breakdown)
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
+    def set_score_breakdown(self, breakdown: dict):
+        """Serialisiert Score-Breakdown-Dict zu JSON-String (für den Backlook)."""
+        self.score_breakdown = json.dumps(breakdown, ensure_ascii=False, default=str)
 
     def __repr__(self):
         return f"<Trade {self.ticker} {self.direction} {self.status} PnL={self.pnl_usd}>"
@@ -84,6 +98,34 @@ class BotState(Base):
             row.value = str(value)
         else:
             session.add(BotState(key=key, value=str(value)))
+
+
+class CurrentWeight(Base):
+    """
+    Aktuell aktive Score-Gewichtung pro Kriterium.
+    Startwerte kommen aus config.SCORE_WEIGHTS; der wöchentliche Backlook
+    (siehe backlook.py) darf sie danach minimal anpassen. Liegt in der DB
+    (statt nur in config.py), damit Bot- und Dashboard-Service auf Railway
+    – getrennte Prozesse, gemeinsame Postgres-DB – denselben Stand sehen.
+    """
+    __tablename__ = "current_weights"
+
+    criterion  = Column(String(50), primary_key=True)
+    weight     = Column(Integer, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class WeightHistory(Base):
+    """Protokoll jeder Gewichtungsanpassung durch den wöchentlichen Backlook."""
+    __tablename__ = "weight_history"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    run_at          = Column(DateTime, default=datetime.utcnow)
+    criterion       = Column(String(50), nullable=False)
+    old_weight      = Column(Integer, nullable=False)
+    new_weight      = Column(Integer, nullable=False)
+    change          = Column(Integer, nullable=False)
+    trades_analyzed = Column(Integer, nullable=False)
 
 
 class DailyLog(Base):
@@ -113,6 +155,9 @@ def init_db():
             BotState.set(session, "last_reset_date", str(date.today()))
         if not BotState.get(session, "bot_paused"):
             BotState.set(session, "bot_paused", "false")
+        # Gewichtungen mit config-Defaults seeden, falls noch nicht vorhanden
+        if not session.query(CurrentWeight).first():
+            set_active_weights(session, SCORE_WEIGHTS)
         session.commit()
     print("✅ Datenbank initialisiert.")
 
@@ -182,6 +227,29 @@ def close_trade(session: Session, trade: Trade, exit_price: float, reason: str) 
     trade.pnl_usd    = (exit_price - trade.entry_price) * trade.quantity
     trade.pnl_pct    = (exit_price - trade.entry_price) / trade.entry_price * 100
     return trade
+
+
+def get_active_weights(session: Session) -> dict:
+    """
+    Gibt die aktuell aktiven Score-Gewichtungen zurück.
+    Fällt auf config.SCORE_WEIGHTS zurück falls DB noch nicht geseedet ist.
+    """
+    rows = session.query(CurrentWeight).all()
+    if not rows:
+        return dict(SCORE_WEIGHTS)
+    return {r.criterion: r.weight for r in rows}
+
+
+def set_active_weights(session: Session, weights: dict):
+    """Schreibt neue Gewichtungen in die current_weights Tabelle."""
+    now = datetime.utcnow()
+    for criterion, weight in weights.items():
+        row = session.query(CurrentWeight).filter_by(criterion=criterion).first()
+        if row:
+            row.weight = weight
+            row.updated_at = now
+        else:
+            session.add(CurrentWeight(criterion=criterion, weight=weight, updated_at=now))
 
 
 def save_daily_snapshot(session: Session, portfolio_value: float):

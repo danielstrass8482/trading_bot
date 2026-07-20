@@ -17,6 +17,7 @@ from database import init_db, get_session, save_daily_snapshot, BotState
 from rule_engine import scan_all_watchlists, check_vix
 from llm_analyst import analyze_with_llm
 from broker import place_trade, monitor_open_positions, get_portfolio_value, GuardrailViolation
+from backlook import run_backlook
 
 
 def run_bot_cycle():
@@ -145,8 +146,22 @@ def main():
         name="SL/TP Monitoring"
     )
 
+    # Wöchentlicher Backlook: Montags 06:00 ET, vor dem Haupt-Zyklus (Option A Selbstlern)
+    scheduler.add_job(
+        run_backlook,
+        CronTrigger(
+            hour=6,
+            minute=0,
+            day_of_week="mon",
+            timezone=et_tz
+        ),
+        id="weekly_backlook",
+        name="Wöchentlicher Backlook"
+    )
+
     print(f"⏰ Scheduler aktiv. Bot läuft täglich um {SCAN_HOUR_ET:02d}:{SCAN_MINUTE_ET:02d} ET (Mo–Fr)")
     print(f"📡 Monitoring: alle 30 Min von 09:30–16:00 ET")
+    print(f"📚 Backlook: montags 06:00 ET")
     print(f"🛑 Zum Beenden: Ctrl+C\n")
 
     # Einmalig sofort ausführen beim Start (zum Testen)

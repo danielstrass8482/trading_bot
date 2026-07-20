@@ -13,12 +13,13 @@ import warnings
 warnings.filterwarnings("ignore")
 
 from config import (
-    SCORE_WEIGHTS, RSI_OVERSOLD, RSI_OVERBOUGHT,
+    RSI_OVERSOLD, RSI_OVERBOUGHT,
     VOLUME_FACTOR, PE_MIN, PE_MAX, DE_MAX,
     MIN_SIGNAL_SCORE, VIX_PAUSE_THRESHOLD,
     EARNINGS_BUFFER_DAYS, MAX_5DAY_MOVE_PCT,
     ACTIVE_SHORT_INSTRUMENTS, STOP_LOSS_PCT, TAKE_PROFIT_PCT
 )
+from database import get_session, get_active_weights
 
 
 @dataclass
@@ -111,6 +112,9 @@ def calculate_score(ticker: str, df: pd.DataFrame, fundamentals: dict, is_invers
     Berechnet den Signal-Score (0–100) anhand technischer und fundamentaler Kriterien.
     Gibt SignalResult zurück.
     """
+    with get_session() as session:
+        weights = get_active_weights(session)
+
     breakdown = {}
     current_price = float(df["Close"].iloc[-1])
 
@@ -120,12 +124,12 @@ def calculate_score(ticker: str, df: pd.DataFrame, fundamentals: dict, is_invers
 
     if is_inverse_etf:
         # Für Inverse ETFs: überKAUFTER Markt ist POSITIV (wir wollen fallen sehen)
-        rsi_score = SCORE_WEIGHTS["rsi"] if rsi > RSI_OVERBOUGHT else int(SCORE_WEIGHTS["rsi"] * (rsi / RSI_OVERBOUGHT))
+        rsi_score = weights["rsi"] if rsi > RSI_OVERBOUGHT else int(weights["rsi"] * (rsi / RSI_OVERBOUGHT))
     else:
         # Für normale Aktien: überVERKAUFT ist bullisch
-        rsi_score = SCORE_WEIGHTS["rsi"] if rsi < RSI_OVERSOLD else int(SCORE_WEIGHTS["rsi"] * max(0, (RSI_OVERSOLD - rsi + 20) / 20))
+        rsi_score = weights["rsi"] if rsi < RSI_OVERSOLD else int(weights["rsi"] * max(0, (RSI_OVERSOLD - rsi + 20) / 20))
 
-    breakdown["rsi"] = {"score": rsi_score, "max": SCORE_WEIGHTS["rsi"], "value": round(rsi, 1)}
+    breakdown["rsi"] = {"score": rsi_score, "max": weights["rsi"], "value": round(rsi, 1)}
 
     # ── SMA 50/200 Trend (20 Punkte) ─────────────────────────────────
     sma50  = float(df["Close"].rolling(50).mean().iloc[-1])  if len(df) >= 50  else None
@@ -134,13 +138,13 @@ def calculate_score(ticker: str, df: pd.DataFrame, fundamentals: dict, is_invers
     if sma50 and sma200:
         if is_inverse_etf:
             # Inverse ETF profitiert wenn Markt unter SMA50/200 fällt
-            sma_score = SCORE_WEIGHTS["sma_trend"] if current_price < sma50 < sma200 else int(SCORE_WEIGHTS["sma_trend"] * 0.3)
+            sma_score = weights["sma_trend"] if current_price < sma50 < sma200 else int(weights["sma_trend"] * 0.3)
         else:
-            sma_score = SCORE_WEIGHTS["sma_trend"] if current_price > sma50 > sma200 else int(SCORE_WEIGHTS["sma_trend"] * 0.3)
+            sma_score = weights["sma_trend"] if current_price > sma50 > sma200 else int(weights["sma_trend"] * 0.3)
     else:
-        sma_score = int(SCORE_WEIGHTS["sma_trend"] * 0.5)  # Neutral wenn nicht genug Daten
+        sma_score = int(weights["sma_trend"] * 0.5)  # Neutral wenn nicht genug Daten
 
-    breakdown["sma_trend"] = {"score": sma_score, "max": SCORE_WEIGHTS["sma_trend"],
+    breakdown["sma_trend"] = {"score": sma_score, "max": weights["sma_trend"],
                                "value": {"sma50": round(sma50, 2) if sma50 else None,
                                          "sma200": round(sma200, 2) if sma200 else None}}
 
@@ -148,44 +152,44 @@ def calculate_score(ticker: str, df: pd.DataFrame, fundamentals: dict, is_invers
     vol_20d_avg  = float(df["Volume"].rolling(20).mean().iloc[-1])
     vol_today    = float(df["Volume"].iloc[-1])
     volume_ratio = vol_today / vol_20d_avg if vol_20d_avg > 0 else 1.0
-    vol_score    = SCORE_WEIGHTS["volume"] if volume_ratio >= VOLUME_FACTOR else int(SCORE_WEIGHTS["volume"] * (volume_ratio / VOLUME_FACTOR))
+    vol_score    = weights["volume"] if volume_ratio >= VOLUME_FACTOR else int(weights["volume"] * (volume_ratio / VOLUME_FACTOR))
 
-    breakdown["volume"] = {"score": vol_score, "max": SCORE_WEIGHTS["volume"], "value": round(volume_ratio, 2)}
+    breakdown["volume"] = {"score": vol_score, "max": weights["volume"], "value": round(volume_ratio, 2)}
 
     # ── KGV (15 Punkte) ──────────────────────────────────────────────
     pe = fundamentals.get("pe_ratio")
     if is_inverse_etf or pe is None:
-        pe_score = int(SCORE_WEIGHTS["pe_ratio"] * 0.7)  # Neutral für ETFs
+        pe_score = int(weights["pe_ratio"] * 0.7)  # Neutral für ETFs
     elif PE_MIN <= pe <= PE_MAX:
-        pe_score = SCORE_WEIGHTS["pe_ratio"]
+        pe_score = weights["pe_ratio"]
     elif pe < PE_MIN or pe > PE_MAX * 1.5:
         pe_score = 0
     else:
-        pe_score = int(SCORE_WEIGHTS["pe_ratio"] * 0.4)
+        pe_score = int(weights["pe_ratio"] * 0.4)
 
-    breakdown["pe_ratio"] = {"score": pe_score, "max": SCORE_WEIGHTS["pe_ratio"], "value": round(pe, 1) if pe else None}
+    breakdown["pe_ratio"] = {"score": pe_score, "max": weights["pe_ratio"], "value": round(pe, 1) if pe else None}
 
     # ── Verschuldungsgrad (15 Punkte) ────────────────────────────────
     de = fundamentals.get("debt_to_equity")
     if is_inverse_etf or de is None:
-        de_score = int(SCORE_WEIGHTS["debt_equity"] * 0.7)
+        de_score = int(weights["debt_equity"] * 0.7)
     elif de <= DE_MAX:
-        de_score = SCORE_WEIGHTS["debt_equity"]
+        de_score = weights["debt_equity"]
     else:
         de_score = 0
 
-    breakdown["debt_equity"] = {"score": de_score, "max": SCORE_WEIGHTS["debt_equity"], "value": round(de, 1) if de else None}
+    breakdown["debt_equity"] = {"score": de_score, "max": weights["debt_equity"], "value": round(de, 1) if de else None}
 
     # ── Revenue-Wachstum (10 Punkte) ─────────────────────────────────
     rev_growth = fundamentals.get("revenue_growth")
     if is_inverse_etf or rev_growth is None:
-        rev_score = int(SCORE_WEIGHTS["revenue_growth"] * 0.7)
+        rev_score = int(weights["revenue_growth"] * 0.7)
     elif rev_growth > 0:
-        rev_score = SCORE_WEIGHTS["revenue_growth"]
+        rev_score = weights["revenue_growth"]
     else:
         rev_score = 0
 
-    breakdown["revenue_growth"] = {"score": rev_score, "max": SCORE_WEIGHTS["revenue_growth"],
+    breakdown["revenue_growth"] = {"score": rev_score, "max": weights["revenue_growth"],
                                     "value": f"{rev_growth:.1%}" if rev_growth else None}
 
     # ── Gesamtscore ───────────────────────────────────────────────────
