@@ -16,7 +16,8 @@ from config import (
 )
 from database import (
     init_db, get_session, get_open_trades, get_total_pnl,
-    get_daily_trade_count, DailyLog, Trade, BotState
+    get_daily_trade_count, DailyLog, Trade, BotState,
+    WeightHistory, get_active_weights
 )
 from rule_engine import analyze_ticker, check_vix
 from broker import get_portfolio_value
@@ -201,7 +202,9 @@ with st.sidebar:
 
 
 # ── TABS ──────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Übersicht", "📋 Trade-Log", "🔍 Signal-Analyse", "📈 Performance"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📊 Übersicht", "📋 Trade-Log", "🔍 Signal-Analyse", "📈 Performance", "🧠 Backlook"
+])
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -447,3 +450,61 @@ with tab4:
             col_s3.metric("Trefferquote", f"{len(wins)/total*100:.0f}%" if total else "—")
             total_pnl_sum = sum(t.pnl_usd for t in closed_trades if t.pnl_usd)
             col_s4.metric("Gesamt P&L", f"${total_pnl_sum:.2f}")
+
+
+# ══════════════════════════════════════════════════════════════════
+# TAB 5: BACKLOOK (Wöchentliches Selbstlernen der Score-Gewichtungen)
+# ══════════════════════════════════════════════════════════════════
+with tab5:
+    st.markdown('<div class="section-label">Wöchentlicher Backlook</div>', unsafe_allow_html=True)
+    st.markdown(
+        "Jeden Montag 06:00 ET wertet der Bot die abgeschlossenen Trades der "
+        "letzten Woche aus und passt die Score-Gewichtungen minimal an "
+        "(max. ±2 Punkte pro Kriterium, Summe bleibt immer 100)."
+    )
+
+    with get_session() as session:
+        history = session.query(WeightHistory).order_by(WeightHistory.run_at.asc()).all()
+        current_weights = get_active_weights(session)
+
+    if not history:
+        st.info("Noch kein Backlook-Lauf mit ausreichend Trades (min. 5) protokolliert.")
+        st.markdown("**Aktuelle Gewichtungen (Startwerte aus config.py):**")
+        st.dataframe(
+            pd.DataFrame(
+                [{"Kriterium": k.replace("_", " ").title(), "Gewichtung": v} for k, v in current_weights.items()]
+            ),
+            use_container_width=True, hide_index=True
+        )
+    else:
+        # Letzter Lauf (alle Zeilen mit dem jüngsten run_at)
+        latest_run_at = max(h.run_at for h in history)
+        latest_rows = [h for h in history if h.run_at == latest_run_at]
+
+        st.markdown(f"**Letzte Anpassung:** {latest_run_at.strftime('%d.%m.%Y %H:%M')} UTC "
+                    f"· Basis: {latest_rows[0].trades_analyzed} abgeschlossene Trades")
+
+        table_data = [{
+            "Kriterium": h.criterion.replace("_", " ").title(),
+            "Alte Gewichtung": h.old_weight,
+            "Neue Gewichtung": h.new_weight,
+            "Änderung": f"{h.change:+d}",
+        } for h in sorted(latest_rows, key=lambda h: h.criterion)]
+        st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.markdown("**Gewichtungsentwicklung über Zeit:**")
+
+        chart_df = pd.DataFrame([{
+            "Datum": h.run_at,
+            "Kriterium": h.criterion.replace("_", " ").title(),
+            "Gewichtung": h.new_weight,
+        } for h in history])
+        pivot_df = chart_df.pivot_table(index="Datum", columns="Kriterium", values="Gewichtung", aggfunc="last")
+        st.line_chart(pivot_df)
+
+    st.markdown("---")
+    st.markdown("**Aktuell aktive Gewichtungen:**")
+    active_cols = st.columns(len(current_weights))
+    for col, (criterion, weight) in zip(active_cols, current_weights.items()):
+        col.metric(criterion.replace("_", " ").title(), f"{weight}")
