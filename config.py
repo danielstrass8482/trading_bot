@@ -52,10 +52,17 @@ ALERT_EMAIL   = os.getenv("ALERT_EMAIL", "")
 # SMTP – E-Mail-Versand via smtplib (Standardbibliothek, kein externes Package).
 # Wenn SMTP_HOST/SMTP_USER/SMTP_PASSWORD fehlen, wird nicht versendet,
 # sondern nur in die Logs geschrieben (siehe send_email() in main.py).
-SMTP_HOST     = os.getenv("SMTP_HOST", "")
-SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER     = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_HOST         = os.getenv("SMTP_HOST", "")
+# Railway blockiert Port 587 (STARTTLS) ausgehend. Port 465 (SMTPS/SSL) ist
+# der Default; wird dieser Port ebenfalls blockiert (z.B. bei künftigem
+# Wechsel auf einen eigenen Mailserver mit abweichender Policy), kann
+# SMTP_FALLBACK_PORT auf einen von Railway nicht blockierten Port gesetzt
+# werden (z.B. 2525, unverschlüsseltes SMTP).
+SMTP_PORT         = int(os.getenv("SMTP_PORT", "465"))
+SMTP_FALLBACK_PORT = int(os.getenv("SMTP_FALLBACK_PORT", "2525"))
+SMTP_USER         = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD     = os.getenv("SMTP_PASSWORD", "")
+SMTP_TIMEOUT      = 10
 
 # ─────────────────────────────────────────────
 # WATCHLISTS
