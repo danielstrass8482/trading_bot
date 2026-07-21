@@ -3,7 +3,6 @@ broker.py – Abstraktion für Paper Trading und Live Trading via Alpaca.
 Identische Schnittstelle für beide Modi – nur die URL ändert sich.
 """
 
-import math
 from datetime import datetime
 from config import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL,
@@ -59,15 +58,7 @@ def check_guardrails(signal: SignalResult) -> None:
         if signal.ticker in open_tickers:
             raise GuardrailViolation(f"Position auf {signal.ticker} bereits offen")
 
-        # 5. Max. Kapital pro Trade
-        if signal.current_price > MAX_CAPITAL_PER_TRADE:
-            # Mindestens 1 Aktie kaufen → prüfen ob Preis zu hoch
-            raise GuardrailViolation(
-                f"Aktienpreis ${signal.current_price} überschreitet Max-Kapitallimit "
-                f"${MAX_CAPITAL_PER_TRADE} pro Trade"
-            )
-
-        # 6. Tägliches Verlustlimit
+        # 5. Tägliches Verlustlimit
         daily_pnl = get_daily_pnl(session)
         daily_loss_limit = MAX_CAPITAL_TOTAL * DAILY_LOSS_LIMIT_PCT
         if daily_pnl < 0 and abs(daily_pnl) >= daily_loss_limit:
@@ -79,12 +70,16 @@ def check_guardrails(signal: SignalResult) -> None:
             )
 
 
+MIN_ORDER_USD = 1.00  # Mindestorder bei Fractional Shares (Alpaca-Minimum)
+
+
 def calculate_quantity(price: float, max_capital: float = MAX_CAPITAL_PER_TRADE) -> float:
-    """Berechnet Anzahl der Aktien basierend auf Kapital-Limit."""
-    if price <= 0:
+    """Berechnet Fractional-Share-Menge basierend auf Kapital-Limit.
+    Alpaca akzeptiert Bruchteile (qty als float) – kein math.floor() mehr."""
+    if price <= 0 or max_capital < MIN_ORDER_USD:
         return 0
-    qty = math.floor(max_capital / price)
-    return max(1, qty)  # Mindestens 1 Aktie
+    qty = max_capital / price
+    return round(qty, 6)
 
 
 def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
