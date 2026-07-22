@@ -7,6 +7,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime
 import smtplib
+import base64
 from email.mime.text import MIMEText
 import pytz
 
@@ -23,6 +24,23 @@ from llm_analyst import analyze_with_llm
 from broker import place_trade, monitor_open_positions, get_portfolio_value, GuardrailViolation
 from backlook import run_backlook
 
+
+def _smtp_login_utf8(server, user, password):
+    """
+    AUTH LOGIN von Hand, da smtplib.auth()/login() den Base64-Payload intern
+    mit .encode("ascii") kodiert und damit bei Nicht-ASCII-Zeichen (Umlaute)
+    im Passwort mit UnicodeEncodeError abstuerzt.
+    """
+    server.ehlo()
+    code, resp = server.docmd("AUTH", "LOGIN")
+    if code != 334:
+        raise smtplib.SMTPAuthenticationError(code, resp)
+    code, resp = server.docmd(base64.b64encode(user.encode("utf-8")).decode("ascii"))
+    if code != 334:
+        raise smtplib.SMTPAuthenticationError(code, resp)
+    code, resp = server.docmd(base64.b64encode(password.encode("utf-8")).decode("ascii"))
+    if code not in (235, 503):
+        raise smtplib.SMTPAuthenticationError(code, resp)
 
 def send_email(subject: str, body: str):
     """
@@ -47,14 +65,14 @@ def send_email(subject: str, body: str):
 
     try:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
-            server.login(SMTP_USER, SMTP_PASSWORD)
+            _smtp_login_utf8(server, SMTP_USER, SMTP_PASSWORD)
             server.sendmail(SMTP_USER, [ALERT_EMAIL], msg.as_string())
         print(f"📧 E-Mail versendet: {subject} (Port {SMTP_PORT})")
     except (TimeoutError, OSError) as e:
         print(f"⚠️  SMTP Port {SMTP_PORT} nicht erreichbar ({e}) – Fallback auf Port {SMTP_FALLBACK_PORT}")
         try:
             with smtplib.SMTP(SMTP_HOST, SMTP_FALLBACK_PORT, timeout=SMTP_TIMEOUT) as server:
-                server.login(SMTP_USER, SMTP_PASSWORD)
+                _smtp_login_utf8(server, SMTP_USER, SMTP_PASSWORD)
                 server.sendmail(SMTP_USER, [ALERT_EMAIL], msg.as_string())
             print(f"📧 E-Mail versendet: {subject} (Port {SMTP_FALLBACK_PORT})")
         except Exception as fallback_e:
