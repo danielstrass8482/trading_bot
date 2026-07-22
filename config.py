@@ -86,7 +86,7 @@ ACTIVE_SHORT_INSTRUMENTS = ["SH", "PSQ"]   # Phase 1: 1x ohne Hebel
 # Änderungen erfordern Code-Änderung + Deployment.
 # ─────────────────────────────────────────────
 
-MAX_CAPITAL_TOTAL     = 500.00   # Gesamtkapital in USD (Alpaca arbeitet in USD)
+MAX_CAPITAL_TOTAL     = 475.00   # Gesamtkapital in USD (Alpaca arbeitet in USD)
 MAX_CAPITAL_PER_TRADE = 50.00    # Max. Einsatz pro Trade (10% des Kapitals)
 MAX_OPEN_POSITIONS    = 5        # Max. gleichzeitig offene Positionen
 MAX_TRADES_PER_DAY    = 3        # Max. neue Trades pro Handelstag
