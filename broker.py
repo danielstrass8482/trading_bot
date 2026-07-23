@@ -6,8 +6,7 @@ Identische Schnittstelle für beide Modi – nur die URL ändert sich.
 from datetime import datetime
 from config import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL,
-    TRADING_MODE, MAX_CAPITAL_PER_TRADE, MAX_CAPITAL_TOTAL,
-    MAX_OPEN_POSITIONS, MAX_TRADES_PER_DAY, DAILY_LOSS_LIMIT_PCT
+    TRADING_MODE, get_live_config
 )
 from database import (
     get_session, Trade, get_open_trades,
@@ -38,6 +37,7 @@ def check_guardrails(signal: SignalResult) -> None:
     Wirft GuardrailViolation wenn eine Regel verletzt wird.
     Diese Funktion kann NICHT durch LLM-Output beeinflusst werden.
     """
+    cfg = get_live_config()  # Guardrail-Limits aus DB (mit hardcoded Fallback)
     with get_session() as session:
         # 1. Bot pausiert?
         if BotState.get(session, "bot_paused") == "true":
@@ -45,13 +45,13 @@ def check_guardrails(signal: SignalResult) -> None:
 
         # 2. Tageslimit Trades
         daily_count = get_daily_trade_count(session)
-        if daily_count >= MAX_TRADES_PER_DAY:
-            raise GuardrailViolation(f"Tageslimit erreicht ({daily_count}/{MAX_TRADES_PER_DAY} Trades)")
+        if daily_count >= cfg["MAX_TRADES_PER_DAY"]:
+            raise GuardrailViolation(f"Tageslimit erreicht ({daily_count}/{cfg['MAX_TRADES_PER_DAY']} Trades)")
 
         # 3. Max. offene Positionen
         open_trades = get_open_trades(session)
-        if len(open_trades) >= MAX_OPEN_POSITIONS:
-            raise GuardrailViolation(f"Max. offene Positionen erreicht ({len(open_trades)}/{MAX_OPEN_POSITIONS})")
+        if len(open_trades) >= cfg["MAX_OPEN_POSITIONS"]:
+            raise GuardrailViolation(f"Max. offene Positionen erreicht ({len(open_trades)}/{cfg['MAX_OPEN_POSITIONS']})")
 
         # 4. Doppelter Trade auf gleichen Ticker verhindern
         open_tickers = [t.ticker for t in open_trades]
@@ -60,7 +60,7 @@ def check_guardrails(signal: SignalResult) -> None:
 
         # 5. Tägliches Verlustlimit
         daily_pnl = get_daily_pnl(session)
-        daily_loss_limit = MAX_CAPITAL_TOTAL * DAILY_LOSS_LIMIT_PCT
+        daily_loss_limit = cfg["MAX_CAPITAL_TOTAL"] * cfg["DAILY_LOSS_LIMIT_PCT"]
         if daily_pnl < 0 and abs(daily_pnl) >= daily_loss_limit:
             BotState.set(session, "bot_paused", "true")
             session.commit()
@@ -73,9 +73,12 @@ def check_guardrails(signal: SignalResult) -> None:
 MIN_ORDER_USD = 1.00  # Mindestorder bei Fractional Shares (Alpaca-Minimum)
 
 
-def calculate_quantity(price: float, max_capital: float = MAX_CAPITAL_PER_TRADE) -> float:
+def calculate_quantity(price: float, max_capital: float = None) -> float:
     """Berechnet Fractional-Share-Menge basierend auf Kapital-Limit.
-    Alpaca akzeptiert Bruchteile (qty als float) – kein math.floor() mehr."""
+    Alpaca akzeptiert Bruchteile (qty als float) – kein math.floor() mehr.
+    max_capital=None → aktueller Wert aus der DB-Config (get_live_config)."""
+    if max_capital is None:
+        max_capital = get_live_config()["MAX_CAPITAL_PER_TRADE"]
     if price <= 0 or max_capital < MIN_ORDER_USD:
         return 0
     qty = max_capital / price
@@ -212,5 +215,5 @@ def get_portfolio_value() -> float:
             except Exception:
                 pass  # Unrealisiert ≈ 0 wenn Preis nicht abrufbar
 
-        from config import MAX_CAPITAL_TOTAL
-        return round(MAX_CAPITAL_TOTAL + realized_pnl + unrealized_pnl, 2)
+        max_capital_total = get_live_config()["MAX_CAPITAL_TOTAL"]
+        return round(max_capital_total + realized_pnl + unrealized_pnl, 2)

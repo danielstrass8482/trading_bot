@@ -100,6 +100,38 @@ class BotState(Base):
             session.add(BotState(key=key, value=str(value)))
 
 
+class BotConfig(Base):
+    """
+    Konfigurierbare Bot-Parameter (Guardrails etc.) als Key-Value-Speicher.
+    Liegt in der gemeinsamen Postgres-DB, damit das Dashboard (portfolio_os)
+    diese Werte anzeigen/ändern kann und der Bot sie beim nächsten Zyklus liest.
+    Die hardcoded Konstanten in config.py bleiben als Fail-safe-Fallback bestehen.
+    """
+    __tablename__ = "bot_config"
+
+    key          = Column(String(100), primary_key=True)
+    value        = Column(Text, nullable=False)
+    beschreibung = Column(Text, nullable=True)
+    updated_at   = Column(DateTime, default=datetime.utcnow,
+                          onupdate=datetime.utcnow)
+
+
+# Initiale Werte für bot_config – werden in init_db() nur gesetzt, falls der
+# jeweilige Key noch nicht existiert (Format: key -> (value, beschreibung)).
+DEFAULT_CONFIG = {
+    "MAX_CAPITAL_TOTAL":       ("475.00", "Gesamtkapital in USD"),
+    "MAX_CAPITAL_PER_TRADE":   ("50.00",  "Max. Einsatz pro Trade"),
+    "MAX_OPEN_POSITIONS":      ("5",      "Max. offene Positionen"),
+    "MAX_TRADES_PER_DAY":      ("3",      "Max. Trades pro Tag"),
+    "STOP_LOSS_PCT":           ("0.03",   "Stop Loss %"),
+    "TAKE_PROFIT_PCT":         ("0.06",   "Take Profit %"),
+    "DAILY_LOSS_LIMIT_PCT":    ("0.05",   "Tagesverlust-Limit %"),
+    "MIN_SIGNAL_SCORE":        ("65",     "Minimaler Score"),
+    "VIX_PAUSE_THRESHOLD":     ("30",     "VIX-Limit"),
+    "MONITORING_INTERVAL_MIN": ("15",     "Monitoring-Intervall Minuten"),
+}
+
+
 class CurrentWeight(Base):
     """
     Aktuell aktive Score-Gewichtung pro Kriterium.
@@ -158,6 +190,11 @@ def init_db():
         # Gewichtungen mit config-Defaults seeden, falls noch nicht vorhanden
         if not session.query(CurrentWeight).first():
             set_active_weights(session, SCORE_WEIGHTS)
+        # Bot-Konfiguration mit Defaults seeden – nur fehlende Keys, damit
+        # im Dashboard geänderte Werte bei einem Neustart nicht überschrieben werden.
+        for key, (value, beschreibung) in DEFAULT_CONFIG.items():
+            if not session.query(BotConfig).filter_by(key=key).first():
+                session.add(BotConfig(key=key, value=value, beschreibung=beschreibung))
         session.commit()
     print("✅ Datenbank initialisiert.")
 
@@ -227,6 +264,22 @@ def close_trade(session: Session, trade: Trade, exit_price: float, reason: str) 
     trade.pnl_usd    = (exit_price - trade.entry_price) * trade.quantity
     trade.pnl_pct    = (exit_price - trade.entry_price) / trade.entry_price * 100
     return trade
+
+
+def get_bot_config(session: Session, key: str, default=None):
+    """Liest einen Bot-Parameter aus der bot_config Tabelle (roher String)."""
+    row = session.query(BotConfig).filter_by(key=key).first()
+    return row.value if row else default
+
+
+def set_bot_config(session: Session, key: str, value):
+    """Schreibt/aktualisiert einen Bot-Parameter in der bot_config Tabelle."""
+    row = session.query(BotConfig).filter_by(key=key).first()
+    if row:
+        row.value = str(value)
+        row.updated_at = datetime.utcnow()
+    else:
+        session.add(BotConfig(key=key, value=str(value)))
 
 
 def get_active_weights(session: Session) -> dict:

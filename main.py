@@ -14,7 +14,7 @@ import pytz
 from config import (
     LONG_WATCHLIST, ACTIVE_SHORT_INSTRUMENTS,
     PROFIT_ALERT_TARGET, MAX_CAPITAL_TOTAL,
-    SCAN_HOUR_ET, SCAN_MINUTE_ET, validate_config,
+    SCAN_HOUR_ET, SCAN_MINUTE_ET, validate_config, get_live_config,
     ALERT_EMAIL, SMTP_HOST, SMTP_PORT, SMTP_FALLBACK_PORT,
     SMTP_USER, SMTP_PASSWORD, SMTP_TIMEOUT
 )
@@ -218,6 +218,10 @@ def main():
     # Datenbank initialisieren
     init_db()
 
+    # Monitoring-Intervall dynamisch aus DB lesen (nach init_db, damit
+    # bot_config sicher existiert; Fallback 15 Min via get_live_config).
+    monitoring_interval = get_live_config().get("MONITORING_INTERVAL_MIN", 15)
+
     # Scheduler konfigurieren (Eastern Time)
     et_tz = pytz.timezone("America/New_York")
     scheduler = BlockingScheduler(timezone=et_tz)
@@ -235,12 +239,13 @@ def main():
         name="Täglicher Bot-Zyklus"
     )
 
-    # Monitoring: alle 30 Minuten während Handelszeit (09:30–16:00 ET)
+    # Monitoring: alle N Minuten während Handelszeit (09:30–16:00 ET),
+    # Intervall konfigurierbar via bot_config (MONITORING_INTERVAL_MIN).
     scheduler.add_job(
         run_monitoring_cycle,
         CronTrigger(
             hour="9-16",
-            minute="*/30",
+            minute=f"*/{monitoring_interval}",
             day_of_week="mon-fri",
             timezone=et_tz
         ),
@@ -262,7 +267,7 @@ def main():
     )
 
     print(f"⏰ Scheduler aktiv. Bot läuft täglich um {SCAN_HOUR_ET:02d}:{SCAN_MINUTE_ET:02d} ET (Mo–Fr)")
-    print(f"📡 Monitoring: alle 30 Min von 09:30–16:00 ET")
+    print(f"📡 Monitoring: alle {monitoring_interval} Min von 09:30–16:00 ET")
     print(f"📚 Backlook: montags 06:00 ET")
     print(f"🛑 Zum Beenden: Ctrl+C\n")
 

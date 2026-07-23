@@ -15,9 +15,8 @@ warnings.filterwarnings("ignore")
 from config import (
     RSI_OVERSOLD, RSI_OVERBOUGHT,
     VOLUME_FACTOR, PE_MIN, PE_MAX, DE_MAX,
-    MIN_SIGNAL_SCORE, VIX_PAUSE_THRESHOLD,
     EARNINGS_BUFFER_DAYS, MAX_5DAY_MOVE_PCT,
-    ACTIVE_SHORT_INSTRUMENTS, STOP_LOSS_PCT, TAKE_PROFIT_PCT
+    ACTIVE_SHORT_INSTRUMENTS, get_live_config
 )
 from database import get_session, get_active_weights
 
@@ -94,7 +93,8 @@ def check_vix() -> tuple[float, bool]:
     if df is None:
         return 0.0, True  # Im Zweifel: nicht pausieren
     vix = float(df["Close"].iloc[-1])
-    return vix, vix <= VIX_PAUSE_THRESHOLD
+    threshold = get_live_config()["VIX_PAUSE_THRESHOLD"]
+    return vix, vix <= threshold
 
 
 def check_ko_criteria(ticker: str, df: pd.DataFrame, fundamentals: dict) -> Optional[str]:
@@ -128,6 +128,8 @@ def calculate_score(ticker: str, df: pd.DataFrame, fundamentals: dict, is_invers
     """
     with get_session() as session:
         weights = get_active_weights(session)
+
+    cfg = get_live_config()  # MIN_SIGNAL_SCORE / SL / TP aus DB (mit Fallback)
 
     breakdown = {}
     current_price = float(df["Close"].iloc[-1])
@@ -208,11 +210,11 @@ def calculate_score(ticker: str, df: pd.DataFrame, fundamentals: dict, is_invers
 
     # ── Gesamtscore ───────────────────────────────────────────────────
     total_score = sum(v["score"] for v in breakdown.values())
-    approved    = total_score >= MIN_SIGNAL_SCORE
+    approved    = total_score >= cfg["MIN_SIGNAL_SCORE"]
 
     # Stop Loss & Take Profit
-    stop_loss   = round(current_price * (1 - STOP_LOSS_PCT), 2)
-    take_profit = round(current_price * (1 + TAKE_PROFIT_PCT), 2)
+    stop_loss   = round(current_price * (1 - cfg["STOP_LOSS_PCT"]), 2)
+    take_profit = round(current_price * (1 + cfg["TAKE_PROFIT_PCT"]), 2)
 
     return SignalResult(
         ticker          = ticker,

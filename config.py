@@ -134,6 +134,54 @@ PE_MAX     = 40.0   # Über 40 → zu teuer für Long
 DE_MAX     = 200.0  # Debt-to-Equity über 200% → ausgeschlossen
 
 
+# ─────────────────────────────────────────────
+# LIVE-KONFIGURATION (aus DB, mit hardcoded Fallback)
+# ─────────────────────────────────────────────
+# Diese Parameter dürfen über das Dashboard (portfolio_os) angepasst werden und
+# liegen in der gemeinsamen Postgres-Tabelle bot_config. Der Bot liest sie zu
+# Beginn jedes Zyklus. Die obigen hartkodierten Konstanten bleiben Fail-safe:
+# Ist die DB nicht erreichbar oder ein Wert ungültig, gilt weiterhin der sichere
+# Default – ein DB-Ausfall kann also niemals die Guardrails aushebeln.
+
+# Erwartete Typen der (als Text gespeicherten) DB-Werte + Fallback-Konstante.
+_LIVE_CONFIG_SPEC = {
+    "MAX_CAPITAL_TOTAL":       (float, MAX_CAPITAL_TOTAL),
+    "MAX_CAPITAL_PER_TRADE":   (float, MAX_CAPITAL_PER_TRADE),
+    "MAX_OPEN_POSITIONS":      (int,   MAX_OPEN_POSITIONS),
+    "MAX_TRADES_PER_DAY":      (int,   MAX_TRADES_PER_DAY),
+    "STOP_LOSS_PCT":           (float, STOP_LOSS_PCT),
+    "TAKE_PROFIT_PCT":         (float, TAKE_PROFIT_PCT),
+    "DAILY_LOSS_LIMIT_PCT":    (float, DAILY_LOSS_LIMIT_PCT),
+    "MIN_SIGNAL_SCORE":        (int,   MIN_SIGNAL_SCORE),
+    "VIX_PAUSE_THRESHOLD":     (float, VIX_PAUSE_THRESHOLD),
+    "MONITORING_INTERVAL_MIN": (int,   15),
+}
+
+
+def get_live_config() -> dict:
+    """
+    Lädt alle konfigurierbaren Bot-Parameter aus der DB (Tabelle bot_config)
+    mit hardcoded Fallback. Rückgabe: dict key -> typisierter Wert.
+
+    Import von database erfolgt bewusst lazy (innerhalb der Funktion), da
+    database.py seinerseits config.py importiert (Zirkelimport-Vermeidung).
+    """
+    cfg = {key: fallback for key, (_cast, fallback) in _LIVE_CONFIG_SPEC.items()}
+    try:
+        from database import get_session, get_bot_config
+        with get_session() as session:
+            for key, (cast, _fallback) in _LIVE_CONFIG_SPEC.items():
+                raw = get_bot_config(session, key)
+                if raw is not None:
+                    try:
+                        cfg[key] = cast(raw)
+                    except (ValueError, TypeError):
+                        pass  # ungültiger DB-Wert → Fallback behalten
+    except Exception:
+        pass  # DB nicht erreichbar → komplett Fallback (Fail-safe)
+    return cfg
+
+
 def validate_config() -> list[str]:
     """Prüft ob kritische Konfiguration vorhanden ist. Gibt Liste mit Warnings zurück."""
     warnings = []
