@@ -22,6 +22,18 @@ from config import (
 from database import get_session, get_active_weights
 
 
+# Branchen-Blacklist: Ticker aus diesen Sektoren/Industrien werden vor der
+# Score-Berechnung blockiert (BLOCKED, Score 0).
+BLACKLIST_MAPPING = {
+    "waffen": ["Aerospace & Defense"],
+    "tabak": ["Tobacco"],
+    "fossil": ["Oil & Gas", "Coal", "Energy"],
+    "pharma": ["Pharmaceuticals", "Drug Manufacturers"],
+    "gluecksspiel": ["Gambling", "Casinos"],
+    "krypto": ["Cryptocurrency"],
+}
+
+
 @dataclass
 class SignalResult:
     """Ergebnis der Rule-Engine-Analyse für einen Ticker."""
@@ -69,6 +81,8 @@ def fetch_fundamentals(ticker: str) -> dict:
             "debt_to_equity": info.get("debtToEquity"),
             "revenue_growth": info.get("revenueGrowth"),   # YoY als Dezimalzahl (0.12 = 12%)
             "earnings_date":  info.get("earningsTimestamp"),
+            "sector":         info.get("sector"),
+            "industry":       info.get("industry"),
         }
     except Exception:
         return {}
@@ -238,6 +252,18 @@ def analyze_ticker(ticker: str) -> SignalResult:
 
     # Fundamentaldaten (nicht für Inverse ETFs relevant)
     fundamentals = {} if is_inverse_etf else fetch_fundamentals(ticker)
+
+    # Branchen-Blacklist prüfen (vor der Score-Berechnung)
+    sector = fundamentals.get("sector", "") or ""
+    industry = fundamentals.get("industry", "") or ""
+    for blacklist_key, sectors in BLACKLIST_MAPPING.items():
+        if any(s.lower() in sector.lower() or s.lower() in industry.lower()
+               for s in sectors):
+            return SignalResult(
+                ticker=ticker, score=0, direction="BLOCKED",
+                instrument_type="STOCK", approved=False,
+                ko_reason=f"Blacklist: {blacklist_key}",
+            )
 
     # KO-Kriterien prüfen
     ko = check_ko_criteria(ticker, df, fundamentals)
