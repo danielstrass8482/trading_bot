@@ -105,16 +105,16 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
             print("❌ Live Trade abgebrochen: Alpaca nicht verfügbar")
             return None
         try:
-            # Market Order mit Stop Loss und Take Profit als Bracket Order
+            # Simple Market Order (fractional shares).
+            # Alpaca erlaubt bei Fractional Shares KEINE Bracket-/Stop-Orders
+            # ("fractional orders must be simple orders"). SL/TP werden daher
+            # softwareseitig durch monitor_open_positions() ueberwacht (alle 30 Min).
             client.submit_order(
                 symbol=signal.ticker,
                 qty=quantity,
                 side="buy",
                 type="market",
                 time_in_force="day",
-                order_class="bracket",
-                stop_loss={"stop_price": signal.stop_loss},
-                take_profit={"limit_price": signal.take_profit}
             )
             print(f"✅ LIVE Order platziert: {quantity}x {signal.ticker}")
         except Exception as e:
