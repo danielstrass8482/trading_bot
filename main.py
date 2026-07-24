@@ -6,6 +6,7 @@ Ablauf: VIX-Check → Watchlist scannen → Guardrails → LLM → Trade
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime
+import math
 import smtplib
 import base64
 from email.mime.text import MIMEText
@@ -209,6 +210,38 @@ def log_scan_results(signals: list, slot_et: str, executed_trades: dict, guardra
         session.commit()
 
 
+def get_trades_for_slot(slot: EntryTimeSlot, daily_count: int, config: dict) -> int:
+    """
+    Dynamische Slot-Verteilung (ersetzt festes "Konservatives Frühbudget"-Cap):
+    das verbleibende Tagesbudget wird gleichmäßig (aufgerundet) auf die noch
+    verbleibenden aktiven Slots ab diesem Slot verteilt, statt frühen Slots
+    das gesamte Restbudget zu überlassen. slot.max_trades_per_slot bleibt als
+    optionale Obergrenze bestehen.
+    """
+    max_trades_today = int(config.get("MAX_TRADES_PER_DAY", 5))
+    restbudget = max_trades_today - daily_count
+
+    if restbudget <= 0:
+        return 0
+
+    with get_session() as session:
+        remaining_slots = session.query(EntryTimeSlot).filter(
+            EntryTimeSlot.aktiv == True,
+            EntryTimeSlot.stunde_et * 60 + EntryTimeSlot.minute_et >=
+            slot.stunde_et * 60 + slot.minute_et
+        ).count()
+
+    if remaining_slots <= 0:
+        return restbudget
+
+    trades_this_slot = math.ceil(restbudget / remaining_slots)
+
+    if slot.max_trades_per_slot is not None:
+        trades_this_slot = min(trades_this_slot, slot.max_trades_per_slot)
+
+    return trades_this_slot
+
+
 def run_entry_cycle(slot: EntryTimeSlot):
     """
     Entry-Zyklus für einen einzelnen Zeitslot (siehe entry_time_slots /
@@ -251,19 +284,16 @@ def run_entry_cycle(slot: EntryTimeSlot):
             )
         )
 
-    # 3. Budget für diesen Slot bestimmen (siehe Fix 1 "Konservatives Frühbudget":
-    # frühe Slots haben ein hartes max_trades_per_slot-Limit, spätere Slots
-    # dürfen das noch verbleibende Tagesbudget voll ausschöpfen).
+    # 3. Budget für diesen Slot bestimmen: das Restbudget des Tages wird
+    # dynamisch auf die verbleibenden aktiven Slots verteilt statt frühen
+    # Slots das gesamte Restbudget zu überlassen (siehe get_trades_for_slot).
     with get_session() as session:
         config = get_live_config()
         max_trades_today = int(config.get("MAX_TRADES_PER_DAY", 5))
         trades_heute = get_daily_trade_count(session)
         restbudget = max_trades_today - trades_heute
 
-        if slot.max_trades_per_slot is not None:
-            erlaubt = min(slot.max_trades_per_slot, restbudget)
-        else:
-            erlaubt = restbudget  # Restbudget ausschöpfen
+    erlaubt = get_trades_for_slot(slot, trades_heute, config)
 
     print(f"🎯 Slot-Budget: {erlaubt} Trade(s) (Cap {slot.max_trades_per_slot}, Restbudget {restbudget}/{max_trades_today})")
     if erlaubt <= 0:

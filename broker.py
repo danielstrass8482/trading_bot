@@ -97,9 +97,29 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
     check_guardrails(signal)  # Wirft GuardrailViolation bei Verstoß
 
     quantity = calculate_quantity(signal.current_price)
+
+    # Ganze Aktie möglich → broker-seitige Bracket-Order (echter SL/TP-Schutz
+    # auch über Nacht/Wochenende). Bruchteil → weiterhin Simple Order, da
+    # Alpaca bei Fractional Shares KEINE Bracket-/Stop-Orders erlaubt
+    # ("fractional orders must be simple orders") – SL/TP dafür weiterhin nur
+    # softwareseitig via monitor_open_positions() (alle 30 Min, siehe unten).
+    is_whole_share = quantity >= 1.0
+    if is_whole_share:
+        quantity = float(int(quantity))
+
     capital_used = round(quantity * signal.current_price, 2)
 
     print(f"📋 Trade-Parameter: {quantity}x {signal.ticker} @ ${signal.current_price} = ${capital_used}")
+
+    # signal.stop_loss/take_profit sind bereits mit den (DB-konfigurierbaren,
+    # siehe get_live_config) STOP_LOSS_PCT/TAKE_PROFIT_PCT berechnet (siehe
+    # rule_engine.py) – für die Bracket-Order dieselben Werte verwenden statt
+    # sie hier erneut aus config.py zu berechnen, sonst könnten broker-seitiger
+    # SL/TP und der in der DB geloggte SL/TP (den z.B. das Dashboard anzeigt)
+    # auseinanderlaufen, falls STOP_LOSS_PCT/TAKE_PROFIT_PCT per bot_config
+    # überschrieben wurden.
+    sl_price = signal.stop_loss
+    tp_price = signal.take_profit
 
     # ── LIVE TRADING via Alpaca ─────────────────────────────────────
     if TRADING_MODE == "LIVE":
@@ -108,25 +128,37 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
             print("❌ Live Trade abgebrochen: Alpaca nicht verfügbar")
             return None
         try:
-            # Simple Market Order (fractional shares).
-            # Alpaca erlaubt bei Fractional Shares KEINE Bracket-/Stop-Orders
-            # ("fractional orders must be simple orders"). SL/TP werden daher
-            # softwareseitig durch monitor_open_positions() ueberwacht (alle 30 Min).
-            client.submit_order(
-                symbol=signal.ticker,
-                qty=quantity,
-                side="buy",
-                type="market",
-                time_in_force="day",
-            )
-            print(f"✅ LIVE Order platziert: {quantity}x {signal.ticker}")
+            if is_whole_share:
+                client.submit_order(
+                    symbol=signal.ticker,
+                    qty=int(quantity),
+                    side="buy",
+                    type="market",
+                    time_in_force="day",
+                    order_class="bracket",
+                    stop_loss={"stop_price": sl_price},
+                    take_profit={"limit_price": tp_price},
+                )
+                print(f"✅ LIVE Bracket-Order platziert: {int(quantity)}x {signal.ticker} SL: ${sl_price} TP: ${tp_price}")
+            else:
+                client.submit_order(
+                    symbol=signal.ticker,
+                    qty=quantity,
+                    side="buy",
+                    type="market",
+                    time_in_force="day",
+                )
+                print(f"✅ LIVE Order platziert: {quantity}x {signal.ticker} (Software-Monitor SL/TP)")
         except Exception as e:
             print(f"❌ Alpaca Order fehlgeschlagen: {e}")
             return None
 
     # ── PAPER TRADING (Simulation) ──────────────────────────────────
     else:
-        print(f"📄 PAPER Trade simuliert: {quantity}x {signal.ticker} @ ${signal.current_price}")
+        if is_whole_share:
+            print(f"📄 PAPER Bracket-Trade simuliert: {int(quantity)}x {signal.ticker} @ ${signal.current_price} SL: ${sl_price} TP: ${tp_price}")
+        else:
+            print(f"📄 PAPER Trade simuliert: {quantity}x {signal.ticker} @ ${signal.current_price}")
 
     # ── In Datenbank loggen (beide Modi) ───────────────────────────
     import json as _json

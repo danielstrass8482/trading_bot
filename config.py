@@ -70,15 +70,48 @@ SMTP_TIMEOUT      = 10
 
 # Bullische Kandidaten – Bot kauft LONG wenn Score ≥ MIN_SIGNAL_SCORE
 LONG_WATCHLIST = [
+    # Aktuelle Positionen
     "AAPL", "MSFT", "GOOGL", "AMZN", "META",
-    "NVDA", "JPM", "JNJ", "V", "UNH",
-    "HD", "PG", "MA", "XOM", "BAC",
+    "NVDA", "JPM", "V", "UNH", "HD",
+    "PG", "MA", "BAC",
+
+    # Tech & Wachstum
+    "TSLA", "NFLX", "ADBE", "CRM", "ORCL",
+    "AMD", "INTC", "QCOM", "TXN", "AMAT",
+    "NOW", "SNOW", "UBER", "ABNB",
+
+    # Finanzen
+    "GS", "MS", "BLK", "AXP", "WFC",
+    "C", "USB", "PNC", "TFC", "COF",
+
+    # Gesundheit (non-Pharma)
+    "ABT", "MDT", "SYK", "BSX", "EW",
+    "ISRG", "ZBH", "BDX",
+
+    # Dividendentitel & Stabile Werte
+    "KO", "PEP", "MCD", "SBUX", "YUM",
+    "WMT", "TGT", "COST", "DG", "DLTR",
+    "T", "VZ", "TMUS",
+
+    # Energie (non-Fossil)
+    "NEE", "DUK", "SO", "AEP", "EXC",
+
+    # Immobilien ETFs
+    "VNQ", "O", "SPG", "PLD", "AMT",
+
+    # Industrie & Materialien
+    "CAT", "DE", "HON", "MMM", "GE",
+    "RTX", "NOC",
+
+    # Konsumgüter
+    "NKE", "LULU", "TJX", "ROST",
 ]
 
 # Bärische Instrumente – Bot kauft LONG auf Inverse ETF wenn Markt bärisch
-# Kein Short Selling, kein Margin-Konto nötig
-ACTIVE_SHORT_INSTRUMENTS = ["SH", "PSQ"]   # Phase 1: 1x ohne Hebel
-# Phase 2 (nach Validierung): ["SH", "PSQ", "SDS"]
+# Kein Short Selling, kein Margin-Konto nötig. SDS/SQQQ/SPXS sind gehebelte
+# Inverse-ETFs (2x/3x) – entsprechend höhere Volatilität pro eingesetztem
+# Dollar als SH/PSQ (1x), bewusst mit dem User abgestimmt (2026-07-24).
+ACTIVE_SHORT_INSTRUMENTS = ["SH", "PSQ", "SDS", "SQQQ", "SPXS"]
 
 # ─────────────────────────────────────────────
 # HARTKODIERTE GUARDRAILS (Emotionsbremse)
