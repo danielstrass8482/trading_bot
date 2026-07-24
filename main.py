@@ -24,7 +24,7 @@ from database import (
 )
 from rule_engine import scan_all_watchlists, check_vix
 from llm_analyst import analyze_with_llm
-from broker import place_trade, monitor_open_positions, get_portfolio_value, GuardrailViolation
+from broker import place_trade, monitor_open_positions, get_portfolio_value, check_guardrails, GuardrailViolation
 from backlook import run_backlook
 
 
@@ -104,12 +104,16 @@ def send_daily_summary(scanned_count: int, executed_trades: list, portfolio_valu
     send_email(subject, body)
 
 
-def log_scan_results(signals: list, slot_et: str, executed_trades: dict):
+def log_scan_results(signals: list, slot_et: str, executed_trades: dict, guardrail_reasons: dict = None):
     """
     Loggt jedes Scan-Ergebnis (auch nicht ausgeführte Ticker) in scan_log,
     damit im Dashboard nachvollziehbar ist, warum ein Ticker gehandelt wurde
     oder nicht (siehe Feature Scan-Log). executed_trades: Ticker -> Trade-ID.
+    guardrail_reasons: Ticker -> Grund (siehe run_entry_cycle), None falls kein
+    Guardrail griff (KO'd oder unter Schwellwert liegende Ticker erreichen die
+    Guardrail-Prüfung ohnehin nie).
     """
+    guardrail_reasons = guardrail_reasons or {}
     scan_time = datetime.utcnow()
     with get_session() as session:
         for signal in signals:
@@ -132,7 +136,7 @@ def log_scan_results(signals: list, slot_et: str, executed_trades: dict):
                 de_score     = breakdown.get("debt_equity", {}).get("score"),
                 rev_score    = breakdown.get("revenue_growth", {}).get("score"),
                 ko_reason    = signal.ko_reason,
-                guardrail_reason = None,  # wird später gesetzt
+                guardrail_reason = guardrail_reasons.get(signal.ticker),
                 trade_executed = trade_id is not None,
                 trade_id     = trade_id,
                 mode         = TRADING_MODE,
@@ -211,10 +215,32 @@ def run_entry_cycle(slot: EntryTimeSlot):
 
     # 5. Für jedes freigegebene Signal (bis zum Slot-Kontingent): LLM + Trade
     executed_trades = []
+    guardrail_reasons = {}
+
+    # Guardrail-Grund für JEDES freigegebene Signal separat ermitteln – rein
+    # informativ fürs Scan-Log (siehe Feature Scan-Log), beeinflusst NICHT
+    # welche Trades unten tatsächlich versucht werden. Nötig, weil die
+    # eigentliche Trade-Schleife nach dem ersten Verstoß abbricht (siehe
+    # stopped_early unten) und sonst nachfolgende Ticker ohne Grund blieben.
     for signal in approved:
+        try:
+            check_guardrails(signal)
+        except GuardrailViolation as gv:
+            guardrail_reasons[signal.ticker] = str(gv)
+
+    stopped_early = False
+    for signal in approved:
+        if stopped_early:
+            guardrail_reasons.setdefault(signal.ticker, "Zyklus vorzeitig gestoppt (vorheriger Guardrail-Verstoß)")
+            continue
+
         if len(executed_trades) >= erlaubt:
+            guardrail_reasons.setdefault(
+                signal.ticker, f"Slot-Cap erreicht ({len(executed_trades)}/{erlaubt} für diesen Slot)"
+            )
             print(f"⏭️  Slot-Budget ({erlaubt}) erreicht – weitere Signale übersprungen.")
-            break
+            stopped_early = True
+            continue
 
         print(f"\n--- Trade-Kandidat: {signal.ticker} (Score: {signal.score}/100) ---")
 
@@ -235,6 +261,7 @@ def run_entry_cycle(slot: EntryTimeSlot):
                 executed_trades.append(trade)
                 print(f"   ✅ Trade #{trade.id} ausgeführt")
         except GuardrailViolation as gv:
+            guardrail_reasons[signal.ticker] = str(gv)
             print(f"   🛡️  Guardrail: {gv}")
             if "Verlustlimit" in str(gv):
                 send_email(
@@ -246,12 +273,12 @@ def run_entry_cycle(slot: EntryTimeSlot):
                         f"manueller Freigabe wieder."
                     )
                 )
-            break  # Wenn Tageslimit, weitere Trades sinnlos
+            stopped_early = True  # Wenn Tageslimit, weitere Trades sinnlos
 
     # 6. Scan-Ergebnisse loggen (auch nicht ausgeführte Ticker, siehe Feature Scan-Log)
     executed_trades_by_ticker = {t.ticker: t.id for t in executed_trades}
     slot_label = f"{slot.stunde_et:02d}:{slot.minute_et:02d}"
-    log_scan_results(signals, slot_label, executed_trades_by_ticker)
+    log_scan_results(signals, slot_label, executed_trades_by_ticker, guardrail_reasons)
 
     # 7. Tages-Snapshot speichern
     with get_session() as session:
