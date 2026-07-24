@@ -5,6 +5,7 @@ Zeigt Portfolio, offene Positionen, Trade-Log und Bot-Controls.
 
 import streamlit as st
 import pandas as pd
+import yfinance as yf
 from datetime import datetime, date
 import json
 
@@ -12,7 +13,7 @@ from config import (
     MAX_CAPITAL_TOTAL, MAX_CAPITAL_PER_TRADE, MAX_TRADES_PER_DAY,
     STOP_LOSS_PCT, TAKE_PROFIT_PCT, MIN_SIGNAL_SCORE,
     VIX_PAUSE_THRESHOLD, TRADING_MODE, LONG_WATCHLIST,
-    ACTIVE_SHORT_INSTRUMENTS, PROFIT_ALERT_TARGET
+    ACTIVE_SHORT_INSTRUMENTS, PROFIT_ALERT_TARGET, get_live_config
 )
 from database import (
     init_db, get_session, get_open_trades, get_total_pnl,
@@ -162,10 +163,13 @@ with st.sidebar:
         open_count   = len(get_open_trades(session))
         bot_paused   = BotState.get(session, "bot_paused") == "true"
 
-    # Trade-Limit
-    trade_pct = daily_count / MAX_TRADES_PER_DAY
+    # Trade-Limit – Y kommt live aus bot_config (Dashboard-Änderungen greifen
+    # sofort, kein Neustart nötig), Fallback ist der hardcoded MAX_TRADES_PER_DAY.
+    live_cfg = get_live_config()
+    max_trades = live_cfg.get("MAX_TRADES_PER_DAY", MAX_TRADES_PER_DAY)
+    trade_pct = daily_count / max_trades
     cls = "guardrail-ok" if trade_pct < 0.8 else ("guardrail-warn" if trade_pct < 1.0 else "guardrail-block")
-    st.markdown(f'<p class="{cls}">Trades heute: {daily_count}/{MAX_TRADES_PER_DAY}</p>', unsafe_allow_html=True)
+    st.markdown(f'<p class="{cls}">Trades heute: {daily_count}/{max_trades}</p>', unsafe_allow_html=True)
 
     # Offene Positionen
     pos_pct = open_count / 5
@@ -284,11 +288,32 @@ with tab1:
             st.markdown('<p style="color:#6b7280; font-size:0.9rem">Keine offenen Positionen.</p>', unsafe_allow_html=True)
         else:
             for t in open_trades:
-                col_a, col_b, col_c, col_d = st.columns([2, 1, 1, 1])
-                col_a.markdown(f"**{t.ticker}** {mode_badge(t.mode)}", unsafe_allow_html=True)
-                col_b.markdown(f"Entry: `${t.entry_price:.2f}`")
-                col_c.markdown(f"SL: `${t.stop_loss:.2f}`")
-                col_d.markdown(f"TP: `${t.take_profit:.2f}`")
+                try:
+                    current_price = float(yf.Ticker(t.ticker).fast_info.get("lastPrice", t.entry_price))
+                except Exception:
+                    current_price = t.entry_price
+
+                unrealized_pnl = (current_price - t.entry_price) * t.quantity
+                unrealized_pct = (
+                    (current_price - t.entry_price) / t.entry_price * 100
+                    if t.entry_price else 0.0
+                )
+                pnl_color = "positive" if unrealized_pnl >= 0 else "negative"
+                sign = "+" if unrealized_pnl >= 0 else ""
+
+                st.markdown(f"""
+                <div style="margin-bottom:0.9rem">
+                    <div><strong>{t.ticker}</strong> {mode_badge(t.mode)}</div>
+                    <div style="color:#9ca3af; font-size:0.85rem; margin-top:0.15rem">
+                        Entry: <code>${t.entry_price:.2f}</code> ·
+                        Aktuell: <code>${current_price:.2f}</code> ·
+                        SL: <code>${t.stop_loss:.2f}</code> ·
+                        TP: <code>${t.take_profit:.2f}</code>
+                    </div>
+                    <div class="kpi-value {pnl_color}" style="font-size:1rem; margin-top:0.15rem">
+                        G/V: {sign}${unrealized_pnl:.2f} ({sign}{unrealized_pct:.1f}%)
+                    </div>
+                </div>""", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════
