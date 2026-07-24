@@ -10,6 +10,7 @@ import smtplib
 import base64
 from email.mime.text import MIMEText
 import pytz
+from sqlalchemy import text
 
 from config import (
     LONG_WATCHLIST, ACTIVE_SHORT_INSTRUMENTS,
@@ -84,24 +85,87 @@ def send_email(subject: str, body: str):
         print(f"⚠️  E-Mail-Versand fehlgeschlagen: {e}")
 
 
-def send_daily_summary(scanned_count: int, executed_trades: list, portfolio_value: float, vix: float):
-    """Verschickt die tägliche Zusammenfassung nach Abschluss eines Bot-Zyklus."""
-    lines = [
-        f"Gescannte Ticker: {scanned_count}",
-        f"Portfolio-Wert: ${portfolio_value:.2f}",
-        f"VIX: {vix:.1f}",
-        "",
-        f"Ausgeführte Trades heute: {len(executed_trades)}",
-    ]
-    for trade in executed_trades:
-        lines.append(
-            f"  - {trade.ticker} | Score: {trade.rule_score}/100 | "
-            f"Entry: ${trade.entry_price:.2f} | SL: ${trade.stop_loss:.2f} | TP: ${trade.take_profit:.2f}"
-        )
+def is_last_slot_of_day(current_slot: EntryTimeSlot) -> bool:
+    """
+    Prüft ob current_slot der zeitlich letzte AKTIVE Einstiegszeitpunkt des
+    Tages ist – steuert, wann send_daily_summary_email() feuert (siehe FIX 7:
+    Tages-Mail nach dem letzten Slot statt zu einer festen Uhrzeit).
+    """
+    with get_session() as session:
+        active_slots = session.query(EntryTimeSlot).filter_by(aktiv=True).order_by(
+            EntryTimeSlot.stunde_et.desc(), EntryTimeSlot.minute_et.desc()
+        ).all()
+    if not active_slots:
+        return True
+    last = active_slots[0]
+    return current_slot.stunde_et == last.stunde_et and current_slot.minute_et == last.minute_et
 
-    body = "\n".join(lines)
-    subject = f"📊 Trading Bot – Tageszusammenfassung {datetime.now().strftime('%Y-%m-%d')}"
+
+def send_daily_summary_email():
+    """
+    Verschickt EINE Tages-Zusammenfassung nach dem letzten aktiven Entry-Slot
+    des Tages (siehe FIX 7) – ersetzt die frühere Pro-Slot-Mail (die nur bei
+    tatsächlich ausgeführten Trades verschickt wurde), damit auch tradefreie
+    Tage einen vollständigen Scan-Überblick per E-Mail bekommen.
+    """
+    et_tz = pytz.timezone("America/New_York")
+    today = datetime.now(et_tz).date()
+
+    with get_session() as session:
+        slots_heute = session.execute(text("""
+            SELECT slot_et,
+                   COUNT(*) as gescannt,
+                   SUM(CASE WHEN score >= 65 THEN 1 ELSE 0 END) as ueber_65,
+                   SUM(CASE WHEN trade_executed THEN 1 ELSE 0 END) as trades,
+                   ROUND(AVG(score)::numeric, 1) as avg_score
+            FROM scan_log
+            WHERE DATE(scan_time AT TIME ZONE 'America/New_York') = :today
+              AND score > 0
+            GROUP BY slot_et
+            ORDER BY slot_et
+        """), {"today": today}).fetchall()
+
+        open_trades = session.execute(text("""
+            SELECT ticker, entry_price, quantity, capital_used
+            FROM trades WHERE status = 'OPEN'
+        """)).fetchall()
+
+    portfolio_value = get_portfolio_value()
+
+    subject = f"📊 Trading Bot – Tageszusammenfassung {today.strftime('%d.%m.%Y')}"
+
+    body = f"""Trading Bot – Tageszusammenfassung {today.strftime('%d.%m.%Y')}
+{'='*50}
+
+PORTFOLIO
+Portfolio-Wert: ${portfolio_value:.2f}
+
+SCAN-ÜBERSICHT
+"""
+    for slot in slots_heute:
+        body += f"""
+Slot {slot.slot_et} ET:
+  Gescannt: {slot.gescannt} Ticker
+  Über Schwellwert (≥65): {slot.ueber_65}
+  Trades ausgeführt: {slot.trades}
+  Ø Score: {slot.avg_score}
+"""
+
+    trades_heute = sum(s.trades for s in slots_heute)
+    body += f"""
+GESAMT HEUTE
+Trades ausgeführt: {trades_heute}
+
+OFFENE POSITIONEN
+"""
+    if open_trades:
+        for t in open_trades:
+            body += f"  {t.ticker}: {t.quantity:.4f} Stück @ ${t.entry_price:.2f}\n"
+    else:
+        body += "  Keine offenen Positionen\n"
+
     send_email(subject, body)
+    print(f"✅ Tages-E-Mail gesendet ({len(slots_heute)} Slots)")
 
 
 def log_scan_results(signals: list, slot_et: str, executed_trades: dict, guardrail_reasons: dict = None):
@@ -289,9 +353,10 @@ def run_entry_cycle(slot: EntryTimeSlot):
     print(f"✅ Entry-Zyklus abgeschlossen. Trades in diesem Slot: {len(executed_trades)}")
     print(f"{'='*60}\n")
 
-    # 8. Zusammenfassung per E-Mail (nur wenn in diesem Slot tatsächlich gehandelt wurde)
-    if executed_trades:
-        send_daily_summary(len(signals), executed_trades, portfolio_value, vix)
+    # 8. Tages-Zusammenfassung per E-Mail nach dem letzten aktiven Slot des Tages
+    # (nicht mehr pro Slot bei Trades, siehe FIX 7) – deckt den ganzen Handelstag ab.
+    if is_last_slot_of_day(slot):
+        send_daily_summary_email()
 
 
 def schedule_entry_jobs(scheduler: BlockingScheduler, et_tz):
