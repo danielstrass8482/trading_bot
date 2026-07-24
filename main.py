@@ -20,7 +20,7 @@ from config import (
 )
 from database import (
     init_db, get_session, save_daily_snapshot, BotState,
-    EntryTimeSlot, get_active_entry_time_slots,
+    EntryTimeSlot, get_active_entry_time_slots, get_daily_trade_count,
 )
 from rule_engine import scan_all_watchlists, check_vix
 from llm_analyst import analyze_with_llm
@@ -104,17 +104,6 @@ def send_daily_summary(scanned_count: int, executed_trades: list, portfolio_valu
     send_email(subject, body)
 
 
-def compute_slot_trade_quota(slot: EntryTimeSlot, active_slots: list[EntryTimeSlot], max_trades_per_day: int) -> int:
-    """
-    Trade-Kontingent für einen einzelnen Entry-Slot (siehe Feature-2-Spec):
-    Gesamt-Trades / Summe-Gewichtungen × Slot-Gewichtung, gerundet.
-    Das globale Tageslimit bleibt zusätzlich über check_guardrails() hart
-    durchgesetzt – dieses Kontingent verteilt es nur über den Handelstag.
-    """
-    total_weight = sum(s.gewichtung for s in active_slots) or 1.0
-    return max(0, round(max_trades_per_day / total_weight * slot.gewichtung))
-
-
 def run_entry_cycle(slot: EntryTimeSlot):
     """
     Entry-Zyklus für einen einzelnen Zeitslot (siehe entry_time_slots /
@@ -157,14 +146,23 @@ def run_entry_cycle(slot: EntryTimeSlot):
             )
         )
 
-    # 3. Slot-Kontingent bestimmen (Trades werden über den Handelstag verteilt)
-    cfg = get_live_config()
+    # 3. Budget für diesen Slot bestimmen (siehe Fix 1 "Konservatives Frühbudget":
+    # frühe Slots haben ein hartes max_trades_per_slot-Limit, spätere Slots
+    # dürfen das noch verbleibende Tagesbudget voll ausschöpfen).
     with get_session() as session:
-        active_slots = get_active_entry_time_slots(session)
-    quota = compute_slot_trade_quota(slot, active_slots, cfg["MAX_TRADES_PER_DAY"])
-    print(f"🎯 Slot-Kontingent: {quota} Trade(s) (Gewichtung {slot.gewichtung})")
-    if quota <= 0:
-        print("⏭️  Kein Kontingent für diesen Slot.")
+        config = get_live_config()
+        max_trades_today = int(config.get("MAX_TRADES_PER_DAY", 5))
+        trades_heute = get_daily_trade_count(session)
+        restbudget = max_trades_today - trades_heute
+
+        if slot.max_trades_per_slot is not None:
+            erlaubt = min(slot.max_trades_per_slot, restbudget)
+        else:
+            erlaubt = restbudget  # Restbudget ausschöpfen
+
+    print(f"🎯 Slot-Budget: {erlaubt} Trade(s) (Cap {slot.max_trades_per_slot}, Restbudget {restbudget}/{max_trades_today})")
+    if erlaubt <= 0:
+        print(f"⏭️  Slot {slot.stunde_et}:{slot.minute_et:02d} – kein Budget")
         return
 
     # 4. Watchlists scannen
@@ -177,8 +175,8 @@ def run_entry_cycle(slot: EntryTimeSlot):
     # 5. Für jedes freigegebene Signal (bis zum Slot-Kontingent): LLM + Trade
     executed_trades = []
     for signal in approved:
-        if len(executed_trades) >= quota:
-            print(f"⏭️  Slot-Kontingent ({quota}) erreicht – weitere Signale übersprungen.")
+        if len(executed_trades) >= erlaubt:
+            print(f"⏭️  Slot-Budget ({erlaubt}) erreicht – weitere Signale übersprungen.")
             break
 
         print(f"\n--- Trade-Kandidat: {signal.ticker} (Score: {signal.score}/100) ---")

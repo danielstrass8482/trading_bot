@@ -192,6 +192,10 @@ class EntryTimeSlot(Base):
     quelle                = Column(String(20), default="initial")   # initial / backlook / manuell
     aktiv                 = Column(Boolean, default=True)
     vom_nutzer_bestaetigt = Column(Boolean, default=False)
+    # Hartes Trade-Limit für diesen Slot (siehe Fix 1 "Konservatives Frühbudget"
+    # in main.py: run_entry_cycle). NULL = kein Cap, Restbudget des Tages darf
+    # voll ausgeschöpft werden.
+    max_trades_per_slot   = Column(Integer, nullable=True, default=None)
     created_at            = Column(DateTime, default=datetime.utcnow)
     updated_at            = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -214,6 +218,7 @@ INITIAL_ENTRY_TIME_SLOTS = [
 def init_db():
     """Erstellt alle Tabellen (idempotent – safe to call multiple times)."""
     Base.metadata.create_all(engine)
+    _migrate_entry_time_slots_columns()
     # Initiale Bot-State-Werte setzen falls nicht vorhanden
     with get_session() as session:
         if not BotState.get(session, "daily_trade_count"):
@@ -238,6 +243,27 @@ def init_db():
                 ))
         session.commit()
     print("✅ Datenbank initialisiert.")
+
+
+def _migrate_entry_time_slots_columns():
+    """
+    Base.metadata.create_all() ändert keine Spalten einer bereits bestehenden
+    Tabelle – max_trades_per_slot (Fix 1 "Konservatives Frühbudget") kam nach-
+    träglich zur entry_time_slots-Tabelle dazu, daher ein idempotentes
+    ALTER TABLE ... ADD COLUMN IF NOT EXISTS. Die initialen Caps (09:45/10:30
+    konservativ auf 1) werden nur gesetzt, solange die Spalte noch NULL ist –
+    ein späterer Backlook-Vorschlag (cap_erhoehen) oder eine manuelle Änderung
+    darf beim nächsten Bot-Neustart NICHT wieder überschrieben werden.
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE entry_time_slots ADD COLUMN IF NOT EXISTS max_trades_per_slot INTEGER DEFAULT NULL"
+        ))
+        conn.execute(text(
+            "UPDATE entry_time_slots SET max_trades_per_slot = 1 "
+            "WHERE stunde_et IN (9, 10) AND minute_et IN (45, 30) AND max_trades_per_slot IS NULL"
+        ))
 
 
 @contextmanager
@@ -397,6 +423,10 @@ def apply_entry_time_proposal(session: Session, vorschlaege: list[dict]):
         elif aktion == "gewichtung_erhoehen":
             if slot:
                 slot.gewichtung = v["neu"]["gewichtung"]
+                slot.updated_at = datetime.utcnow()
+        elif aktion in ("cap_erhoehen", "cap_reduzieren"):
+            if slot:
+                slot.max_trades_per_slot = v["neu"]["max_trades_per_slot"]
                 slot.updated_at = datetime.utcnow()
         elif aktion == "neuen_slot_hinzufuegen":
             if slot:

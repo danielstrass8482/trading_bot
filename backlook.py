@@ -37,6 +37,15 @@ MIN_TRADES_PER_SLOT       = 5     # Mindestanzahl für eine valide Aussage pro Z
 SLOT_DEVIATION_PCT        = 0.20  # >20% vom Durchschnitt = auffällig (besser oder schlechter)
 MAX_SLOT_GEWICHTUNG       = 3.0
 
+# ─────────────────────────────────────────────
+# SLOT-CAP-EVALUIERUNG (Fix 2 – ergänzt die Gewichtungs-Vorschläge oben um
+# Vorschläge für max_trades_per_slot, siehe Fix 1 "Konservatives Frühbudget")
+# ─────────────────────────────────────────────
+CAP_MIN_TRADES           = 10    # Höhere Datenbasis als bei der Gewichtungs-Analyse (5)
+CAP_HOHE_TREFFERQUOTE    = 70.0  # >70% Trefferquote -> Cap erhöhen
+CAP_NIEDRIGE_TREFFERQUOTE = 40.0  # <40% Trefferquote -> Cap auf 1 begrenzen (oder deaktivieren)
+CAP_ERHOEHT              = 2
+
 
 def get_last_week_closed_trades(session) -> list[Trade]:
     """Alle Trades die in den letzten 7 Tagen geschlossen wurden."""
@@ -275,6 +284,39 @@ def analyze_entry_timing():
                         "neu": {"gewichtung": neue_gewichtung},
                     })
 
+            # Slot-Cap zusätzlich evaluieren (Fix 2 – eigene, höhere Datenbasis-
+            # Schwelle als die Gewichtungs-Analyse oben, siehe CAP_MIN_TRADES).
+            if s["anzahl_trades"] >= CAP_MIN_TRADES:
+                # Für die Erhöhen-Entscheidung zählt ein fehlender Cap (None) als
+                # effektiv 1 (Default-Konservativ) – für die Anzeige im Vorschlag
+                # aber der tatsächliche Wert ("unbegrenzt" statt irreführend "1").
+                cap_effektiv = slot.max_trades_per_slot if slot.max_trades_per_slot is not None else 1
+                cap_anzeige = slot.max_trades_per_slot if slot.max_trades_per_slot is not None else "unbegrenzt"
+                cap_begruendung = f"Trefferquote {s['trefferquote']:.0f}% ({s['anzahl_trades']} Trades)"
+                if s["trefferquote"] > CAP_HOHE_TREFFERQUOTE and cap_effektiv < CAP_ERHOEHT:
+                    vorschlaege.append({
+                        "slot": f"{slot.stunde_et:02d}:{slot.minute_et:02d}",
+                        "aktion": "cap_erhoehen",
+                        "begruendung": f"{cap_begruendung} → Cap {cap_anzeige}→{CAP_ERHOEHT}",
+                        "neu": {"max_trades_per_slot": CAP_ERHOEHT},
+                    })
+                elif s["trefferquote"] < CAP_NIEDRIGE_TREFFERQUOTE:
+                    if slot.max_trades_per_slot == 1:
+                        # Bereits konservativ auf 1 gedeckelt und trotzdem schwach -> ganz abschalten.
+                        vorschlaege.append({
+                            "slot": f"{slot.stunde_et:02d}:{slot.minute_et:02d}",
+                            "aktion": "deaktivieren",
+                            "begruendung": f"{cap_begruendung} trotz Cap 1 weiterhin schwach",
+                            "aktuell": {"gewichtung": slot.gewichtung, "avg_pnl": round(s["avg_pnl"], 1)},
+                        })
+                    else:
+                        vorschlaege.append({
+                            "slot": f"{slot.stunde_et:02d}:{slot.minute_et:02d}",
+                            "aktion": "cap_reduzieren",
+                            "begruendung": f"{cap_begruendung} → Cap {cap_anzeige}→1",
+                            "neu": {"max_trades_per_slot": 1},
+                        })
+
         # Unbekannte (nicht konfigurierte) Stunden, die besser performen als
         # der aktuell schwächste konfigurierte Slot.
         configured_hours = {slot.stunde_et for slot in slots}
@@ -293,6 +335,18 @@ def analyze_entry_timing():
                     ),
                     "neu": {"gewichtung": 1.0},
                 })
+
+        # Duplikate vermeiden – Gewichtungs- und Cap-Analyse können für denselben
+        # Slot dieselbe Aktion vorschlagen (z.B. "deaktivieren" aus beiden Regeln).
+        gesehen = set()
+        eindeutige_vorschlaege = []
+        for v in vorschlaege:
+            key = (v["slot"], v["aktion"])
+            if key in gesehen:
+                continue
+            gesehen.add(key)
+            eindeutige_vorschlaege.append(v)
+        vorschlaege = eindeutige_vorschlaege
 
         if vorschlaege:
             lernmodus = get_bot_config(session, "ENTRY_LEARNING_MODE", "false") == "true"
