@@ -14,11 +14,14 @@ import pytz
 from config import (
     LONG_WATCHLIST, ACTIVE_SHORT_INSTRUMENTS,
     PROFIT_ALERT_TARGET, MAX_CAPITAL_TOTAL,
-    SCAN_HOUR_ET, SCAN_MINUTE_ET, validate_config, get_live_config,
+    validate_config, get_live_config,
     ALERT_EMAIL, SMTP_HOST, SMTP_PORT, SMTP_FALLBACK_PORT,
     SMTP_USER, SMTP_PASSWORD, SMTP_TIMEOUT
 )
-from database import init_db, get_session, save_daily_snapshot, BotState
+from database import (
+    init_db, get_session, save_daily_snapshot, BotState,
+    EntryTimeSlot, get_active_entry_time_slots,
+)
 from rule_engine import scan_all_watchlists, check_vix
 from llm_analyst import analyze_with_llm
 from broker import place_trade, monitor_open_positions, get_portfolio_value, GuardrailViolation
@@ -101,25 +104,39 @@ def send_daily_summary(scanned_count: int, executed_trades: list, portfolio_valu
     send_email(subject, body)
 
 
-def run_bot_cycle():
+def compute_slot_trade_quota(slot: EntryTimeSlot, active_slots: list[EntryTimeSlot], max_trades_per_day: int) -> int:
     """
-    Haupt-Bot-Zyklus. Wird täglich zur Marktöffnung ausgeführt.
+    Trade-Kontingent für einen einzelnen Entry-Slot (siehe Feature-2-Spec):
+    Gesamt-Trades / Summe-Gewichtungen × Slot-Gewichtung, gerundet.
+    Das globale Tageslimit bleibt zusätzlich über check_guardrails() hart
+    durchgesetzt – dieses Kontingent verteilt es nur über den Handelstag.
+    """
+    total_weight = sum(s.gewichtung for s in active_slots) or 1.0
+    return max(0, round(max_trades_per_day / total_weight * slot.gewichtung))
+
+
+def run_entry_cycle(slot: EntryTimeSlot):
+    """
+    Entry-Zyklus für einen einzelnen Zeitslot (siehe entry_time_slots /
+    schedule_entry_jobs). Wie der frühere run_bot_cycle, aber nur Signal-Scan +
+    Trade-Platzierung – kein SL/TP-Monitoring (läuft separat, siehe
+    run_monitoring_cycle alle MONITORING_INTERVAL_MIN Minuten).
     """
     print(f"\n{'='*60}")
-    print(f"🤖 Bot-Zyklus gestartet: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🤖 Entry-Zyklus {slot.stunde_et:02d}:{slot.minute_et:02d} ET gestartet: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
 
     # 0. Bot pausiert?
     with get_session() as session:
         if BotState.get(session, "bot_paused") == "true":
-            print("⏸️  Bot ist pausiert. Kein Handel heute.")
+            print("⏸️  Bot ist pausiert. Kein Handel in diesem Slot.")
             return
 
     # 1. VIX-Check (Marktangst-Filter)
     vix, vix_ok = check_vix()
     print(f"\n📊 VIX: {vix:.1f}", end=" ")
     if not vix_ok:
-        print(f"🚨 ÜBER LIMIT – Bot pausiert heute (VIX > Schwellwert)")
+        print(f"🚨 ÜBER LIMIT – Slot übersprungen (VIX > Schwellwert)")
         return
     print(f"✅ Im grünen Bereich")
 
@@ -140,9 +157,15 @@ def run_bot_cycle():
             )
         )
 
-    # 3. Positionen überwachen (SL/TP prüfen)
-    print(f"\n--- Positions-Check ---")
-    monitor_open_positions()
+    # 3. Slot-Kontingent bestimmen (Trades werden über den Handelstag verteilt)
+    cfg = get_live_config()
+    with get_session() as session:
+        active_slots = get_active_entry_time_slots(session)
+    quota = compute_slot_trade_quota(slot, active_slots, cfg["MAX_TRADES_PER_DAY"])
+    print(f"🎯 Slot-Kontingent: {quota} Trade(s) (Gewichtung {slot.gewichtung})")
+    if quota <= 0:
+        print("⏭️  Kein Kontingent für diesen Slot.")
+        return
 
     # 4. Watchlists scannen
     print(f"\n--- Signal-Scan ---")
@@ -151,9 +174,13 @@ def run_bot_cycle():
     approved = [s for s in signals if s.approved]
     print(f"\n✅ {len(approved)} Trade-Signale über Schwellwert:")
 
-    # 5. Für jedes freigegebene Signal: LLM + Trade
+    # 5. Für jedes freigegebene Signal (bis zum Slot-Kontingent): LLM + Trade
     executed_trades = []
     for signal in approved:
+        if len(executed_trades) >= quota:
+            print(f"⏭️  Slot-Kontingent ({quota}) erreicht – weitere Signale übersprungen.")
+            break
+
         print(f"\n--- Trade-Kandidat: {signal.ticker} (Score: {signal.score}/100) ---")
 
         # LLM-Analyse (non-blocking – Bot läuft weiter bei Fehler)
@@ -192,11 +219,40 @@ def run_bot_cycle():
         session.commit()
 
     print(f"\n{'='*60}")
-    print(f"✅ Zyklus abgeschlossen. Heute ausgeführte Trades: {len(executed_trades)}")
+    print(f"✅ Entry-Zyklus abgeschlossen. Trades in diesem Slot: {len(executed_trades)}")
     print(f"{'='*60}\n")
 
-    # 7. Tägliche Zusammenfassung per E-Mail
-    send_daily_summary(len(signals), executed_trades, portfolio_value, vix)
+    # 7. Zusammenfassung per E-Mail (nur wenn in diesem Slot tatsächlich gehandelt wurde)
+    if executed_trades:
+        send_daily_summary(len(signals), executed_trades, portfolio_value, vix)
+
+
+def schedule_entry_jobs(scheduler: BlockingScheduler, et_tz):
+    """
+    Registriert für jeden aktiven entry_time_slot einen eigenen Scheduler-Job
+    (ersetzt die frühere feste Scan-Zeit 09:00 ET, siehe Feature 6).
+    """
+    with get_session() as session:
+        slots = get_active_entry_time_slots(session)
+
+    if not slots:
+        print("⚠️  Keine aktiven Entry-Zeitslots gefunden – kein Entry-Job registriert.")
+        return
+
+    for slot in slots:
+        scheduler.add_job(
+            lambda s=slot: run_entry_cycle(s),
+            CronTrigger(
+                hour=slot.stunde_et,
+                minute=slot.minute_et,
+                day_of_week="mon-fri",
+                timezone=et_tz,
+            ),
+            id=f"entry_{slot.id}",
+            name=f"Entry-Zyklus {slot.stunde_et:02d}:{slot.minute_et:02d} ET",
+            replace_existing=True,
+        )
+        print(f"   📍 Entry-Job registriert: {slot.stunde_et:02d}:{slot.minute_et:02d} ET (Gewichtung {slot.gewichtung})")
 
 
 def run_monitoring_cycle():
@@ -226,18 +282,10 @@ def main():
     et_tz = pytz.timezone("America/New_York")
     scheduler = BlockingScheduler(timezone=et_tz)
 
-    # Haupt-Zyklus: täglich zur Marktöffnung (09:00 ET)
-    scheduler.add_job(
-        run_bot_cycle,
-        CronTrigger(
-            hour=SCAN_HOUR_ET,
-            minute=SCAN_MINUTE_ET,
-            day_of_week="mon-fri",
-            timezone=et_tz
-        ),
-        id="main_cycle",
-        name="Täglicher Bot-Zyklus"
-    )
+    # Entry-Zyklen: ein Job pro aktivem entry_time_slot (siehe Feature 2/6),
+    # ersetzt die frühere feste Scan-Zeit 09:00 ET.
+    print("📍 Entry-Zeitslots registrieren...")
+    schedule_entry_jobs(scheduler, et_tz)
 
     # Monitoring: alle N Minuten während Handelszeit (09:30–16:00 ET),
     # Intervall konfigurierbar via bot_config (MONITORING_INTERVAL_MIN).
@@ -266,13 +314,10 @@ def main():
         name="Wöchentlicher Backlook"
     )
 
-    print(f"⏰ Scheduler aktiv. Bot läuft täglich um {SCAN_HOUR_ET:02d}:{SCAN_MINUTE_ET:02d} ET (Mo–Fr)")
+    print(f"⏰ Scheduler aktiv. Entry-Zyklen laufen zu den registrierten Zeitslots (Mo–Fr)")
     print(f"📡 Monitoring: alle {monitoring_interval} Min von 09:30–16:00 ET")
     print(f"📚 Backlook: montags 06:00 ET")
     print(f"🛑 Zum Beenden: Ctrl+C\n")
-
-    # Einmalig sofort ausführen beim Start (zum Testen)
-    # run_bot_cycle()  # ← Auskommentiert für Production; einkommentieren zum Testen
 
     try:
         scheduler.start()

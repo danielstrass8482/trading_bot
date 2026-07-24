@@ -14,16 +14,28 @@ Harte Grenzen (nicht verhandelbar):
 - SCORE_WEIGHTS-Summe bleibt exakt 100 (zero-sum Anpassung).
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
+import pytz
 
 from database import (
-    get_session, Trade, get_active_weights, set_active_weights, WeightHistory
+    get_session, Trade, get_active_weights, set_active_weights, WeightHistory,
+    EntryTimeSlot, get_bot_config, get_pending_entry_proposal, set_pending_entry_proposal,
+    apply_entry_time_proposal,
 )
 
 MIN_TRADES_REQUIRED       = 5
 MAX_WEIGHT_CHANGE_PER_RUN = 2
 MIN_WEIGHT                = 5
 MAX_WEIGHT                = 35
+
+# ─────────────────────────────────────────────
+# EINSTIEGSZEITPUNKT-OPTIMIERUNG (Feature 3)
+# ─────────────────────────────────────────────
+
+ET_TZ                    = pytz.timezone("America/New_York")
+MIN_TRADES_PER_SLOT       = 5     # Mindestanzahl für eine valide Aussage pro Zeitslot
+SLOT_DEVIATION_PCT        = 0.20  # >20% vom Durchschnitt = auffällig (besser oder schlechter)
+MAX_SLOT_GEWICHTUNG       = 3.0
 
 
 def get_last_week_closed_trades(session) -> list[Trade]:
@@ -111,8 +123,8 @@ def compute_weight_adjustments(trades: list[Trade], current_weights: dict) -> di
     return new_weights
 
 
-def run_backlook():
-    """Hauptfunktion: wird vom Scheduler jeden Montag 06:00 ET aufgerufen."""
+def _run_weekly_weight_backlook():
+    """Wöchentliche Anpassung der Score-Gewichtungen (Option A, siehe Modulkommentar)."""
     print(f"\n{'='*60}")
     print(f"📚 Wöchentlicher Backlook gestartet: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
@@ -156,6 +168,163 @@ def run_backlook():
         session.commit()
 
     print(f"{'='*60}\n")
+
+
+def _entry_hour_et(trade: Trade) -> int:
+    """Einstiegsstunde (Eastern Time) eines Trades – created_at ist UTC (naiv gespeichert)."""
+    utc_dt = pytz.utc.localize(trade.created_at)
+    return utc_dt.astimezone(ET_TZ).hour
+
+
+def _get_all_closed_trades(session) -> list[Trade]:
+    """Alle je abgeschlossenen Trades – die Zeitpunkt-Analyse braucht die volle
+    Historie (nicht nur die letzte Woche wie der Gewichtungs-Backlook), damit
+    pro Stunde überhaupt genug Datenbasis zusammenkommt."""
+    return session.query(Trade).filter(
+        Trade.status.in_(["CLOSED_SL", "CLOSED_TP", "CLOSED_MANUAL"])
+    ).all()
+
+
+def _hourly_stats(trades: list[Trade]) -> dict[int, dict]:
+    """Ø G/V%, Trefferquote und Anzahl Trades je Einstiegsstunde (ET)."""
+    by_hour: dict[int, list[Trade]] = {}
+    for t in trades:
+        by_hour.setdefault(_entry_hour_et(t), []).append(t)
+
+    stats = {}
+    for hour, ts in by_hour.items():
+        pnls = [t.pnl_pct for t in ts if t.pnl_pct is not None]
+        if not pnls:
+            continue
+        stats[hour] = {
+            "avg_pnl": sum(pnls) / len(pnls),
+            "trefferquote": sum(1 for p in pnls if p > 0) / len(pnls) * 100,
+            "anzahl_trades": len(pnls),
+        }
+    return stats
+
+
+def analyze_entry_timing():
+    """
+    Analysiert alle abgeschlossenen Trades nach Einstiegsstunde (ET) und
+    schlägt Anpassungen an den entry_time_slots vor (siehe Feature-3-Spec).
+    Läuft direkt im Anschluss an den Gewichtungs-Backlook (siehe run_backlook
+    unten) – jeden Montag, unabhängig davon ob dort genug Trades für eine
+    Gewichtungsanpassung vorlagen.
+
+    Vorschläge werden NIE automatisch übernommen, außer der Nutzer hat den
+    Lernmodus aktiviert (bot_config ENTRY_LEARNING_MODE=true, siehe Feature 4).
+    """
+    print(f"\n{'='*60}")
+    print(f"🕒 Einstiegszeitpunkt-Analyse gestartet: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}")
+
+    with get_session() as session:
+        trades = _get_all_closed_trades(session)
+        stats = _hourly_stats(trades)
+        slots = session.query(EntryTimeSlot).all()
+
+        # Gelernte Performance je konfiguriertem Slot aktualisieren – auch
+        # unterhalb der Mindestanzahl, rein zur Anzeige in der Zeitslot-Tabelle.
+        for slot in slots:
+            s = stats.get(slot.stunde_et)
+            if not s:
+                continue
+            slot.avg_pnl = s["avg_pnl"]
+            slot.trefferquote = s["trefferquote"]
+            slot.anzahl_trades = s["anzahl_trades"]
+            if slot.quelle == "initial" and s["anzahl_trades"] >= MIN_TRADES_PER_SLOT:
+                slot.quelle = "backlook"
+            slot.updated_at = datetime.utcnow()
+
+        valide_stats = {h: s for h, s in stats.items() if s["anzahl_trades"] >= MIN_TRADES_PER_SLOT}
+        if not valide_stats:
+            print(f"⏭️  Kein Zeitslot mit ≥{MIN_TRADES_PER_SLOT} abgeschlossenen Trades – noch keine Vorschläge möglich.")
+            session.commit()
+            print(f"{'='*60}\n")
+            return
+
+        gesamt_avg = sum(s["avg_pnl"] for s in valide_stats.values()) / len(valide_stats)
+
+        vorschlaege = []
+        for slot in slots:
+            s = stats.get(slot.stunde_et)
+            if not s or s["anzahl_trades"] < MIN_TRADES_PER_SLOT:
+                continue
+
+            schwelle = abs(gesamt_avg) * SLOT_DEVIATION_PCT if gesamt_avg != 0 else 0.5
+            begruendung = (
+                f"Ø G/V {s['avg_pnl']:+.1f}%, Trefferquote {s['trefferquote']:.0f}% "
+                f"({s['anzahl_trades']} Trades)"
+            )
+            if s["avg_pnl"] < gesamt_avg - schwelle:
+                aktion = "deaktivieren" if s["trefferquote"] < 50 else "gewichtung_reduzieren"
+                vorschlaege.append({
+                    "slot": f"{slot.stunde_et:02d}:{slot.minute_et:02d}",
+                    "aktion": aktion,
+                    "begruendung": begruendung,
+                    "aktuell": {"gewichtung": slot.gewichtung, "avg_pnl": round(s["avg_pnl"], 1)},
+                })
+            elif s["avg_pnl"] > gesamt_avg + schwelle and s["trefferquote"] >= 60:
+                neue_gewichtung = round(min(slot.gewichtung * 1.5, MAX_SLOT_GEWICHTUNG), 1)
+                if neue_gewichtung > slot.gewichtung:
+                    vorschlaege.append({
+                        "slot": f"{slot.stunde_et:02d}:{slot.minute_et:02d}",
+                        "aktion": "gewichtung_erhoehen",
+                        "begruendung": begruendung,
+                        "neu": {"gewichtung": neue_gewichtung},
+                    })
+
+        # Unbekannte (nicht konfigurierte) Stunden, die besser performen als
+        # der aktuell schwächste konfigurierte Slot.
+        configured_hours = {slot.stunde_et for slot in slots}
+        konfigurierte_avgs = [slot.avg_pnl for slot in slots if slot.avg_pnl is not None]
+        schwaechster = min(konfigurierte_avgs) if konfigurierte_avgs else None
+        for hour, s in stats.items():
+            if hour in configured_hours or s["anzahl_trades"] < MIN_TRADES_PER_SLOT:
+                continue
+            if schwaechster is None or s["avg_pnl"] > schwaechster:
+                vorschlaege.append({
+                    "slot": f"{hour:02d}:00",
+                    "aktion": "neuen_slot_hinzufuegen",
+                    "begruendung": (
+                        f"Ø G/V {s['avg_pnl']:+.1f}%, Trefferquote {s['trefferquote']:.0f}% "
+                        f"({s['anzahl_trades']} Trades) – bisher kein Slot um {hour:02d} Uhr"
+                    ),
+                    "neu": {"gewichtung": 1.0},
+                })
+
+        if vorschlaege:
+            lernmodus = get_bot_config(session, "ENTRY_LEARNING_MODE", "false") == "true"
+            if lernmodus:
+                apply_entry_time_proposal(session, vorschlaege)
+                set_pending_entry_proposal(session, None)
+                print(f"🤖 Lernmodus aktiv – {len(vorschlaege)} Vorschlag/Vorschläge automatisch übernommen.")
+            else:
+                set_pending_entry_proposal(session, {
+                    "typ": "entry_time_optimization",
+                    "erstellt": str(date.today()),
+                    "vorschlaege": vorschlaege,
+                    "lernmodus": False,
+                })
+                print(f"📋 {len(vorschlaege)} Vorschlag/Vorschläge gespeichert (pending_entry_proposal).")
+        else:
+            print("✅ Keine Optimierungsvorschläge – aktuelle Zeitpunkte performen gleichmäßig.")
+
+        session.commit()
+
+    print(f"{'='*60}\n")
+
+
+def run_backlook():
+    """
+    Hauptfunktion: wird vom Scheduler jeden Montag 06:00 ET aufgerufen.
+    Führt zuerst den Gewichtungs-Backlook aus, danach direkt im Anschluss die
+    Einstiegszeitpunkt-Analyse (siehe Feature 3 – unabhängig vom Ergebnis des
+    Gewichtungs-Backlooks, da beide auf unterschiedlichen Datenbasen laufen).
+    """
+    _run_weekly_weight_backlook()
+    analyze_entry_timing()
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ Verwendet SQLAlchemy mit SQLite (serverlos, kein Setup nötig).
 from datetime import datetime, date
 from sqlalchemy import (
     create_engine, Column, Integer, Float, String,
-    DateTime, Date, Text, func
+    DateTime, Date, Text, Boolean, func
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from contextlib import contextmanager
@@ -129,6 +129,7 @@ DEFAULT_CONFIG = {
     "MIN_SIGNAL_SCORE":        ("65",     "Minimaler Score"),
     "VIX_PAUSE_THRESHOLD":     ("30",     "VIX-Limit"),
     "MONITORING_INTERVAL_MIN": ("15",     "Monitoring-Intervall Minuten"),
+    "ENTRY_LEARNING_MODE":     ("false",  "Backlook-Vorschläge zu Einstiegszeitpunkten automatisch übernehmen"),
 }
 
 
@@ -172,6 +173,40 @@ class DailyLog(Base):
     open_positions = Column(Integer, default=0)
 
 
+class EntryTimeSlot(Base):
+    """
+    Konfigurierbarer Einstiegszeitpunkt (ET) für den Entry-Scheduler (main.py:
+    schedule_entry_jobs). gewichtung steuert die Trade-Quote pro Slot; avg_pnl/
+    trefferquote/anzahl_trades werden vom wöchentlichen Backlook gelernt
+    (siehe backlook.py: analyze_entry_timing).
+    """
+    __tablename__ = "entry_time_slots"
+
+    id                    = Column(Integer, primary_key=True, autoincrement=True)
+    stunde_et             = Column(Integer, nullable=False)
+    minute_et             = Column(Integer, nullable=False, default=0)
+    gewichtung            = Column(Float, nullable=False, default=1.0)
+    avg_pnl               = Column(Float, nullable=True)
+    trefferquote          = Column(Float, nullable=True)
+    anzahl_trades         = Column(Integer, default=0)
+    quelle                = Column(String(20), default="initial")   # initial / backlook / manuell
+    aktiv                 = Column(Boolean, default=True)
+    vom_nutzer_bestaetigt = Column(Boolean, default=False)
+    created_at            = Column(DateTime, default=datetime.utcnow)
+    updated_at            = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# Initiale Einstiegszeitpunkte (siehe Feature-2-Spec) – werden in init_db() nur
+# angelegt, falls die Tabelle noch komplett leer ist.
+INITIAL_ENTRY_TIME_SLOTS = [
+    (9, 45, 1.0),   # nach Opening-Volatilität
+    (10, 30, 1.5),  # stärkster historischer Zeitpunkt
+    (12, 0, 0.5),   # Mittagskonsolidierung, weniger
+    (14, 0, 1.0),   # vor letzter Handelsstunde
+    (15, 0, 0.5),   # kurz vor Schluss, vorsichtig
+]
+
+
 # ─────────────────────────────────────────────
 # DATENBANKZUGRIFF
 # ─────────────────────────────────────────────
@@ -195,6 +230,12 @@ def init_db():
         for key, (value, beschreibung) in DEFAULT_CONFIG.items():
             if not session.query(BotConfig).filter_by(key=key).first():
                 session.add(BotConfig(key=key, value=value, beschreibung=beschreibung))
+        # Initiale Einstiegszeitpunkte seeden – nur beim allerersten Start (Tabelle leer).
+        if not session.query(EntryTimeSlot).first():
+            for stunde, minute, gewichtung in INITIAL_ENTRY_TIME_SLOTS:
+                session.add(EntryTimeSlot(
+                    stunde_et=stunde, minute_et=minute, gewichtung=gewichtung, quelle="initial"
+                ))
         session.commit()
     print("✅ Datenbank initialisiert.")
 
@@ -303,6 +344,70 @@ def set_active_weights(session: Session, weights: dict):
             row.updated_at = now
         else:
             session.add(CurrentWeight(criterion=criterion, weight=weight, updated_at=now))
+
+
+def get_active_entry_time_slots(session: Session) -> list["EntryTimeSlot"]:
+    """Aktive Einstiegszeitpunkte, sortiert nach Uhrzeit (für schedule_entry_jobs)."""
+    return session.query(EntryTimeSlot).filter_by(aktiv=True).order_by(
+        EntryTimeSlot.stunde_et, EntryTimeSlot.minute_et
+    ).all()
+
+
+def get_pending_entry_proposal(session: Session) -> dict | None:
+    """Liest den aktuellen Backlook-Zeitpunkt-Vorschlag aus bot_state (siehe analyze_entry_timing)."""
+    raw = BotState.get(session, "pending_entry_proposal")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def set_pending_entry_proposal(session: Session, proposal: dict | None):
+    """Schreibt (oder löscht bei None) den pending_entry_proposal-Eintrag in bot_state."""
+    if proposal is None:
+        row = session.query(BotState).filter_by(key="pending_entry_proposal").first()
+        if row:
+            session.delete(row)
+    else:
+        BotState.set(session, "pending_entry_proposal", json.dumps(proposal, ensure_ascii=False))
+
+
+def apply_entry_time_proposal(session: Session, vorschlaege: list[dict]):
+    """
+    Wendet eine Liste von Backlook-Zeitpunkt-Vorschlägen (Format siehe
+    analyze_entry_timing) auf entry_time_slots an – entweder automatisch bei
+    aktivem Lernmodus, oder nach manueller Nutzerbestätigung (siehe Feature 4).
+    """
+    for v in vorschlaege:
+        stunde_str, minute_str = v["slot"].split(":")
+        stunde, minute = int(stunde_str), int(minute_str)
+        slot = session.query(EntryTimeSlot).filter_by(stunde_et=stunde, minute_et=minute).first()
+        aktion = v["aktion"]
+
+        if aktion == "deaktivieren":
+            if slot:
+                slot.aktiv = False
+                slot.updated_at = datetime.utcnow()
+        elif aktion == "gewichtung_reduzieren":
+            if slot:
+                slot.gewichtung = max(slot.gewichtung * 0.5, 0.1)
+                slot.updated_at = datetime.utcnow()
+        elif aktion == "gewichtung_erhoehen":
+            if slot:
+                slot.gewichtung = v["neu"]["gewichtung"]
+                slot.updated_at = datetime.utcnow()
+        elif aktion == "neuen_slot_hinzufuegen":
+            if slot:
+                slot.aktiv = True
+                slot.gewichtung = v["neu"]["gewichtung"]
+                slot.updated_at = datetime.utcnow()
+            else:
+                session.add(EntryTimeSlot(
+                    stunde_et=stunde, minute_et=minute,
+                    gewichtung=v["neu"]["gewichtung"], quelle="backlook", aktiv=True,
+                ))
 
 
 def save_daily_snapshot(session: Session, portfolio_value: float):
