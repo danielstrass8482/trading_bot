@@ -161,6 +161,36 @@ class WeightHistory(Base):
     trades_analyzed = Column(Integer, nullable=False)
 
 
+class ScanLog(Base):
+    """Vollständiges Log jedes Bot-Scans – auch Ticker ohne ausgeführten Trade."""
+    __tablename__ = "scan_log"
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    scan_time   = Column(DateTime, default=datetime.utcnow)
+    slot_et     = Column(String(10), nullable=True)  # z.B. "09:45"
+    ticker      = Column(String(10), nullable=False)
+    score       = Column(Integer, nullable=False)
+    approved    = Column(Boolean, default=False)
+    instrument_type = Column(String(20), nullable=True)
+    current_price   = Column(Float, nullable=True)
+
+    # Score Breakdown
+    rsi             = Column(Float, nullable=True)
+    rsi_score       = Column(Integer, nullable=True)
+    sma_score       = Column(Integer, nullable=True)
+    volume_score    = Column(Integer, nullable=True)
+    pe_score        = Column(Integer, nullable=True)
+    de_score        = Column(Integer, nullable=True)
+    rev_score       = Column(Integer, nullable=True)
+
+    # Warum kein Trade
+    ko_reason       = Column(Text, nullable=True)
+    guardrail_reason = Column(Text, nullable=True)
+    trade_executed  = Column(Boolean, default=False)
+    trade_id        = Column(Integer, nullable=True)  # FK zu trades.id
+    mode            = Column(String(10), default="LIVE")
+
+
 class DailyLog(Base):
     """Tägliche Zusammenfassung für Performance-Chart."""
     __tablename__ = "daily_log"

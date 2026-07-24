@@ -13,13 +13,13 @@ import pytz
 
 from config import (
     LONG_WATCHLIST, ACTIVE_SHORT_INSTRUMENTS,
-    PROFIT_ALERT_TARGET, MAX_CAPITAL_TOTAL,
+    PROFIT_ALERT_TARGET, MAX_CAPITAL_TOTAL, TRADING_MODE,
     validate_config, get_live_config,
     ALERT_EMAIL, SMTP_HOST, SMTP_PORT, SMTP_FALLBACK_PORT,
     SMTP_USER, SMTP_PASSWORD, SMTP_TIMEOUT
 )
 from database import (
-    init_db, get_session, save_daily_snapshot, BotState,
+    init_db, get_session, save_daily_snapshot, BotState, ScanLog,
     EntryTimeSlot, get_active_entry_time_slots, get_daily_trade_count,
 )
 from rule_engine import scan_all_watchlists, check_vix
@@ -102,6 +102,43 @@ def send_daily_summary(scanned_count: int, executed_trades: list, portfolio_valu
     body = "\n".join(lines)
     subject = f"📊 Trading Bot – Tageszusammenfassung {datetime.now().strftime('%Y-%m-%d')}"
     send_email(subject, body)
+
+
+def log_scan_results(signals: list, slot_et: str, executed_trades: dict):
+    """
+    Loggt jedes Scan-Ergebnis (auch nicht ausgeführte Ticker) in scan_log,
+    damit im Dashboard nachvollziehbar ist, warum ein Ticker gehandelt wurde
+    oder nicht (siehe Feature Scan-Log). executed_trades: Ticker -> Trade-ID.
+    """
+    scan_time = datetime.utcnow()
+    with get_session() as session:
+        for signal in signals:
+            trade_id = executed_trades.get(signal.ticker)
+            breakdown = signal.score_breakdown or {}
+
+            log_entry = ScanLog(
+                scan_time    = scan_time,
+                slot_et      = slot_et,
+                ticker       = signal.ticker,
+                score        = signal.score,
+                approved     = signal.approved,
+                instrument_type = signal.instrument_type,
+                current_price   = signal.current_price,
+                rsi          = signal.rsi,
+                rsi_score    = breakdown.get("rsi", {}).get("score"),
+                sma_score    = breakdown.get("sma_trend", {}).get("score"),
+                volume_score = breakdown.get("volume", {}).get("score"),
+                pe_score     = breakdown.get("pe_ratio", {}).get("score"),
+                de_score     = breakdown.get("debt_equity", {}).get("score"),
+                rev_score    = breakdown.get("revenue_growth", {}).get("score"),
+                ko_reason    = signal.ko_reason,
+                guardrail_reason = None,  # wird später gesetzt
+                trade_executed = trade_id is not None,
+                trade_id     = trade_id,
+                mode         = TRADING_MODE,
+            )
+            session.add(log_entry)
+        session.commit()
 
 
 def run_entry_cycle(slot: EntryTimeSlot):
@@ -211,7 +248,12 @@ def run_entry_cycle(slot: EntryTimeSlot):
                 )
             break  # Wenn Tageslimit, weitere Trades sinnlos
 
-    # 6. Tages-Snapshot speichern
+    # 6. Scan-Ergebnisse loggen (auch nicht ausgeführte Ticker, siehe Feature Scan-Log)
+    executed_trades_by_ticker = {t.ticker: t.id for t in executed_trades}
+    slot_label = f"{slot.stunde_et:02d}:{slot.minute_et:02d}"
+    log_scan_results(signals, slot_label, executed_trades_by_ticker)
+
+    # 7. Tages-Snapshot speichern
     with get_session() as session:
         save_daily_snapshot(session, portfolio_value)
         session.commit()
@@ -220,7 +262,7 @@ def run_entry_cycle(slot: EntryTimeSlot):
     print(f"✅ Entry-Zyklus abgeschlossen. Trades in diesem Slot: {len(executed_trades)}")
     print(f"{'='*60}\n")
 
-    # 7. Zusammenfassung per E-Mail (nur wenn in diesem Slot tatsächlich gehandelt wurde)
+    # 8. Zusammenfassung per E-Mail (nur wenn in diesem Slot tatsächlich gehandelt wurde)
     if executed_trades:
         send_daily_summary(len(signals), executed_trades, portfolio_value, vix)
 
