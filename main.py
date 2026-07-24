@@ -274,37 +274,48 @@ def run_entry_cycle(slot: EntryTimeSlot):
     print(f"\n--- Signal-Scan ---")
     signals = scan_all_watchlists(LONG_WATCHLIST, ACTIVE_SHORT_INSTRUMENTS)
 
-    approved = [s for s in signals if s.approved]
+    # Beste Kandidaten zuerst (höchster Score) – ein Trade-Slot soll dem
+    # stärksten Signal zugutekommen, nicht einfach dem ersten in
+    # Watchlist-Reihenfolge (siehe FIX Slot-Cap).
+    approved = sorted((s for s in signals if s.approved), key=lambda s: s.score, reverse=True)
     print(f"\n✅ {len(approved)} Trade-Signale über Schwellwert:")
 
-    # 5. Für jedes freigegebene Signal (bis zum Slot-Kontingent): LLM + Trade
+    # 5. Für jedes freigegebene Signal (bis zum Slot-Kontingent): Guardrail
+    # zuerst prüfen (spart LLM-Aufrufe für ohnehin geblockte Kandidaten), dann
+    # LLM + Trade. WICHTIG (FIX Slot-Cap): nur ein tatsächlich AUSGEFÜHRTER
+    # Trade verbraucht das Slot-Kontingent – ein von einem Guardrail
+    # geblockter Kandidat (z.B. "Position auf TICKER bereits offen", was nur
+    # DIESEN einen Ticker betrifft) darf keinen Slot verbrauchen und nicht
+    # verhindern, dass der nächste Kandidat noch versucht wird.
     executed_trades = []
     guardrail_reasons = {}
+    trades_in_slot = 0
+    verlustlimit_alert_gesendet = False
 
-    # Guardrail-Grund für JEDES freigegebene Signal separat ermitteln – rein
-    # informativ fürs Scan-Log (siehe Feature Scan-Log), beeinflusst NICHT
-    # welche Trades unten tatsächlich versucht werden. Nötig, weil die
-    # eigentliche Trade-Schleife nach dem ersten Verstoß abbricht (siehe
-    # stopped_early unten) und sonst nachfolgende Ticker ohne Grund blieben.
     for signal in approved:
+        if trades_in_slot >= erlaubt:
+            break
+
+        # check_guardrails() fragt open_trades/daily_trade_count/daily_pnl bei
+        # jedem Aufruf frisch aus der DB ab – reflektiert also automatisch
+        # bereits in diesem Zyklus ausgeführte Trades, keine veralteten Werte.
         try:
             check_guardrails(signal)
         except GuardrailViolation as gv:
             guardrail_reasons[signal.ticker] = str(gv)
-
-    stopped_early = False
-    for signal in approved:
-        if stopped_early:
-            guardrail_reasons.setdefault(signal.ticker, "Zyklus vorzeitig gestoppt (vorheriger Guardrail-Verstoß)")
-            continue
-
-        if len(executed_trades) >= erlaubt:
-            guardrail_reasons.setdefault(
-                signal.ticker, f"Slot-Cap erreicht ({len(executed_trades)}/{erlaubt} für diesen Slot)"
-            )
-            print(f"⏭️  Slot-Budget ({erlaubt}) erreicht – weitere Signale übersprungen.")
-            stopped_early = True
-            continue
+            print(f"   🛡️  {signal.ticker}: Guardrail – {gv}")
+            if "Verlustlimit" in str(gv) and not verlustlimit_alert_gesendet:
+                send_email(
+                    subject="🛑 Trading Bot – Daily Loss Limit erreicht",
+                    body=(
+                        f"{gv}\n\n"
+                        f"Portfolio-Wert: ${portfolio_value:.2f}\n"
+                        f"Der Bot wurde automatisch pausiert und handelt erst nach "
+                        f"manueller Freigabe wieder."
+                    )
+                )
+                verlustlimit_alert_gesendet = True
+            continue  # NICHT trades_in_slot erhöhen – geblockter Kandidat verbraucht keinen Slot
 
         print(f"\n--- Trade-Kandidat: {signal.ticker} (Score: {signal.score}/100) ---")
 
@@ -318,16 +329,18 @@ def run_entry_cycle(slot: EntryTimeSlot):
             for r in llm_result["risks"]:
                 print(f"   ⚠️  {r}")
 
-        # Trade platzieren (Guardrails werden intern geprüft)
+        # Trade platzieren (Guardrails werden intern nochmal geprüft – Sicherheitsnetz
+        # falls sich der Zustand zwischen Vor-Check und Order-Platzierung ändert).
         try:
             trade = place_trade(signal, llm_result)
             if trade:
                 executed_trades.append(trade)
-                print(f"   ✅ Trade #{trade.id} ausgeführt")
+                trades_in_slot += 1  # Nur hier erhöhen – ein echter Trade wurde ausgeführt
+                print(f"   ✅ Trade #{trade.id} ausgeführt ({trades_in_slot}/{erlaubt})")
         except GuardrailViolation as gv:
             guardrail_reasons[signal.ticker] = str(gv)
             print(f"   🛡️  Guardrail: {gv}")
-            if "Verlustlimit" in str(gv):
+            if "Verlustlimit" in str(gv) and not verlustlimit_alert_gesendet:
                 send_email(
                     subject="🛑 Trading Bot – Daily Loss Limit erreicht",
                     body=(
@@ -337,7 +350,15 @@ def run_entry_cycle(slot: EntryTimeSlot):
                         f"manueller Freigabe wieder."
                     )
                 )
-            stopped_early = True  # Wenn Tageslimit, weitere Trades sinnlos
+                verlustlimit_alert_gesendet = True
+
+    # Kandidaten, die wegen erreichtem Slot-Kontingent gar nicht mehr geprüft
+    # wurden (Schleife oben per break beendet), bekommen fürs Scan-Log trotzdem
+    # einen nachvollziehbaren Grund statt eines leeren guardrail_reason.
+    executed_tickers = {t.ticker for t in executed_trades}
+    for signal in approved:
+        if signal.ticker not in guardrail_reasons and signal.ticker not in executed_tickers:
+            guardrail_reasons[signal.ticker] = f"Slot-Cap erreicht ({trades_in_slot}/{erlaubt} für diesen Slot)"
 
     # 6. Scan-Ergebnisse loggen (auch nicht ausgeführte Ticker, siehe Feature Scan-Log)
     executed_trades_by_ticker = {t.ticker: t.id for t in executed_trades}
