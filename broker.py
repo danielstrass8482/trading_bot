@@ -11,7 +11,8 @@ from config import (
 from database import (
     get_session, Trade, get_open_trades,
     get_daily_trade_count, get_total_capital_in_trades,
-    get_total_pnl, get_daily_pnl, close_trade, BotState
+    get_total_pnl, get_daily_pnl, close_trade, BotState,
+    get_alpaca_api_for_user,
 )
 from rule_engine import SignalResult
 
@@ -21,8 +22,20 @@ class GuardrailViolation(Exception):
     pass
 
 
-def _get_alpaca_client():
-    """Erstellt Alpaca-Client. Gibt None zurück wenn kein API-Key konfiguriert."""
+def _get_alpaca_client(user_id: int = None):
+    """
+    Erstellt Alpaca-Client. Mit user_id (Feature 8 Multi-Tenant) wird zuerst
+    versucht, die pro Nutzer in pos_users hinterlegten Keys zu verwenden
+    (siehe database.get_alpaca_api_for_user) – ohne user_id oder wenn der
+    Nutzer keine eigenen Keys verbunden hat, Fallback auf die globalen
+    .env-Keys (Beta-Phase: Daniel als einziger aktiver Trader, kein call site
+    übergibt aktuell eine user_id – Verhalten bleibt also unverändert).
+    Gibt None zurück wenn kein API-Key konfiguriert.
+    """
+    if user_id is not None:
+        client = get_alpaca_api_for_user(user_id)
+        if client:
+            return client
     try:
         import alpaca_trade_api as tradeapi
         return tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL)

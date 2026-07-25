@@ -44,6 +44,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///trading_bot.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+# Geteilt mit portfolio_os (gleicher Wert) – noetig um pos_users.alpaca_*_encrypted
+# zu entschluesseln (siehe database.get_alpaca_api_for_user, Feature 8 Multi-Tenant).
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")
+
 # ─────────────────────────────────────────────
 # ALERTS
 # ─────────────────────────────────────────────

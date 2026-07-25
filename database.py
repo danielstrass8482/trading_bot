@@ -6,17 +6,33 @@ Verwendet SQLAlchemy mit SQLite (serverlos, kein Setup nötig).
 from datetime import datetime, date
 from sqlalchemy import (
     create_engine, Column, Integer, Float, String,
-    DateTime, Date, Text, Boolean, func
+    DateTime, Date, Text, Boolean, func, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from contextlib import contextmanager
 import json
 
-from config import DATABASE_URL, SCORE_WEIGHTS
+from cryptography.fernet import Fernet
+
+from config import DATABASE_URL, SCORE_WEIGHTS, ENCRYPTION_KEY
 
 Base = declarative_base()
 engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(bind=engine)
+
+# Gleicher Fernet-Key wie portfolio_os/database.py – nur zum ENTSCHLÜSSELN der
+# dort verschlüsselten pos_users.alpaca_*_encrypted-Spalten nötig (siehe
+# get_alpaca_api_for_user unten, Feature 8 Multi-Tenant).
+_fernet = Fernet(ENCRYPTION_KEY.encode()) if ENCRYPTION_KEY else None
+
+
+def _decrypt_field(value: str) -> str:
+    if not _fernet or not value:
+        return value
+    try:
+        return _fernet.decrypt(value.encode()).decode()
+    except Exception:
+        return value
 
 
 # ─────────────────────────────────────────────
@@ -548,6 +564,41 @@ def save_daily_snapshot(session: Session, portfolio_value: float):
             trades_count=get_daily_trade_count(session),
             open_positions=len(get_open_trades(session))
         ))
+
+
+def get_alpaca_api_for_user(user_id: int):
+    """
+    Baut einen Alpaca-Client mit den pro Nutzer hinterlegten Keys (siehe
+    portfolio_os/database.py PosUser.alpaca_*_encrypted, verschlüsselt via
+    Fernet mit demselben ENCRYPTION_KEY). trading_bot hat kein eigenes
+    SQLAlchemy-Modell für pos_users (die Tabelle "gehört" portfolio_os) –
+    daher ein schlankes Raw-SQL-SELECT statt eines Duplikat-Modells.
+
+    Gibt None zurück, wenn kein Nutzer/keine Keys gefunden wurden – der
+    Aufrufer (siehe broker._get_alpaca_client) fällt dann auf die globalen
+    .env-Keys zurück (Beta-Phase: Daniel als einziger aktiver Trader,
+    Multi-User-Trading kommt erst in Phase 2).
+    """
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT alpaca_api_key_encrypted, alpaca_secret_key_encrypted, alpaca_mode "
+            "FROM pos_users WHERE id = :uid"
+        ), {"uid": user_id}).fetchone()
+
+    if not row or not row[0] or not row[1]:
+        return None
+
+    api_key = _decrypt_field(row[0])
+    secret_key = _decrypt_field(row[1])
+    mode = row[2] or "paper"
+    base_url = "https://api.alpaca.markets" if mode == "live" else "https://paper-api.alpaca.markets"
+
+    try:
+        import alpaca_trade_api as tradeapi
+        return tradeapi.REST(api_key, secret_key, base_url)
+    except Exception as e:
+        print(f"⚠️  Alpaca-Client für Nutzer {user_id} nicht verfügbar: {e}")
+        return None
 
 
 if __name__ == "__main__":
