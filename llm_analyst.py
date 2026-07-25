@@ -85,6 +85,70 @@ CRV: 2:1"""
         return _fallback_response(f"API-Fehler: {e}")
 
 
+def get_market_brief() -> str:
+    """
+    Erstellt ein kurzes KI-Marktbriefing (max. 150 Wörter, Deutsch) anhand
+    aktueller Indexstände. Bei fehlendem API-Key oder Fehler: Fallback-Text
+    statt Absturz (siehe Modul-Docstring: Bot läuft im degraded mode weiter).
+    """
+    import yfinance as yf
+    from datetime import datetime
+
+    indices = {
+        "S&P 500": "^GSPC",
+        "Nasdaq": "^IXIC",
+        "VIX": "^VIX",
+        "10Y Treasury": "^TNX",
+        "EUR/USD": "EURUSD=X",
+    }
+
+    market_data = {}
+    for name, ticker in indices.items():
+        try:
+            info = yf.Ticker(ticker).fast_info
+            price = info.get("lastPrice", 0)
+            prev = info.get("previousClose", price)
+            change_pct = ((price - prev) / prev * 100) if prev else 0
+            market_data[name] = {"price": price, "change_pct": change_pct}
+        except Exception:
+            pass
+
+    market_summary = "\n".join([
+        f"{name}: {d['price']:.2f} ({d['change_pct']:+.2f}%)"
+        for name, d in market_data.items()
+    ])
+
+    if not ANTHROPIC_API_KEY:
+        print("⚠️  Marktbriefing nicht verfügbar: Kein API-Key konfiguriert (degraded mode)")
+        return f"Marktdaten (KI-Briefing nicht verfügbar):\n{market_summary}" if market_summary else "Marktdaten aktuell nicht verfügbar."
+
+    prompt = f"""Heute ist {datetime.now().strftime('%d.%m.%Y')}.
+
+Aktuelle Marktdaten:
+{market_summary}
+
+Erstelle eine kurze Marktbriefing (max 150 Wörter) auf Deutsch:
+1. Wie ist die aktuelle Marktstimmung?
+2. Worauf sollten Anleger heute achten?
+3. Welche Sektoren sind besonders im Fokus?
+
+Ton: sachlich, informativ, keine Anlageberatung.
+Hinweis am Ende: "Dies ist kein Anlageberatung."
+"""
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model=LLM_MODEL,
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        print(f"⚠️  Marktbriefing-Generierung fehlgeschlagen: {e} (degraded mode)")
+        return f"Marktdaten (KI-Briefing fehlgeschlagen):\n{market_summary}" if market_summary else "Marktdaten aktuell nicht verfügbar."
+
+
 def _fallback_response(reason: str) -> dict:
     """Leere Antwort wenn LLM nicht verfügbar – Bot läuft weiter."""
     print(f"⚠️  LLM-Analyse nicht verfügbar: {reason} (degraded mode)")

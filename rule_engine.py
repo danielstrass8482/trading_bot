@@ -188,6 +188,36 @@ def check_correlation(ticker: str, open_tickers: list) -> tuple[bool, Optional[s
         return True, None
 
 
+def get_benchmark_performance(days: int = 30) -> dict:
+    """
+    Performance von S&P 500 und Nasdaq über die letzten `days` Tage (%) –
+    für den Bot-vs-Markt-Vergleich in Dashboard und Tages-E-Mail. Liegt hier
+    (statt in dashboard.py, das wegen seiner Streamlit-Top-Level-Aufrufe
+    nicht importierbar ist), damit main.py es für die Tages-Mail mitnutzen kann.
+    """
+    benchmarks = {
+        "S&P 500": "^GSPC",
+        "Nasdaq": "^IXIC",
+    }
+    results = {}
+    for name, ticker in benchmarks.items():
+        try:
+            df = yf.download(ticker, period=f"{days}d", interval="1d", progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            closes = df["Close"].dropna()
+            if not closes.empty:
+                start = float(closes.iloc[0])
+                end = float(closes.iloc[-1])
+                pct = (end - start) / start * 100
+                results[name] = round(pct, 2)
+            else:
+                results[name] = None
+        except Exception:
+            results[name] = None
+    return results
+
+
 def check_vix() -> tuple[float, bool]:
     """Prüft ob VIX unter dem Pausenschwellwert liegt."""
     df = fetch_market_data("^VIX", period="5d", min_rows=1)
@@ -198,18 +228,54 @@ def check_vix() -> tuple[float, bool]:
     return vix, vix <= threshold
 
 
+def check_earnings_risk(ticker: str, days_buffer: int = 3) -> tuple[bool, Optional[str]]:
+    """
+    Prüft ob Earnings in den nächsten days_buffer Handelstagen sind – via
+    yf.Ticker.calendar (deutlich zuverlässiger als das mittlerweile oft
+    fehlende info["earningsTimestamp"], das dieser Check vorher nutzte).
+    Gibt (True, Grund) bei Risiko zurück, sonst (False, None).
+    """
+    try:
+        t = yf.Ticker(ticker)
+        cal = t.calendar
+        if cal is None or (hasattr(cal, "empty") and cal.empty):
+            return False, None
+
+        earnings_date = None
+        if isinstance(cal, dict):
+            dates = cal.get("Earnings Date")
+            if dates:
+                earnings_date = pd.Timestamp(dates[0] if isinstance(dates, list) else dates)
+        elif "Earnings Date" in getattr(cal, "columns", []):
+            dates = cal["Earnings Date"].dropna()
+            if not dates.empty:
+                earnings_date = pd.Timestamp(dates.iloc[0])
+
+        if earnings_date is None:
+            return False, None
+
+        now = pd.Timestamp.now(tz="America/New_York").tz_localize(None)
+        days_until = (earnings_date - now).days
+
+        if 0 <= days_until <= days_buffer:
+            return True, (f"Earnings in {days_until} Tagen "
+                         f"({earnings_date.strftime('%d.%m.%Y')})")
+        return False, None
+    except Exception as e:
+        print(f"Earnings-Check Fehler {ticker}: {e}")
+        return False, None
+
+
 def check_ko_criteria(ticker: str, df: pd.DataFrame, fundamentals: dict) -> Optional[str]:
     """
     Prüft alle KO-Kriterien. Gibt Grund zurück wenn KO ausgelöst, sonst None.
     KO-Kriterien überschreiben alle anderen Signale.
     """
-    # 1. Earnings innerhalb der nächsten N Tage
-    earnings_ts = fundamentals.get("earnings_date")
-    if earnings_ts:
-        earnings_date = datetime.fromtimestamp(earnings_ts)
-        days_to_earnings = (earnings_date - datetime.now()).days
-        if 0 <= days_to_earnings <= EARNINGS_BUFFER_DAYS:
-            return f"Earnings in {days_to_earnings} Tagen – zu hohes Gap-Risiko"
+    # 1. Earnings innerhalb der nächsten N Tage (siehe check_earnings_risk)
+    days_buffer = int(get_live_config().get("EARNINGS_BUFFER_DAYS", EARNINGS_BUFFER_DAYS))
+    earnings_risk, earnings_reason = check_earnings_risk(ticker, days_buffer)
+    if earnings_risk:
+        return f"Earnings-Risiko: {earnings_reason}"
 
     # 2. Aktie hat sich in 5 Tagen zu stark bewegt
     if len(df) >= 5:

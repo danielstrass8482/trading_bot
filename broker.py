@@ -307,3 +307,27 @@ def get_portfolio_value() -> float:
 
         max_capital_total = get_live_config()["MAX_CAPITAL_TOTAL"]
         return round(max_capital_total + realized_pnl + unrealized_pnl, 2)
+
+
+def get_bot_performance(days: int = 30) -> float | None:
+    """
+    Prozentuale Bot-Performance über die letzten `days` Tage – Vergleichsbasis
+    für rule_engine.get_benchmark_performance() (S&P 500 / Nasdaq). Nutzt den
+    ältesten daily_log-Snapshot innerhalb des Zeitraums als Startwert; None
+    falls noch kein Snapshot in diesem Zeitraum existiert (z.B. Bot läuft
+    noch keine `days` Tage).
+    """
+    from datetime import date, timedelta
+    from database import DailyLog
+
+    cutoff = date.today() - timedelta(days=days)
+    with get_session() as session:
+        start_snapshot = session.query(DailyLog).filter(
+            DailyLog.log_date >= cutoff
+        ).order_by(DailyLog.log_date.asc()).first()
+
+    if not start_snapshot or start_snapshot.portfolio_value <= 0:
+        return None
+
+    current_value = get_portfolio_value()
+    return round((current_value - start_snapshot.portfolio_value) / start_snapshot.portfolio_value * 100, 2)

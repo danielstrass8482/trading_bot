@@ -215,6 +215,7 @@ _LIVE_CONFIG_SPEC = {
     "MAX_HOLDING_DAYS":        (int,   5),
     "VOLATILE_SEGMENT_PCT":    (float, 0.33),
     "VOLATILE_ATR_THRESHOLD":  (float, 0.025),
+    "EARNINGS_BUFFER_DAYS":    (int,   EARNINGS_BUFFER_DAYS),
 }
 
 

@@ -25,9 +25,9 @@ from database import (
     EntryTimeSlot, get_active_entry_time_slots, get_daily_trade_count,
     get_open_trades,
 )
-from rule_engine import scan_all_watchlists, check_vix
-from llm_analyst import analyze_with_llm
-from broker import place_trade, monitor_open_positions, get_portfolio_value, check_guardrails, GuardrailViolation
+from rule_engine import scan_all_watchlists, check_vix, get_market_regime, get_benchmark_performance
+from llm_analyst import analyze_with_llm, get_market_brief
+from broker import place_trade, monitor_open_positions, get_portfolio_value, get_bot_performance, check_guardrails, GuardrailViolation
 from backlook import run_backlook
 
 
@@ -166,8 +166,50 @@ OFFENE POSITIONEN
     else:
         body += "  Keine offenen Positionen\n"
 
+    # Performance-Vergleich vs. Benchmarks (siehe Feature Benchmark-Vergleich)
+    bot_performance = get_bot_performance(days=30)
+    benchmarks = get_benchmark_performance(days=30)
+    if bot_performance is not None:
+        sp500 = benchmarks.get("S&P 500")
+        nasdaq = benchmarks.get("Nasdaq")
+        body += f"""
+PERFORMANCE-VERGLEICH (30 Tage):
+Dein Bot:  {bot_performance:+.2f}%
+S&P 500:   {f'{sp500:+.2f}%' if sp500 is not None else 'N/A'}
+Nasdaq:    {f'{nasdaq:+.2f}%' if nasdaq is not None else 'N/A'}
+"""
+
     send_email(subject, body)
     print(f"✅ Tages-E-Mail gesendet ({len(slots_heute)} Slots)")
+
+
+def generate_morning_market_brief() -> str:
+    """Erstellt das tägliche KI-Marktbriefing (siehe llm_analyst.get_market_brief)."""
+    return get_market_brief()
+
+
+def send_morning_brief():
+    """
+    Verschickt das tägliche Marktbriefing per E-Mail vor dem ersten Entry-Slot
+    (siehe main(): Scheduler-Job um 08:30 ET, vor dem 09:45-ET-Slot).
+    """
+    brief = generate_morning_market_brief()
+    regime = get_market_regime()
+    regime_emoji = {"bullish": "📈", "bearish": "📉", "neutral": "➡️"}.get(regime, "➡️")
+
+    subject = f"🌅 Trading Bot – Marktbriefing {datetime.now().strftime('%d.%m.%Y')}"
+    body = f"""
+Guten Morgen!
+
+Markt-Regime: {regime_emoji} {regime.upper()}
+
+{brief}
+
+──────────────────────────
+Trading Bot startet heute um 09:45 ET.
+"""
+    send_email(subject, body)
+    print("✅ Morning Brief gesendet")
 
 
 def log_scan_results(signals: list, slot_et: str, executed_trades: dict, guardrail_reasons: dict = None):
@@ -525,6 +567,19 @@ def main():
     print("📍 Entry-Zeitslots registrieren...")
     schedule_entry_jobs(scheduler, et_tz)
 
+    # Morning Brief: täglich 08:30 ET, vor dem ersten Entry-Slot (09:45 ET).
+    scheduler.add_job(
+        send_morning_brief,
+        CronTrigger(
+            hour=8, minute=30,
+            day_of_week="mon-fri",
+            timezone=et_tz
+        ),
+        id="morning_brief",
+        name="Morning Market Brief",
+        replace_existing=True
+    )
+
     # Monitoring: alle N Minuten während Handelszeit (09:30–16:00 ET),
     # Intervall konfigurierbar via bot_config (MONITORING_INTERVAL_MIN).
     scheduler.add_job(
@@ -553,6 +608,7 @@ def main():
     )
 
     print(f"⏰ Scheduler aktiv. Entry-Zyklen laufen zu den registrierten Zeitslots (Mo–Fr)")
+    print(f"🌅 Morning Brief: täglich 08:30 ET")
     print(f"📡 Monitoring: alle {monitoring_interval} Min von 09:30–16:00 ET")
     print(f"📚 Backlook: montags 06:00 ET")
     print(f"🛑 Zum Beenden: Ctrl+C\n")

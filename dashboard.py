@@ -20,8 +20,8 @@ from database import (
     get_daily_trade_count, get_total_capital_in_trades, DailyLog, Trade, BotState,
     WeightHistory, get_active_weights, CLOSED_STATUSES
 )
-from rule_engine import analyze_ticker, check_vix
-from broker import get_portfolio_value
+from rule_engine import analyze_ticker, check_vix, get_benchmark_performance
+from broker import get_portfolio_value, get_bot_performance
 from main import calculate_max_trades_today
 
 # ── PAGE CONFIG ────────────────────────────────────────────────────
@@ -481,6 +481,34 @@ with tab4:
             col_s3.metric("Trefferquote", f"{len(wins)/total*100:.0f}%" if total else "—")
             total_pnl_sum = sum(t.pnl_usd for t in closed_trades if t.pnl_usd)
             col_s4.metric("Gesamt P&L", f"${total_pnl_sum:.2f}")
+
+        # Performance-Vergleich vs. Benchmarks (siehe Feature Benchmark-Vergleich)
+        st.markdown("---")
+        st.markdown("**Performance-Vergleich (30 Tage):**")
+        bot_perf = get_bot_performance(days=30)
+        if bot_perf is None:
+            st.info("Noch nicht genug Historie für einen 30-Tage-Vergleich.")
+        else:
+            benchmark_perf = get_benchmark_performance(days=30)
+            rows = [("Dein Bot", bot_perf)] + list(benchmark_perf.items())
+            max_abs = max((abs(v) for _, v in rows if v is not None), default=1) or 1
+
+            for label, pct in rows:
+                if pct is None:
+                    st.markdown(f"{label}: N/A")
+                    continue
+                if label == "Dein Bot":
+                    cls = "positive" if pct > 0 else ("negative" if pct < 0 else "neutral")
+                else:
+                    cls = "positive" if bot_perf > pct else ("negative" if bot_perf < pct else "neutral")
+                bar_len = max(1, int(round(abs(pct) / max_abs * 20))) if pct != 0 else 0
+                bar = "█" * bar_len
+                st.markdown(
+                    f'<p style="margin:0.15rem 0">{label:<10} '
+                    f'<span class="kpi-value {cls}" style="font-size:1rem">{pct:+.2f}%</span> '
+                    f'<span class="kpi-value {cls}" style="font-size:1rem; letter-spacing:-1px">{bar}</span></p>',
+                    unsafe_allow_html=True
+                )
 
 
 # ══════════════════════════════════════════════════════════════════

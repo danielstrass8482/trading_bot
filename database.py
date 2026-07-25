@@ -143,6 +143,7 @@ DEFAULT_CONFIG = {
     "MAX_HOLDING_DAYS":        ("5",      "Max. Haltedauer in Handelstagen"),
     "VOLATILE_SEGMENT_PCT":    ("0.33",   "Anteil volatile Titel am Portfolio (0-1)"),
     "VOLATILE_ATR_THRESHOLD":  ("0.025",  "ATR/Preis Ratio ab dem ein Titel als volatil gilt (2.5%)"),
+    "EARNINGS_BUFFER_DAYS":    ("3",      "Tage vor Earnings in denen nicht gekauft wird"),
 }
 
 
