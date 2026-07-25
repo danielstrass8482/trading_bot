@@ -105,6 +105,12 @@ LONG_WATCHLIST = [
 
     # Konsumgüter
     "NKE", "LULU", "TJX", "ROST",
+
+    # Volatile Titel (siehe VOLATILE_WATCHLIST) – bewusst mit dem User
+    # abgestimmt (2026-07-25), damit die Portfolio-Segmentierung tatsächlich
+    # wirksam wird (sonst würde der Bot diese Ticker nie scannen/kaufen).
+    "PLTR", "SOFI", "RIVN", "SOXL", "ARKK",
+    "MSTR", "COIN", "RBLX", "SNAP", "HOOD",
 ]
 
 # Bärische Instrumente – Bot kauft LONG auf Inverse ETF wenn Markt bärisch
@@ -112,6 +118,20 @@ LONG_WATCHLIST = [
 # Inverse-ETFs (2x/3x) – entsprechend höhere Volatilität pro eingesetztem
 # Dollar als SH/PSQ (1x), bewusst mit dem User abgestimmt (2026-07-24).
 ACTIVE_SHORT_INSTRUMENTS = ["SH", "PSQ", "SDS", "SQQQ", "SPXS"]
+
+# Teilmenge von LONG_WATCHLIST, die als besonders volatil gilt (Portfolio-
+# Segmentierung, siehe main.run_entry_cycle) – günstige/gehebelte/spekulative
+# Titel, die der Bot bewusst nur bis zu einem Zielanteil (VOLATILE_SEGMENT_PCT)
+# am offenen Portfolio zulässt.
+VOLATILE_WATCHLIST = [
+    "PLTR", "SOFI", "RIVN",  # Günstig + volatil
+    "SOXL",                   # 3x Halbleiter ETF
+    "ARKK",                   # Innovations ETF
+    "MSTR",                   # Bitcoin-Proxy
+    "COIN",                   # Coinbase
+    "RBLX", "SNAP", "UBER",  # Wachstum + volatil
+    "HOOD",                   # Robinhood
+]
 
 # ─────────────────────────────────────────────
 # HARTKODIERTE GUARDRAILS (Emotionsbremse)
@@ -192,6 +212,9 @@ _LIVE_CONFIG_SPEC = {
     "ATR_MULTIPLIER_TP":       (float, 3.0),
     "ATR_MIN_SL_PCT":          (float, 0.01),
     "ATR_MAX_SL_PCT":          (float, 0.08),
+    "MAX_HOLDING_DAYS":        (int,   5),
+    "VOLATILE_SEGMENT_PCT":    (float, 0.33),
+    "VOLATILE_ATR_THRESHOLD":  (float, 0.025),
 }
 
 

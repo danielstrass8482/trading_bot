@@ -42,7 +42,7 @@ class Trade(Base):
     llm_summary    = Column(Text, nullable=True)
     llm_risks      = Column(Text, nullable=True)           # JSON-Array als String
     score_breakdown = Column(Text, nullable=True)          # JSON-Objekt: Kriterium -> {score, max, value}
-    status         = Column(String(20), default="OPEN")   # OPEN / CLOSED_SL / CLOSED_TP / CLOSED_MANUAL
+    status         = Column(String(20), default="OPEN")   # OPEN / CLOSED_SL / CLOSED_TP / CLOSED_TRAILING_SL / CLOSED_TIME_EXIT / CLOSED_MANUAL
     exit_price     = Column(Float, nullable=True)
     closed_at      = Column(DateTime, nullable=True)
     pnl_usd        = Column(Float, nullable=True)
@@ -51,6 +51,9 @@ class Trade(Base):
     atr            = Column(Float, nullable=True)          # ATR(14) zum Einstiegszeitpunkt
     sl_pct         = Column(Float, nullable=True)          # tatsächlich verwendeter SL % (ATR- oder Fallback-basiert)
     tp_pct         = Column(Float, nullable=True)          # tatsächlich verwendeter TP %
+    trailing_sl_active         = Column(Boolean, default=False)  # True sobald TP erreicht & Trailing SL statt Verkauf aktiviert
+    trailing_sl_price          = Column(Float, nullable=True)    # aktueller Trailing-SL-Preis (nur wenn trailing_sl_active)
+    highest_price_since_entry  = Column(Float, nullable=True)    # höchster beobachteter Kurs seit Entry (Basis für Trailing SL)
 
     def get_llm_risks(self) -> list:
         """Deserialisiert llm_risks JSON-String zu Liste."""
@@ -137,6 +140,9 @@ DEFAULT_CONFIG = {
     "ATR_MULTIPLIER_TP":       ("3.0",    "ATR Multiplikator Take Profit"),
     "ATR_MIN_SL_PCT":          ("0.01",   "Minimaler SL % (Sicherheitsnetz)"),
     "ATR_MAX_SL_PCT":          ("0.08",   "Maximaler SL % (Sicherheitsnetz)"),
+    "MAX_HOLDING_DAYS":        ("5",      "Max. Haltedauer in Handelstagen"),
+    "VOLATILE_SEGMENT_PCT":    ("0.33",   "Anteil volatile Titel am Portfolio (0-1)"),
+    "VOLATILE_ATR_THRESHOLD":  ("0.025",  "ATR/Preis Ratio ab dem ein Titel als volatil gilt (2.5%)"),
 }
 
 
@@ -196,6 +202,7 @@ class ScanLog(Base):
     trade_executed  = Column(Boolean, default=False)
     trade_id        = Column(Integer, nullable=True)  # FK zu trades.id
     mode            = Column(String(10), default="LIVE")
+    market_regime   = Column(Text, nullable=True)  # "bullish" / "bearish" / "neutral" (siehe rule_engine.get_market_regime)
 
 
 class DailyLog(Base):
@@ -257,6 +264,8 @@ def init_db():
     Base.metadata.create_all(engine)
     _migrate_entry_time_slots_columns()
     _migrate_trades_atr_columns()
+    _migrate_trades_trailing_sl_columns()
+    _migrate_scan_log_regime_column()
     # Initiale Bot-State-Werte setzen falls nicht vorhanden
     with get_session() as session:
         if not BotState.get(session, "daily_trade_count"):
@@ -318,6 +327,32 @@ def _migrate_trades_atr_columns():
         conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS tp_pct FLOAT"))
 
 
+def _migrate_trades_trailing_sl_columns():
+    """
+    Base.metadata.create_all() ändert keine Spalten einer bereits bestehenden
+    Tabelle – trailing_sl_active/trailing_sl_price/highest_price_since_entry
+    (Trailing-SL-Feature) kamen nachträglich zur trades-Tabelle dazu, daher
+    ein idempotentes ALTER TABLE ... ADD COLUMN IF NOT EXISTS.
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trailing_sl_active BOOLEAN DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trailing_sl_price FLOAT DEFAULT NULL"))
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS highest_price_since_entry FLOAT DEFAULT NULL"))
+
+
+def _migrate_scan_log_regime_column():
+    """
+    Base.metadata.create_all() ändert keine Spalten einer bereits bestehenden
+    Tabelle – market_regime (Regime-Detection-Feature) kam nachträglich zur
+    scan_log-Tabelle dazu, daher ein idempotentes ALTER TABLE ... ADD COLUMN
+    IF NOT EXISTS.
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE scan_log ADD COLUMN IF NOT EXISTS market_regime TEXT"))
+
+
 @contextmanager
 def get_session():
     """Context Manager für sichere Datenbanksessions."""
@@ -357,10 +392,17 @@ def get_total_capital_in_trades(session: Session) -> float:
     return result or 0.0
 
 
+# Alle Status-Werte eines abgeschlossenen Trades – zentral gepflegt, damit
+# neue Exit-Gründe (z.B. Trailing SL, Time-Exit) nicht in get_total_pnl/
+# get_daily_pnl vergessen werden und so das Daily-Loss-Limit (Guardrail!)
+# unterlaufen.
+CLOSED_STATUSES = ["CLOSED_SL", "CLOSED_TP", "CLOSED_TRAILING_SL", "CLOSED_TIME_EXIT", "CLOSED_MANUAL"]
+
+
 def get_total_pnl(session: Session) -> float:
     """Gesamter realisierter P&L aller abgeschlossenen Trades."""
     result = session.query(func.sum(Trade.pnl_usd)).filter(
-        Trade.status.in_(["CLOSED_SL", "CLOSED_TP", "CLOSED_MANUAL"])
+        Trade.status.in_(CLOSED_STATUSES)
     ).scalar()
     return result or 0.0
 
@@ -369,7 +411,7 @@ def get_daily_pnl(session: Session) -> float:
     """Realisierter P&L der heute geschlossenen Trades (für das Daily-Loss-Limit)."""
     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     result = session.query(func.sum(Trade.pnl_usd)).filter(
-        Trade.status.in_(["CLOSED_SL", "CLOSED_TP", "CLOSED_MANUAL"]),
+        Trade.status.in_(CLOSED_STATUSES),
         Trade.closed_at >= today_start
     ).scalar()
     return result or 0.0

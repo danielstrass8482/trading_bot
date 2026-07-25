@@ -191,12 +191,34 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
         return trade
 
 
+def count_trading_days(start_date, end_date) -> int:
+    """
+    Zählt Handelstage (Mo-Fr) zwischen start_date und end_date (inklusive) –
+    Feiertage werden bewusst nicht berücksichtigt (Näherung, siehe Feature
+    Time-based Exit).
+    """
+    import pandas as pd
+    return len(pd.bdate_range(start_date, end_date))
+
+
 def monitor_open_positions():
     """
     Prüft alle offenen Positionen gegen aktuelle Preise.
-    Schließt Positionen die Stop Loss oder Take Profit erreicht haben.
+    - Time-based Exit: Position wird nach MAX_HOLDING_DAYS Handelstagen
+      unabhängig von SL/TP geschlossen.
+    - Solange kein Trailing SL aktiv ist: normaler fester Stop Loss / Take
+      Profit. Erreicht der Kurs den Take Profit, wird NICHT sofort verkauft,
+      sondern ein ATR-basierter Trailing SL aktiviert (siehe Feature
+      Trailing SL nach erstem TP).
+    - Ist der Trailing SL aktiv: SL wird nachgezogen, sobald ein neuer Hoch-
+      punkt erreicht wird; fällt der Kurs unter den Trailing SL, wird verkauft.
     Wird vom Scheduler regelmäßig aufgerufen.
     """
+    from rule_engine import calculate_atr
+
+    config = get_live_config()
+    max_days = int(config.get("MAX_HOLDING_DAYS", 5))
+
     with get_session() as session:
         open_trades = get_open_trades(session)
         if not open_trades:
@@ -216,15 +238,48 @@ def monitor_open_positions():
 
                 current_price = float(current_price)
 
-                # Stop Loss ausgelöst?
-                if current_price <= trade.stop_loss:
-                    close_trade(session, trade, current_price, "CLOSED_SL")
-                    print(f"🔴 SL ausgelöst: {trade.ticker} @ ${current_price} (PnL: ${trade.pnl_usd:.2f})")
+                # Höchsten Kurs seit Entry tracken (Basis für Trailing SL)
+                if (trade.highest_price_since_entry is None or
+                        current_price > trade.highest_price_since_entry):
+                    trade.highest_price_since_entry = current_price
 
-                # Take Profit ausgelöst?
-                elif current_price >= trade.take_profit:
-                    close_trade(session, trade, current_price, "CLOSED_TP")
-                    print(f"🟢 TP ausgelöst: {trade.ticker} @ ${current_price} (PnL: ${trade.pnl_usd:.2f})")
+                # Time-based Exit: unabhängig von SL/TP/Trailing.
+                days_held = count_trading_days(trade.created_at.date(), datetime.now().date())
+                if days_held >= max_days:
+                    close_trade(session, trade, current_price, "CLOSED_TIME_EXIT")
+                    print(f"⏰ {trade.ticker}: Time-Exit nach {days_held} Handelstagen (PnL: ${trade.pnl_usd:.2f})")
+                    continue
+
+                if not trade.trailing_sl_active:
+                    # Phase 1: Normaler fester SL/TP
+                    if current_price <= trade.stop_loss:
+                        close_trade(session, trade, current_price, "CLOSED_SL")
+                        print(f"🔴 SL ausgelöst: {trade.ticker} @ ${current_price} (PnL: ${trade.pnl_usd:.2f})")
+                        continue
+
+                    if current_price >= trade.take_profit:
+                        # TP erreicht → Trailing SL aktivieren statt verkaufen
+                        trade.trailing_sl_active = True
+                        atr = calculate_atr(trade.ticker)
+                        sl_distance = atr * 1.5 if atr else current_price * 0.03
+                        trade.trailing_sl_price = round(current_price - sl_distance, 2)
+                        print(f"🎯 {trade.ticker}: TP erreicht! Trailing SL aktiviert bei ${trade.trailing_sl_price:.2f}")
+
+                else:
+                    # Phase 2: Trailing SL aktiv – SL nach oben nachziehen
+                    atr = calculate_atr(trade.ticker)
+                    sl_distance = atr * 1.5 if atr else current_price * 0.03
+                    new_trailing_sl = round(trade.highest_price_since_entry - sl_distance, 2)
+
+                    if new_trailing_sl > trade.trailing_sl_price:
+                        trade.trailing_sl_price = new_trailing_sl
+                        print(f"📈 {trade.ticker}: Trailing SL → ${trade.trailing_sl_price:.2f}")
+
+                    # Trailing SL ausgelöst?
+                    if current_price <= trade.trailing_sl_price:
+                        close_trade(session, trade, current_price, "CLOSED_TRAILING_SL")
+                        print(f"🟢 Trailing SL ausgelöst: {trade.ticker} @ ${current_price} (PnL: ${trade.pnl_usd:.2f})")
+                        continue
 
             except Exception as e:
                 print(f"⚠️  Fehler beim Monitoring von {trade.ticker}: {e}")

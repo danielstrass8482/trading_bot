@@ -18,7 +18,7 @@ from config import (
 from database import (
     init_db, get_session, get_open_trades, get_total_pnl,
     get_daily_trade_count, get_total_capital_in_trades, DailyLog, Trade, BotState,
-    WeightHistory, get_active_weights
+    WeightHistory, get_active_weights, CLOSED_STATUSES
 )
 from rule_engine import analyze_ticker, check_vix
 from broker import get_portfolio_value
@@ -139,10 +139,12 @@ def fmt_pct(val):
 
 def status_badge(status):
     mapping = {
-        "OPEN":          ("OPEN",   "badge-open"),
-        "CLOSED_TP":     ("TP ✓",   "badge-tp"),
-        "CLOSED_SL":     ("SL ✗",   "badge-sl"),
-        "CLOSED_MANUAL": ("MANUAL", "badge-open"),
+        "OPEN":              ("OPEN",       "badge-open"),
+        "CLOSED_TP":         ("TP ✓",       "badge-tp"),
+        "CLOSED_SL":         ("SL ✗",       "badge-sl"),
+        "CLOSED_TRAILING_SL": ("TRAIL ✓",   "badge-tp"),
+        "CLOSED_TIME_EXIT":  ("TIME-EXIT",  "badge-open"),
+        "CLOSED_MANUAL":     ("MANUAL",     "badge-open"),
     }
     label, cls = mapping.get(status, (status, "badge-open"))
     return f'<span class="badge {cls}">{label}</span>'
@@ -446,7 +448,7 @@ with tab4:
     with get_session() as session:
         snapshots = session.query(DailyLog).order_by(DailyLog.log_date.asc()).all()
         closed_trades = session.query(Trade).filter(
-            Trade.status.in_(["CLOSED_SL", "CLOSED_TP", "CLOSED_MANUAL"])
+            Trade.status.in_(CLOSED_STATUSES)
         ).all()
 
     if not snapshots:

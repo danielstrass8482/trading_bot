@@ -18,7 +18,7 @@ from config import (
     EARNINGS_BUFFER_DAYS, MAX_5DAY_MOVE_PCT,
     ACTIVE_SHORT_INSTRUMENTS, get_live_config
 )
-from database import get_session, get_active_weights
+from database import get_session, get_active_weights, get_open_trades
 
 
 # Branchen-Blacklist: Ticker aus diesen Sektoren/Industrien werden vor der
@@ -51,6 +51,8 @@ class SignalResult:
     atr:              Optional[float] = None
     sl_pct:           Optional[float] = None
     tp_pct:           Optional[float] = None
+    # Marktregime zum Analysezeitpunkt (siehe get_market_regime)
+    market_regime:    Optional[str] = None
     # Rohdaten für LLM-Analyse
     rsi:              Optional[float] = None
     pe_ratio:         Optional[float] = None
@@ -116,6 +118,74 @@ def calculate_atr(ticker: str, period: int = 14) -> Optional[float]:
     except Exception as e:
         print(f"ATR Fehler für {ticker}: {e}")
         return None
+
+
+_REGIME_CACHE = {"value": None, "ts": None}
+_REGIME_CACHE_TTL_SEC = 900  # 15 Min – vermeidet einen SPY-Download pro gescanntem Ticker
+
+
+def get_market_regime() -> str:
+    """
+    Bestimmt das aktuelle Marktregime anhand SPY vs. SMA50/SMA200:
+    "bullish" (Kurs > SMA200 und SMA50 > SMA200), "bearish" (umgekehrt)
+    oder "neutral". Ergebnis wird kurz gecacht, da sonst jeder gescannte
+    Ticker in analyze_ticker() einen eigenen SPY-Download auslösen würde.
+    """
+    now = datetime.now()
+    if (_REGIME_CACHE["value"] is not None and _REGIME_CACHE["ts"] is not None
+            and (now - _REGIME_CACHE["ts"]).total_seconds() < _REGIME_CACHE_TTL_SEC):
+        return _REGIME_CACHE["value"]
+
+    regime = "neutral"
+    try:
+        spy = fetch_market_data("SPY", period="1y", min_rows=200)
+        if spy is not None:
+            current = float(spy["Close"].iloc[-1])
+            sma200 = float(spy["Close"].rolling(200).mean().iloc[-1])
+            sma50 = float(spy["Close"].rolling(50).mean().iloc[-1])
+
+            if current > sma200 and sma50 > sma200:
+                regime = "bullish"
+            elif current < sma200 and sma50 < sma200:
+                regime = "bearish"
+    except Exception as e:
+        print(f"⚠️  Regime-Erkennung fehlgeschlagen: {e}")
+
+    _REGIME_CACHE["value"] = regime
+    _REGIME_CACHE["ts"] = now
+    return regime
+
+
+def check_correlation(ticker: str, open_tickers: list) -> tuple[bool, Optional[str]]:
+    """
+    Prüft ob ticker zu stark mit einer bereits offenen Position korreliert
+    (3-Monats-Tagesrenditen, Schwelle 0.8) – vermeidet Klumpenrisiko durch
+    mehrere Positionen, die faktisch dieselbe Bewegung abbilden.
+    Gibt (True, None) zurück wenn unbedenklich oder bei fehlenden Daten.
+    """
+    if not open_tickers:
+        return True, None
+
+    try:
+        all_tickers = [ticker] + open_tickers
+        data = yf.download(all_tickers, period="3mo", interval="1d", progress=False)["Close"]
+
+        if data.empty:
+            return True, None
+
+        returns = data.pct_change().dropna()
+
+        for open_ticker in open_tickers:
+            if ticker not in returns.columns or open_ticker not in returns.columns:
+                continue
+            corr = returns[ticker].corr(returns[open_ticker])
+            if corr is not None and corr > 0.8:
+                return False, f"Korrelation mit {open_ticker}: {corr:.2f} > 0.8"
+
+        return True, None
+    except Exception as e:
+        print(f"⚠️  Korrelationsprüfung fehlgeschlagen für {ticker}: {e}")
+        return True, None
 
 
 def check_vix() -> tuple[float, bool]:
@@ -298,6 +368,7 @@ def analyze_ticker(ticker: str) -> SignalResult:
     Gibt SignalResult zurück – entweder mit approved=True oder mit ko_reason.
     """
     is_inverse_etf = ticker in ACTIVE_SHORT_INSTRUMENTS
+    regime = get_market_regime()
 
     # Marktdaten laden
     df = fetch_market_data(ticker)
@@ -305,7 +376,8 @@ def analyze_ticker(ticker: str) -> SignalResult:
         return SignalResult(
             ticker=ticker, score=0, direction="BLOCKED",
             instrument_type="INVERSE_ETF" if is_inverse_etf else "STOCK",
-            approved=False, ko_reason="Keine Marktdaten verfügbar"
+            approved=False, ko_reason="Keine Marktdaten verfügbar",
+            market_regime=regime,
         )
 
     # Fundamentaldaten (nicht für Inverse ETFs relevant)
@@ -321,6 +393,7 @@ def analyze_ticker(ticker: str) -> SignalResult:
                 ticker=ticker, score=0, direction="BLOCKED",
                 instrument_type="STOCK", approved=False,
                 ko_reason=f"Blacklist: {blacklist_key}",
+                market_regime=regime,
             )
 
     # KO-Kriterien prüfen
@@ -330,11 +403,41 @@ def analyze_ticker(ticker: str) -> SignalResult:
             ticker=ticker, score=0, direction="BLOCKED",
             instrument_type="INVERSE_ETF" if is_inverse_etf else "STOCK",
             approved=False, ko_reason=ko,
-            current_price=float(df["Close"].iloc[-1])
+            current_price=float(df["Close"].iloc[-1]),
+            market_regime=regime,
+        )
+
+    # Korrelationsfilter: zu hohe Korrelation mit einer bereits offenen
+    # Position vermeidet Klumpenrisiko (siehe check_correlation).
+    with get_session() as session:
+        open_tickers = [t.ticker for t in get_open_trades(session)]
+    corr_ok, corr_reason = check_correlation(ticker, open_tickers)
+    if not corr_ok:
+        return SignalResult(
+            ticker=ticker, score=0, direction="BLOCKED",
+            instrument_type="INVERSE_ETF" if is_inverse_etf else "STOCK",
+            approved=False, ko_reason=f"Korrelationsfilter: {corr_reason}",
+            current_price=float(df["Close"].iloc[-1]),
+            market_regime=regime,
         )
 
     # Score berechnen
     result = calculate_score(ticker, df, fundamentals, is_inverse_etf)
+    result.market_regime = regime
+
+    # Markt-Regime-Filter: in einem bärischen Markt werden LONG-Aktien
+    # abgestraft und Inverse ETFs bevorzugt (score muss danach neu gegen
+    # MIN_SIGNAL_SCORE geprüft werden).
+    if regime == "bearish" and result.instrument_type == "STOCK" and result.direction == "LONG":
+        result.score -= 10
+        print(f"📉 Bearish Regime: Score -10 für {ticker}")
+    elif regime == "bearish" and result.instrument_type == "INVERSE_ETF":
+        result.score += 10
+        print(f"📉 Bearish Regime: Score +10 für {ticker} (Inverse ETF)")
+
+    cfg = get_live_config()
+    result.approved = result.score >= cfg["MIN_SIGNAL_SCORE"]
+
     return result
 
 

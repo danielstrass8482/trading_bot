@@ -14,7 +14,7 @@ import pytz
 from sqlalchemy import text
 
 from config import (
-    LONG_WATCHLIST, ACTIVE_SHORT_INSTRUMENTS,
+    LONG_WATCHLIST, ACTIVE_SHORT_INSTRUMENTS, VOLATILE_WATCHLIST,
     PROFIT_ALERT_TARGET, MAX_CAPITAL_TOTAL, TRADING_MODE,
     validate_config, get_live_config,
     ALERT_EMAIL, SMTP_HOST, SMTP_PORT, SMTP_FALLBACK_PORT,
@@ -23,6 +23,7 @@ from config import (
 from database import (
     init_db, get_session, save_daily_snapshot, BotState, ScanLog,
     EntryTimeSlot, get_active_entry_time_slots, get_daily_trade_count,
+    get_open_trades,
 )
 from rule_engine import scan_all_watchlists, check_vix
 from llm_analyst import analyze_with_llm
@@ -205,6 +206,7 @@ def log_scan_results(signals: list, slot_et: str, executed_trades: dict, guardra
                 trade_executed = trade_id is not None,
                 trade_id     = trade_id,
                 mode         = TRADING_MODE,
+                market_regime = signal.market_regime,
             )
             session.add(log_entry)
         session.commit()
@@ -375,6 +377,30 @@ def run_entry_cycle(slot: EntryTimeSlot):
                 )
                 verlustlimit_alert_gesendet = True
             continue  # NICHT trades_in_slot erhöhen – geblockter Kandidat verbraucht keinen Slot
+
+        # Portfolio-Segmentierung: Anteil volatiler Titel (VOLATILE_WATCHLIST)
+        # an den offenen Positionen begrenzen bzw. gezielt auffüllen (siehe
+        # Feature Portfolio-Segmentierung). Frisch pro Kandidat berechnet,
+        # damit bereits in diesem Zyklus ausgeführte Trades berücksichtigt sind.
+        seg_config = get_live_config()
+        volatile_target = float(seg_config.get("VOLATILE_SEGMENT_PCT", 0.33))
+
+        with get_session() as seg_session:
+            open_trades_all = get_open_trades(seg_session)
+        total_open = len(open_trades_all)
+        volatile_open = sum(1 for t in open_trades_all if t.ticker in VOLATILE_WATCHLIST)
+        volatile_ratio = (volatile_open / total_open) if total_open > 0 else 0
+
+        if signal.ticker in VOLATILE_WATCHLIST:
+            if volatile_ratio > volatile_target + 0.15:
+                # Zu viele volatile Titel offen: diesen Kandidaten blockieren
+                guardrail_reasons[signal.ticker] = f"Volatile Segment voll ({volatile_ratio*100:.0f}%)"
+                print(f"   🛡️  {signal.ticker}: Volatile Segment voll ({volatile_ratio*100:.0f}%)")
+                continue  # NICHT trades_in_slot erhöhen
+            elif volatile_ratio < volatile_target:
+                # Volatiles Segment unterrepräsentiert: Score-Bonus
+                signal.score += 5
+                print(f"   📊 {signal.ticker}: Volatile Segment unterrepräsentiert ({volatile_ratio*100:.0f}%) – Score +5")
 
         print(f"\n--- Trade-Kandidat: {signal.ticker} (Score: {signal.score}/100) ---")
 
