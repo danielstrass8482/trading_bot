@@ -210,7 +210,37 @@ def log_scan_results(signals: list, slot_et: str, executed_trades: dict, guardra
         session.commit()
 
 
-def get_trades_for_slot(slot: EntryTimeSlot, daily_count: int, config: dict) -> int:
+def calculate_max_trades_today() -> int:
+    """
+    Ersetzt die feste MAX_TRADES_PER_DAY-Grenze: berechnet täglich neu, wie
+    viele neue Trades tatsächlich möglich sind – begrenzt durch das noch
+    verfügbare Kapital (MAX_CAPITAL_TOTAL - bereits investiert) UND durch
+    die Anzahl noch freier offener Positionen (MAX_OPEN_POSITIONS).
+    """
+    config = get_live_config()
+    max_capital_total = float(config.get("MAX_CAPITAL_TOTAL", 475))
+    max_per_trade = float(config.get("MAX_CAPITAL_PER_TRADE", 50))
+    max_open = int(config.get("MAX_OPEN_POSITIONS", 5))
+
+    with get_session() as session:
+        invested = session.execute(text("""
+            SELECT COALESCE(SUM(capital_used), 0) as invested
+            FROM trades WHERE status = 'OPEN'
+        """)).scalar()
+        invested = float(invested or 0)
+        available_capital = max_capital_total - invested
+
+        current_open = session.execute(text("""
+            SELECT COUNT(*) FROM trades WHERE status = 'OPEN'
+        """)).scalar()
+
+        max_by_capital = int(available_capital / max_per_trade) if max_per_trade > 0 else 0
+        max_by_positions = max_open - int(current_open)
+
+        return max(0, min(max_by_capital, max_by_positions))
+
+
+def get_trades_for_slot(slot: EntryTimeSlot, daily_count: int) -> int:
     """
     Dynamische Slot-Verteilung (ersetzt festes "Konservatives Frühbudget"-Cap):
     das verbleibende Tagesbudget wird gleichmäßig (aufgerundet) auf die noch
@@ -218,7 +248,7 @@ def get_trades_for_slot(slot: EntryTimeSlot, daily_count: int, config: dict) -> 
     das gesamte Restbudget zu überlassen. slot.max_trades_per_slot bleibt als
     optionale Obergrenze bestehen.
     """
-    max_trades_today = int(config.get("MAX_TRADES_PER_DAY", 5))
+    max_trades_today = calculate_max_trades_today()
     restbudget = max_trades_today - daily_count
 
     if restbudget <= 0:
@@ -288,12 +318,11 @@ def run_entry_cycle(slot: EntryTimeSlot):
     # dynamisch auf die verbleibenden aktiven Slots verteilt statt frühen
     # Slots das gesamte Restbudget zu überlassen (siehe get_trades_for_slot).
     with get_session() as session:
-        config = get_live_config()
-        max_trades_today = int(config.get("MAX_TRADES_PER_DAY", 5))
+        max_trades_today = calculate_max_trades_today()
         trades_heute = get_daily_trade_count(session)
         restbudget = max_trades_today - trades_heute
 
-    erlaubt = get_trades_for_slot(slot, trades_heute, config)
+    erlaubt = get_trades_for_slot(slot, trades_heute)
 
     print(f"🎯 Slot-Budget: {erlaubt} Trade(s) (Cap {slot.max_trades_per_slot}, Restbudget {restbudget}/{max_trades_today})")
     if erlaubt <= 0:

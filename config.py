@@ -188,6 +188,10 @@ _LIVE_CONFIG_SPEC = {
     "MIN_SIGNAL_SCORE":        (int,   MIN_SIGNAL_SCORE),
     "VIX_PAUSE_THRESHOLD":     (float, VIX_PAUSE_THRESHOLD),
     "MONITORING_INTERVAL_MIN": (int,   15),
+    "ATR_MULTIPLIER_SL":       (float, 1.5),
+    "ATR_MULTIPLIER_TP":       (float, 3.0),
+    "ATR_MIN_SL_PCT":          (float, 0.01),
+    "ATR_MAX_SL_PCT":          (float, 0.08),
 }
 
 

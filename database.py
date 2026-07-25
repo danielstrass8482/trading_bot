@@ -48,6 +48,9 @@ class Trade(Base):
     pnl_usd        = Column(Float, nullable=True)
     pnl_pct        = Column(Float, nullable=True)
     mode           = Column(String(10), default="PAPER")   # PAPER / LIVE
+    atr            = Column(Float, nullable=True)          # ATR(14) zum Einstiegszeitpunkt
+    sl_pct         = Column(Float, nullable=True)          # tatsächlich verwendeter SL % (ATR- oder Fallback-basiert)
+    tp_pct         = Column(Float, nullable=True)          # tatsächlich verwendeter TP %
 
     def get_llm_risks(self) -> list:
         """Deserialisiert llm_risks JSON-String zu Liste."""
@@ -130,6 +133,10 @@ DEFAULT_CONFIG = {
     "VIX_PAUSE_THRESHOLD":     ("30",     "VIX-Limit"),
     "MONITORING_INTERVAL_MIN": ("15",     "Monitoring-Intervall Minuten"),
     "ENTRY_LEARNING_MODE":     ("false",  "Backlook-Vorschläge zu Einstiegszeitpunkten automatisch übernehmen"),
+    "ATR_MULTIPLIER_SL":       ("1.5",    "ATR Multiplikator Stop Loss"),
+    "ATR_MULTIPLIER_TP":       ("3.0",    "ATR Multiplikator Take Profit"),
+    "ATR_MIN_SL_PCT":          ("0.01",   "Minimaler SL % (Sicherheitsnetz)"),
+    "ATR_MAX_SL_PCT":          ("0.08",   "Maximaler SL % (Sicherheitsnetz)"),
 }
 
 
@@ -249,6 +256,7 @@ def init_db():
     """Erstellt alle Tabellen (idempotent – safe to call multiple times)."""
     Base.metadata.create_all(engine)
     _migrate_entry_time_slots_columns()
+    _migrate_trades_atr_columns()
     # Initiale Bot-State-Werte setzen falls nicht vorhanden
     with get_session() as session:
         if not BotState.get(session, "daily_trade_count"):
@@ -294,6 +302,20 @@ def _migrate_entry_time_slots_columns():
             "UPDATE entry_time_slots SET max_trades_per_slot = 1 "
             "WHERE stunde_et IN (9, 10) AND minute_et IN (45, 30) AND max_trades_per_slot IS NULL"
         ))
+
+
+def _migrate_trades_atr_columns():
+    """
+    Base.metadata.create_all() ändert keine Spalten einer bereits bestehenden
+    Tabelle – atr/sl_pct/tp_pct (ATR-basierter SL/TP) kamen nachträglich zur
+    trades-Tabelle dazu, daher ein idempotentes ALTER TABLE ... ADD COLUMN
+    IF NOT EXISTS.
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS atr FLOAT"))
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS sl_pct FLOAT"))
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS tp_pct FLOAT"))
 
 
 @contextmanager

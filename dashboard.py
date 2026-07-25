@@ -10,18 +10,19 @@ from datetime import datetime, date
 import json
 
 from config import (
-    MAX_CAPITAL_TOTAL, MAX_CAPITAL_PER_TRADE, MAX_TRADES_PER_DAY,
+    MAX_CAPITAL_TOTAL, MAX_CAPITAL_PER_TRADE,
     STOP_LOSS_PCT, TAKE_PROFIT_PCT, MIN_SIGNAL_SCORE,
     VIX_PAUSE_THRESHOLD, TRADING_MODE, LONG_WATCHLIST,
     ACTIVE_SHORT_INSTRUMENTS, PROFIT_ALERT_TARGET, get_live_config
 )
 from database import (
     init_db, get_session, get_open_trades, get_total_pnl,
-    get_daily_trade_count, DailyLog, Trade, BotState,
+    get_daily_trade_count, get_total_capital_in_trades, DailyLog, Trade, BotState,
     WeightHistory, get_active_weights
 )
 from rule_engine import analyze_ticker, check_vix
 from broker import get_portfolio_value
+from main import calculate_max_trades_today
 
 # ── PAGE CONFIG ────────────────────────────────────────────────────
 st.set_page_config(
@@ -162,14 +163,17 @@ with st.sidebar:
         daily_count  = get_daily_trade_count(session)
         open_count   = len(get_open_trades(session))
         bot_paused   = BotState.get(session, "bot_paused") == "true"
+        invested     = get_total_capital_in_trades(session)
 
-    # Trade-Limit – Y kommt live aus bot_config (Dashboard-Änderungen greifen
-    # sofort, kein Neustart nötig), Fallback ist der hardcoded MAX_TRADES_PER_DAY.
+    # Verfügbare Trades/Kapital – dynamisch aus aktuell investiertem Kapital
+    # und offenen Positionen berechnet (siehe main.calculate_max_trades_today),
+    # ersetzt die feste "Trades heute: X/5"-Anzeige.
     live_cfg = get_live_config()
-    max_trades = live_cfg.get("MAX_TRADES_PER_DAY", MAX_TRADES_PER_DAY)
-    trade_pct = daily_count / max_trades
-    cls = "guardrail-ok" if trade_pct < 0.8 else ("guardrail-warn" if trade_pct < 1.0 else "guardrail-block")
-    st.markdown(f'<p class="{cls}">Trades heute: {daily_count}/{max_trades}</p>', unsafe_allow_html=True)
+    max_capital_total = live_cfg.get("MAX_CAPITAL_TOTAL", MAX_CAPITAL_TOTAL)
+    available_capital = max_capital_total - invested
+    available_trades = calculate_max_trades_today()
+    cls = "guardrail-ok" if available_trades > 1 else ("guardrail-warn" if available_trades == 1 else "guardrail-block")
+    st.markdown(f'<p class="{cls}">Verfügbar: {available_trades} Trades (${available_capital:.0f} frei)</p>', unsafe_allow_html=True)
 
     # Offene Positionen
     pos_pct = open_count / 5

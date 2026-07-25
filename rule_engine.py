@@ -46,6 +46,11 @@ class SignalResult:
     take_profit:      float = 0.0
     score_breakdown:  dict  = field(default_factory=dict)
     ko_reason:        Optional[str] = None   # Gesetzt wenn KO-Kriterium ausgelöst
+    # ATR-basierter SL/TP (siehe calculate_atr) – None wenn ATR nicht verfügbar
+    # war und auf feste Prozente aus bot_config zurückgefallen wurde.
+    atr:              Optional[float] = None
+    sl_pct:           Optional[float] = None
+    tp_pct:           Optional[float] = None
     # Rohdaten für LLM-Analyse
     rsi:              Optional[float] = None
     pe_ratio:         Optional[float] = None
@@ -85,6 +90,32 @@ def fetch_fundamentals(ticker: str) -> dict:
         }
     except Exception:
         return {}
+
+
+def calculate_atr(ticker: str, period: int = 14) -> Optional[float]:
+    """Berechnet den Average True Range (ATR) für den SL/TP-Abstand."""
+    try:
+        df = yf.download(ticker, period="1mo",
+                         interval="1d", progress=False,
+                         auto_adjust=False)
+        if df.empty or len(df) < period:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        high = df["High"]
+        low = df["Low"]
+        close = df["Close"].shift(1)
+
+        tr1 = high - low
+        tr2 = (high - close).abs()
+        tr3 = (low - close).abs()
+        true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = true_range.rolling(period).mean().iloc[-1]
+        return float(atr)
+    except Exception as e:
+        print(f"ATR Fehler für {ticker}: {e}")
+        return None
 
 
 def check_vix() -> tuple[float, bool]:
@@ -212,9 +243,31 @@ def calculate_score(ticker: str, df: pd.DataFrame, fundamentals: dict, is_invers
     total_score = sum(v["score"] for v in breakdown.values())
     approved    = total_score >= cfg["MIN_SIGNAL_SCORE"]
 
-    # Stop Loss & Take Profit
-    stop_loss   = round(current_price * (1 - cfg["STOP_LOSS_PCT"]), 2)
-    take_profit = round(current_price * (1 + cfg["TAKE_PROFIT_PCT"]), 2)
+    # Stop Loss & Take Profit – ATR-basiert (volatilitätsabhängiger Abstand),
+    # mit Fallback auf feste Prozente aus bot_config falls ATR nicht verfügbar.
+    atr = calculate_atr(ticker)
+    atr_multiplier_sl = cfg.get("ATR_MULTIPLIER_SL", 1.5)
+    atr_multiplier_tp = cfg.get("ATR_MULTIPLIER_TP", 3.0)  # CRV 2:1
+
+    if atr and atr > 0:
+        sl_distance = atr * atr_multiplier_sl
+        tp_distance = atr * atr_multiplier_tp
+
+        # Sicherheitsnetz: SL zwischen ATR_MIN_SL_PCT und ATR_MAX_SL_PCT
+        min_sl_pct = cfg.get("ATR_MIN_SL_PCT", 0.01)
+        max_sl_pct = cfg.get("ATR_MAX_SL_PCT", 0.08)
+        sl_pct = max(min_sl_pct, min(max_sl_pct, sl_distance / current_price))
+        tp_pct = max(min_sl_pct * 2, min(max_sl_pct * 2, tp_distance / current_price))
+
+        stop_loss   = round(current_price * (1 - sl_pct), 2)
+        take_profit = round(current_price * (1 + tp_pct), 2)
+
+        print(f"ATR: ${atr:.2f} → SL: -{sl_pct*100:.1f}% TP: +{tp_pct*100:.1f}%")
+    else:
+        sl_pct = float(cfg["STOP_LOSS_PCT"])
+        tp_pct = float(cfg["TAKE_PROFIT_PCT"])
+        stop_loss   = round(current_price * (1 - sl_pct), 2)
+        take_profit = round(current_price * (1 + tp_pct), 2)
 
     return SignalResult(
         ticker          = ticker,
@@ -226,6 +279,9 @@ def calculate_score(ticker: str, df: pd.DataFrame, fundamentals: dict, is_invers
         stop_loss       = stop_loss,
         take_profit     = take_profit,
         score_breakdown = breakdown,
+        atr             = round(atr, 2) if atr else None,
+        sl_pct          = sl_pct,
+        tp_pct          = tp_pct,
         rsi             = round(rsi, 1),
         pe_ratio        = round(pe, 1) if pe else None,
         debt_to_equity  = round(de, 1) if de else None,
