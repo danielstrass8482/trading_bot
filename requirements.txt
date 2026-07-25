@@ -9,3 +9,6 @@ streamlit>=1.35.0
 apscheduler>=3.10.0
 python-dotenv>=1.0.0
 pytz>=2024.1
+fastapi>=0.115.0
+uvicorn>=0.30.0
+python-jose[cryptography]>=3.3.0
