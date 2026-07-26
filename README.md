@@ -15,6 +15,10 @@ trading_bot/
 ├── rule_engine.py     # Signal-Score Berechnung (RSI, SMA, Volumen, Fundamentals)
 ├── llm_analyst.py     # Claude API Integration (Kommentator, kein Entscheider)
 ├── broker.py          # Alpaca Paper/Live Abstraktion + Guardrail-Enforcement
+├── broker_interface.py # Broker-agnostische Schnittstelle (Alpaca/IBKR)
+├── broker_alpaca.py   # BrokerInterface-Implementierung für Alpaca
+├── broker_ibkr.py     # BrokerInterface-Implementierung für Interactive Brokers
+├── fair_value.py       # Fair-Value-Gatekeeper (Stufe 1, WAS kaufen)
 ├── main.py            # Scheduler + Orchestrierung
 ├── dashboard.py       # Streamlit Dashboard
 ├── requirements.txt
@@ -136,6 +140,50 @@ Dashboard URL → Portfolio-Übersicht sichtbar
 - 500 $ einzahlen
 - `.env` ändern: `TRADING_MODE=LIVE`
 - Neu deployen
+
+---
+
+## IBKR Setup
+
+Zweiter Broker neben Alpaca (siehe `broker_interface.py`, `broker_ibkr.py`) –
+vor allem für europäische Aktien (`config.IBKR_EU_WATCHLIST`), die Alpaca
+nicht anbietet. Anders als Alpaca (reiner REST-API-Zugriff) braucht IBKR
+einen lokal erreichbaren TWS- oder IB-Gateway-Prozess mit aktivierter API.
+
+### Option A: IB Gateway (empfohlen für Server)
+1. IB Gateway herunterladen von interactivebrokers.com
+2. IBC (Interactive Brokers Controller) installieren – https://github.com/IbcAlpha/IBC
+3. IBC konfigurieren für automatischen Start
+4. Gateway läuft auf Port 4001 (Live) oder 4002 (Paper)
+
+### Option B: TWS (für lokalen Betrieb)
+1. Trader Workstation installieren
+2. API-Zugang aktivieren: File → Global Config → API
+3. Port: 7496 (Live) oder 7497 (Paper)
+
+### Verbindung testen
+
+```bash
+python -c "
+from ib_insync import IB
+ib = IB()
+ib.connect('127.0.0.1', 4001, clientId=1)
+print(ib.accountSummary())
+ib.disconnect()
+"
+```
+
+### Broker wechseln
+
+`bot_config.ACTIVE_BROKER` (Default `alpaca`) steuert, welchen Broker
+`broker.get_broker()` zurückgibt – auf `ibkr` setzen, sobald Gateway/TWS
+erreichbar ist:
+
+```env
+IBKR_HOST=127.0.0.1
+IBKR_PORT=4001
+IBKR_CLIENT_ID=1
+```
 
 ---
 

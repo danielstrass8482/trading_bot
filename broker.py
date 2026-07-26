@@ -3,6 +3,7 @@ broker.py – Abstraktion für Paper Trading und Live Trading via Alpaca.
 Identische Schnittstelle für beide Modi – nur die URL ändert sich.
 """
 
+import os
 from datetime import datetime
 from config import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL,
@@ -15,11 +16,41 @@ from database import (
     get_alpaca_api_for_user,
 )
 from rule_engine import SignalResult
+from broker_interface import BrokerInterface
 
 
 class GuardrailViolation(Exception):
     """Wird geworfen wenn ein Guardrail-Limit erreicht wurde."""
     pass
+
+
+def get_broker(user_id: int = None) -> BrokerInterface:
+    """
+    Broker-Factory (siehe broker_interface.py): liest bot_config.ACTIVE_BROKER
+    ("alpaca"/"ibkr") und gibt die passende BrokerInterface-Implementierung
+    zurück. Bewusst getrennt von place_trade()/_get_alpaca_client() oben, die
+    weiterhin das bisherige, fest auf Alpaca zugeschnittene Guardrail+DB-
+    Logging übernehmen – get_broker() ist der Broker-agnostische Einstieg für
+    neuen Code (z.B. künftige IBKR-Order-Platzierung, Konto-/Positionsabfragen).
+    """
+    from broker_alpaca import AlpacaBroker
+    from broker_ibkr import IBKRBroker
+
+    config = get_live_config()
+    broker_type = config.get("ACTIVE_BROKER", "alpaca")
+
+    if broker_type == "ibkr":
+        ibkr_host = os.getenv("IBKR_HOST", "127.0.0.1")
+        ibkr_port = int(os.getenv("IBKR_PORT", "4001"))
+        ibkr_client_id = int(os.getenv("IBKR_CLIENT_ID", "1"))
+        return IBKRBroker(host=ibkr_host, port=ibkr_port, client_id=ibkr_client_id)
+
+    # Alpaca (Standard)
+    if user_id:
+        client = get_alpaca_api_for_user(user_id)
+        if client:
+            return AlpacaBroker(client=client)
+    return AlpacaBroker()
 
 
 def _get_alpaca_client(user_id: int = None):

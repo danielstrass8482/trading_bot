@@ -137,6 +137,51 @@ VOLATILE_WATCHLIST = [
     "HOOD",                   # Robinhood
 ]
 
+# Europäische Titel für IBKR (siehe broker_ibkr.py) – nur relevant wenn
+# ACTIVE_BROKER=ibkr, da Alpaca keine EU-Börsen unterstützt. Ticker-Suffix
+# (.DE/.L/.PA) steuert in broker_ibkr._get_contract() die Exchange-Wahl
+# (XETRA/LSE/EURONEXT). Die Branchen-Blacklist (siehe rule_engine.
+# BLACKLIST_MAPPING) greift unverändert auch hier – BP.L, TTE.PA (fossil),
+# GSK.L, SAN.PA (Pharma) werden also automatisch ausgeschlossen, bleiben
+# aber bewusst in der Liste, damit der Filter sie auch tatsächlich zu sehen
+# bekommt (analog zu VOLATILE_WATCHLIST in LONG_WATCHLIST).
+IBKR_EU_WATCHLIST = [
+    # Deutschland (XETRA)
+    "SAP.DE",    # SAP
+    "SIE.DE",    # Siemens
+    "ALV.DE",    # Allianz
+    "DTE.DE",    # Deutsche Telekom
+    "BMW.DE",    # BMW
+    "MBG.DE",    # Mercedes-Benz
+    "BAS.DE",    # BASF
+    "BAYN.DE",   # Bayer
+    "VOW3.DE",   # Volkswagen VZ
+    "MUV2.DE",   # Munich Re
+    "ADS.DE",    # Adidas
+    "DBK.DE",    # Deutsche Bank
+    "RWE.DE",    # RWE
+    "HEN3.DE",   # Henkel VZ
+    "EOAN.DE",   # E.ON
+
+    # UK (LSE)
+    "SHEL.L",    # Shell (Fossil-Blacklist)
+    "AZN.L",     # AstraZeneca
+    "HSBA.L",    # HSBC
+    "BP.L",      # BP (Fossil-Blacklist)
+    "RIO.L",     # Rio Tinto
+    "ULVR.L",    # Unilever
+    "GSK.L",     # GSK (Pharma-Blacklist)
+
+    # Frankreich (Euronext)
+    "MC.PA",     # LVMH
+    "OR.PA",     # L'Oréal
+    "TTE.PA",    # TotalEnergies (Fossil-Blacklist)
+    "SAN.PA",    # Sanofi (Pharma-Blacklist)
+    "AIR.PA",    # Airbus
+    "BNP.PA",    # BNP Paribas
+    "KER.PA",    # Kering
+]
+
 # ─────────────────────────────────────────────
 # HARTKODIERTE GUARDRAILS (Emotionsbremse)
 # Diese Werte sind bewusst NICHT in .env ausgelagert.
@@ -220,6 +265,7 @@ _LIVE_CONFIG_SPEC = {
     "VOLATILE_SEGMENT_PCT":    (float, 0.33),
     "VOLATILE_ATR_THRESHOLD":  (float, 0.025),
     "EARNINGS_BUFFER_DAYS":    (int,   EARNINGS_BUFFER_DAYS),
+    "ACTIVE_BROKER":           (str,   "alpaca"),  # "alpaca" oder "ibkr" (siehe broker.get_broker)
 }
 
 
