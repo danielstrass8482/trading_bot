@@ -224,6 +224,7 @@ def log_scan_results(signals: list, slot_et: str, executed_trades: dict, guardra
     """
     guardrail_reasons = guardrail_reasons or {}
     scan_time = datetime.utcnow()
+    active_broker = get_live_config().get("ACTIVE_BROKER", "alpaca")
     with get_session() as session:
         for signal in signals:
             trade_id = executed_trades.get(signal.ticker)
@@ -252,6 +253,7 @@ def log_scan_results(signals: list, slot_et: str, executed_trades: dict, guardra
                 market_regime = signal.market_regime,
                 fair_value_avg          = signal.fair_value_avg,
                 fair_value_discount_pct = signal.fair_value_discount,
+                broker       = active_broker,
             )
             session.add(log_entry)
         session.commit()
@@ -335,6 +337,19 @@ def run_entry_cycle(slot: EntryTimeSlot):
         if BotState.get(session, "bot_paused") == "true":
             print("⏸️  Bot ist pausiert. Kein Handel in diesem Slot.")
             return
+
+    # 0.5 Alpaca Drain Mode: solange Alpaca der aktive Broker ist UND Drain
+    # Mode an ist, werden keine neuen Positionen mehr eröffnet – bestehende
+    # laufen unverändert weiter (Monitoring/SL/TP/Trailing/Time-Exit läuft
+    # IMMER, siehe run_monitoring_cycle/broker.monitor_open_positions, das ist
+    # bewusst NICHT an dieses Gate gekoppelt). Ist IBKR der aktive Broker,
+    # greift das Gate nicht – neue Trades laufen dann über IBKR.
+    cfg = get_live_config()
+    alpaca_drain = cfg.get("ALPACA_DRAIN_MODE", "false").lower() == "true"
+    active_broker = cfg.get("ACTIVE_BROKER", "alpaca")
+    if alpaca_drain and active_broker == "alpaca":
+        print("⏸️  Alpaca Drain Mode: Keine neuen Trades. Bestehende Positionen werden weiter gemanagt.")
+        return
 
     # 1. VIX-Check (Marktangst-Filter)
     vix, vix_ok = check_vix()

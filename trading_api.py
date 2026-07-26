@@ -83,7 +83,7 @@ def get_overview():
                    entry_price, stop_loss, take_profit,
                    quantity, capital_used, rule_score,
                    trailing_sl_active, trailing_sl_price,
-                   created_at, mode
+                   created_at, mode, broker
             FROM trades WHERE status = 'OPEN'
             ORDER BY created_at DESC
         """)).fetchall()
@@ -200,7 +200,7 @@ def get_scan_log(limit: int = 500, ticker: Optional[str] = None):
             rsi_score, sma_score, volume_score,
             pe_score, de_score, rev_score,
             ko_reason, guardrail_reason,
-            trade_executed, mode, market_regime
+            trade_executed, mode, market_regime, broker
         FROM scan_log
     """
     params = {"limit": min(limit, 5000)}

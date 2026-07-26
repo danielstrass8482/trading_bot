@@ -266,6 +266,7 @@ _LIVE_CONFIG_SPEC = {
     "VOLATILE_ATR_THRESHOLD":  (float, 0.025),
     "EARNINGS_BUFFER_DAYS":    (int,   EARNINGS_BUFFER_DAYS),
     "ACTIVE_BROKER":           (str,   "alpaca"),  # "alpaca" oder "ibkr" (siehe broker.get_broker)
+    "ALPACA_DRAIN_MODE":       (str,   "false"),   # "true" = keine neuen Alpaca-Käufe, nur bestehende Positionen managen
 }
 
 

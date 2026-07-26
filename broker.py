@@ -140,6 +140,18 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
     # Guardrails zuerst – keine Ausnahmen
     check_guardrails(signal)  # Wirft GuardrailViolation bei Verstoß
 
+    # Sicherheitsnetz: die eigentliche Order-Platzierung unten spricht aus-
+    # schließlich die Alpaca-API an – IBKR-Order-Routing ist (noch) nicht
+    # implementiert (broker_ibkr.py existiert nur als BrokerInterface-Client,
+    # siehe broker.get_broker). Wäre ACTIVE_BROKER="ibkr" hier folgenlos, würde
+    # der Trade fälschlich als "ibkr" geloggt, obwohl tatsächlich Alpaca (Live-
+    # Geld!) gehandelt hat – daher lieber gar kein Trade als eine falsche
+    # Broker-Zuordnung im Log.
+    active_broker = get_live_config().get("ACTIVE_BROKER", "alpaca")
+    if active_broker != "alpaca":
+        print(f"❌ ACTIVE_BROKER='{active_broker}', aber Order-Routing ist aktuell nur für Alpaca implementiert – Trade übersprungen.")
+        return None
+
     quantity = calculate_quantity(signal.current_price)
 
     # Ganze Aktie möglich → broker-seitige Bracket-Order (echter SL/TP-Schutz
@@ -223,7 +235,8 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
         llm_summary     = llm_result.get("summary"),
         llm_risks       = _json.dumps(llm_result.get("risks", []), ensure_ascii=False),
         status          = "OPEN",
-        mode            = TRADING_MODE
+        mode            = TRADING_MODE,
+        broker          = active_broker,
     )
     trade.set_score_breakdown(signal.score_breakdown)
 

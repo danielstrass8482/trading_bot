@@ -70,6 +70,7 @@ class Trade(Base):
     trailing_sl_active         = Column(Boolean, default=False)  # True sobald TP erreicht & Trailing SL statt Verkauf aktiviert
     trailing_sl_price          = Column(Float, nullable=True)    # aktueller Trailing-SL-Preis (nur wenn trailing_sl_active)
     highest_price_since_entry  = Column(Float, nullable=True)    # höchster beobachteter Kurs seit Entry (Basis für Trailing SL)
+    broker                     = Column(String(20), default="alpaca")  # "alpaca" / "ibkr" (siehe broker.place_trade)
 
     def get_llm_risks(self) -> list:
         """Deserialisiert llm_risks JSON-String zu Liste."""
@@ -160,7 +161,8 @@ DEFAULT_CONFIG = {
     "VOLATILE_SEGMENT_PCT":    ("0.33",   "Anteil volatile Titel am Portfolio (0-1)"),
     "VOLATILE_ATR_THRESHOLD":  ("0.025",  "ATR/Preis Ratio ab dem ein Titel als volatil gilt (2.5%)"),
     "EARNINGS_BUFFER_DAYS":    ("3",      "Tage vor Earnings in denen nicht gekauft wird"),
-    "ACTIVE_BROKER":           ("alpaca", "Aktiver Broker: alpaca / ibkr"),
+    "ACTIVE_BROKER":           ("alpaca", "Aktiver Broker für neue Trades: alpaca / ibkr"),
+    "ALPACA_DRAIN_MODE":       ("true",   "Alpaca: Keine neuen Käufe, nur bestehende Positionen managen"),
 }
 
 
@@ -225,6 +227,11 @@ class ScanLog(Base):
     # Fair Value (Stufe-1-Gatekeeper, siehe fair_value.py)
     fair_value_avg          = Column(Float, nullable=True)
     fair_value_discount_pct = Column(Float, nullable=True)
+
+    # Aktiver Broker zum Scan-Zeitpunkt (siehe broker.get_broker/Feature Alpaca
+    # Drain Mode) – nicht zwingend derselbe wie trades.broker, falls sich
+    # ACTIVE_BROKER zwischen Scan und tatsächlicher Order geändert hat.
+    broker          = Column(String(20), default="alpaca")
 
 
 class FairValueCache(Base):
@@ -329,6 +336,7 @@ def init_db():
     _migrate_entry_time_slots_columns()
     _migrate_trades_atr_columns()
     _migrate_trades_trailing_sl_columns()
+    _migrate_trades_broker_column()
     _migrate_scan_log_regime_column()
     _migrate_scan_log_fair_value_columns()
     # Initiale Bot-State-Werte setzen falls nicht vorhanden
@@ -404,6 +412,22 @@ def _migrate_trades_trailing_sl_columns():
         conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trailing_sl_active BOOLEAN DEFAULT FALSE"))
         conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trailing_sl_price FLOAT DEFAULT NULL"))
         conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS highest_price_since_entry FLOAT DEFAULT NULL"))
+
+
+def _migrate_trades_broker_column():
+    """
+    Base.metadata.create_all() ändert keine Spalten einer bereits bestehenden
+    Tabelle – broker (IBKR-Integration, siehe broker.get_broker/place_trade)
+    kam nachträglich zur trades-Tabelle dazu, daher ein idempotentes
+    ALTER TABLE ... ADD COLUMN IF NOT EXISTS. Bestehende Trades (alle vor
+    diesem Feature) sind ausnahmslos über Alpaca gelaufen, daher DEFAULT 'alpaca'.
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS broker VARCHAR(20) DEFAULT 'alpaca'"))
+        conn.execute(text("UPDATE trades SET broker = 'alpaca' WHERE broker IS NULL"))
+        conn.execute(text("ALTER TABLE scan_log ADD COLUMN IF NOT EXISTS broker VARCHAR(20) DEFAULT 'alpaca'"))
+        conn.execute(text("UPDATE scan_log SET broker = 'alpaca' WHERE broker IS NULL"))
 
 
 def _migrate_scan_log_regime_column():
