@@ -6,7 +6,7 @@ Verwendet SQLAlchemy mit SQLite (serverlos, kein Setup nötig).
 from datetime import datetime, date
 from sqlalchemy import (
     create_engine, Column, Integer, Float, String,
-    DateTime, Date, Text, Boolean, func, text
+    DateTime, Date, Text, Boolean, UniqueConstraint, func, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from contextlib import contextmanager
@@ -221,6 +221,52 @@ class ScanLog(Base):
     mode            = Column(String(10), default="LIVE")
     market_regime   = Column(Text, nullable=True)  # "bullish" / "bearish" / "neutral" (siehe rule_engine.get_market_regime)
 
+    # Fair Value (Stufe-1-Gatekeeper, siehe fair_value.py)
+    fair_value_avg          = Column(Float, nullable=True)
+    fair_value_discount_pct = Column(Float, nullable=True)
+
+
+class FairValueCache(Base):
+    """
+    Wöchentlich (siehe main.py: fair_value_update Job) neu berechneter Fair
+    Value je Ticker – Stufe-1-Gatekeeper vor dem täglichen 8-Faktoren-Score
+    (siehe fair_value.py, rule_engine.analyze_ticker). Nur Ticker mit
+    is_undervalued=True dürfen die Stufe-2-Technikprüfung überhaupt erreichen.
+    """
+    __tablename__ = "fair_value_cache"
+
+    id     = Column(Integer, primary_key=True, autoincrement=True)
+    ticker = Column(String(20), nullable=False)
+
+    # Aktuelle Kennzahlen
+    current_price       = Column(Float)
+    pe_ratio             = Column(Float)
+    eps                  = Column(Float)
+    revenue_per_share    = Column(Float)
+    cashflow_per_share   = Column(Float)
+    dividend_yield       = Column(Float)
+
+    # Sektor
+    sector = Column(String(50))
+
+    # Fair Value Berechnungen
+    fair_value_kgv = Column(Float)
+    fair_value_kcv = Column(Float)
+    fair_value_div = Column(Float)
+    fair_value_avg = Column(Float)
+
+    # Bewertung
+    discount_pct     = Column(Float)   # % unter Fair Value (positiv = günstig)
+    is_undervalued   = Column(Boolean, default=False)
+    value_trap_risk  = Column(String(20), default="low")   # low/medium/high
+
+    # Metadata
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('ticker', name='uq_fair_value_ticker'),
+    )
+
 
 class DailyLog(Base):
     """Tägliche Zusammenfassung für Performance-Chart."""
@@ -283,6 +329,7 @@ def init_db():
     _migrate_trades_atr_columns()
     _migrate_trades_trailing_sl_columns()
     _migrate_scan_log_regime_column()
+    _migrate_scan_log_fair_value_columns()
     # Initiale Bot-State-Werte setzen falls nicht vorhanden
     with get_session() as session:
         if not BotState.get(session, "daily_trade_count"):
@@ -368,6 +415,18 @@ def _migrate_scan_log_regime_column():
     from sqlalchemy import text
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE scan_log ADD COLUMN IF NOT EXISTS market_regime TEXT"))
+
+
+def _migrate_scan_log_fair_value_columns():
+    """
+    Base.metadata.create_all() ändert keine Spalten einer bereits bestehenden
+    Tabelle – fair_value_avg/fair_value_discount_pct (Fair-Value-Gatekeeper,
+    siehe fair_value.py) kamen nachträglich zur scan_log-Tabelle dazu, daher
+    ein idempotentes ALTER TABLE ... ADD COLUMN IF NOT EXISTS.
+    """
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE scan_log ADD COLUMN IF NOT EXISTS fair_value_avg FLOAT"))
+        conn.execute(text("ALTER TABLE scan_log ADD COLUMN IF NOT EXISTS fair_value_discount_pct FLOAT"))
 
 
 @contextmanager

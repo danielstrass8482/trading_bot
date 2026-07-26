@@ -23,6 +23,7 @@ from database import (
 from rule_engine import analyze_ticker, check_vix, get_benchmark_performance
 from broker import get_portfolio_value, get_bot_performance
 from main import calculate_max_trades_today
+from fair_value import get_undervalued_tickers
 
 # ── PAGE CONFIG ────────────────────────────────────────────────────
 st.set_page_config(
@@ -395,6 +396,10 @@ with tab3:
                 status_text = "✅ FREIGEGEBEN" if result.approved else "❌ UNTER LIMIT"
                 if result.ko_reason:
                     status_text = f"🚫 KO: {result.ko_reason}"
+                    # Fair Value ist kein ethischer Ausschluss wie die Blacklist,
+                    # daher Orange statt Rot (siehe Fair-Value-Gatekeeper).
+                    if result.ko_reason.startswith("Fair Value"):
+                        score_color = "#fb923c"
 
                 st.markdown(f"""
                 <div class="kpi-card" style="margin-top:1rem">
@@ -426,6 +431,26 @@ with tab3:
 
             except Exception as e:
                 st.error(f"Fehler bei der Analyse: {e}")
+
+    # Fair Value Übersicht (Stufe-1-Gatekeeper, siehe fair_value.py) – alle
+    # aktuell unterbewerteten Ticker aus dem wöchentlichen Cache, höchster
+    # Rabatt zuerst.
+    st.markdown("---")
+    st.markdown('<div class="section-label">Fair Value Übersicht</div>', unsafe_allow_html=True)
+    st.markdown("Ticker, die den Stufe-1-Gatekeeper aktuell bestehen (≥10% unter Fair Value).")
+
+    undervalued = get_undervalued_tickers()
+    if undervalued:
+        fv_data = [{
+            "Ticker": ticker,
+            "Kurs": f"${price:.2f}" if price else "—",
+            "Fair Value": f"${fv_avg:.2f}" if fv_avg else "—",
+            "Rabatt %": f"{discount:.1f}%",
+            "Value Trap": risk,
+        } for ticker, discount, fv_avg, price, risk in undervalued]
+        st.dataframe(pd.DataFrame(fv_data), use_container_width=True, hide_index=True)
+    else:
+        st.info("Aktuell keine unterbewerteten Ticker im Cache (oder noch kein Fair-Value-Update gelaufen).")
 
     # Watchlist-Übersicht
     st.markdown("---")

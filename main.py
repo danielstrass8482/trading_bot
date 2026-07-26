@@ -23,12 +23,13 @@ from config import (
 from database import (
     init_db, get_session, save_daily_snapshot, BotState, ScanLog,
     EntryTimeSlot, get_active_entry_time_slots, get_daily_trade_count,
-    get_open_trades,
+    get_open_trades, FairValueCache,
 )
 from rule_engine import scan_all_watchlists, check_vix, get_market_regime, get_benchmark_performance
 from llm_analyst import analyze_with_llm, get_market_brief
 from broker import place_trade, monitor_open_positions, get_portfolio_value, get_bot_performance, check_guardrails, GuardrailViolation
 from backlook import run_backlook
+from fair_value import update_fair_value_cache
 
 
 def _smtp_login_utf8(server, user, password):
@@ -249,6 +250,8 @@ def log_scan_results(signals: list, slot_et: str, executed_trades: dict, guardra
                 trade_id     = trade_id,
                 mode         = TRADING_MODE,
                 market_regime = signal.market_regime,
+                fair_value_avg          = signal.fair_value_avg,
+                fair_value_discount_pct = signal.fair_value_discount,
             )
             session.add(log_entry)
         session.commit()
@@ -535,6 +538,22 @@ def schedule_entry_jobs(scheduler: BlockingScheduler, et_tz):
         print(f"   📍 Entry-Job registriert: {slot.stunde_et:02d}:{slot.minute_et:02d} ET (Gewichtung {slot.gewichtung})")
 
 
+def init_fair_value_if_empty():
+    """
+    Stufe-1-Gatekeeper (siehe fair_value.py) braucht einen gefüllten Cache
+    bevor der erste Entry-Zyklus läuft – ansonsten würde jeder Ticker beim
+    allerersten Start mangels fair_value_cache-Eintrag ungefiltert
+    durchgereicht. Läuft daher einmalig beim Bot-Start, falls die Tabelle
+    noch komplett leer ist (der reguläre Betrieb aktualisiert wöchentlich
+    montags, siehe schedule_entry_jobs/main).
+    """
+    with get_session() as session:
+        count = session.query(FairValueCache).count()
+    if count == 0:
+        print("Fair Value Cache leer → initialer Update...")
+        update_fair_value_cache(LONG_WATCHLIST + ACTIVE_SHORT_INSTRUMENTS)
+
+
 def run_monitoring_cycle():
     """
     Leichtgewichtiger Zyklus: Nur SL/TP überwachen (alle 30 Min während Handelszeit).
@@ -607,10 +626,29 @@ def main():
         name="Wöchentlicher Backlook"
     )
 
+    # Fair Value Update: montags 08:00 ET, vor dem ersten Entry-Slot (09:45 ET)
+    # – Stufe 1 (WAS kaufen?) muss vor Stufe 2 (WANN kaufen?) aktuell sein.
+    scheduler.add_job(
+        lambda: update_fair_value_cache(LONG_WATCHLIST + ACTIVE_SHORT_INSTRUMENTS),
+        CronTrigger(
+            day_of_week="mon",
+            hour=8,
+            minute=0,
+            timezone=et_tz
+        ),
+        id="fair_value_update",
+        name="Wöchentliches Fair Value Update",
+        replace_existing=True
+    )
+
+    # Initialer Fair-Value-Update falls Cache noch leer (z.B. erster Start).
+    init_fair_value_if_empty()
+
     print(f"⏰ Scheduler aktiv. Entry-Zyklen laufen zu den registrierten Zeitslots (Mo–Fr)")
     print(f"🌅 Morning Brief: täglich 08:30 ET")
     print(f"📡 Monitoring: alle {monitoring_interval} Min von 09:30–16:00 ET")
     print(f"📚 Backlook: montags 06:00 ET")
+    print(f"💰 Fair Value Update: montags 08:00 ET")
     print(f"🛑 Zum Beenden: Ctrl+C\n")
 
     try:

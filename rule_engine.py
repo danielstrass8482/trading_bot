@@ -19,6 +19,7 @@ from config import (
     ACTIVE_SHORT_INSTRUMENTS, get_live_config
 )
 from database import get_session, get_active_weights, get_open_trades
+from fair_value import get_fair_value_for_ticker
 
 
 # Branchen-Blacklist: Ticker aus diesen Sektoren/Industrien werden vor der
@@ -53,6 +54,10 @@ class SignalResult:
     tp_pct:           Optional[float] = None
     # Marktregime zum Analysezeitpunkt (siehe get_market_regime)
     market_regime:    Optional[str] = None
+    # Fair Value (Stufe-1-Gatekeeper, siehe fair_value.py) – None wenn kein
+    # Cache-Eintrag vorhanden war (z.B. ETFs/Inverse ETFs ohne KGV/Cashflow).
+    fair_value_avg:      Optional[float] = None
+    fair_value_discount: Optional[float] = None
     # Rohdaten für LLM-Analyse
     rsi:              Optional[float] = None
     pe_ratio:         Optional[float] = None
@@ -436,6 +441,39 @@ def analyze_ticker(ticker: str) -> SignalResult:
     is_inverse_etf = ticker in ACTIVE_SHORT_INSTRUMENTS
     regime = get_market_regime()
 
+    # ── Fair Value Check (Stufe 1 Gatekeeper – WAS kaufen?) ──────────────
+    # Läuft VOR dem teuren Marktdaten-Download: nur Ticker mit ≥10% Rabatt
+    # zum wöchentlich berechneten Fair Value (siehe fair_value.py) erreichen
+    # überhaupt die technische Stufe-2-Prüfung unten. Inverse ETFs haben kein
+    # KGV/Cashflow/Dividende und werden daher vom Gatekeeper ausgenommen.
+    fv = None
+    fv_bonus = 0
+    if not is_inverse_etf:
+        fv = get_fair_value_for_ticker(ticker)
+
+        if fv is not None:
+            if not fv["is_undervalued"]:
+                discount = fv.get("discount_pct", 0)
+                return SignalResult(
+                    ticker=ticker, score=0, direction="BLOCKED",
+                    instrument_type="STOCK", approved=False,
+                    ko_reason=(f"Fair Value: Aktie {abs(discount):.0f}% "
+                               f"{'über' if discount < 0 else 'unter'} "
+                               f"Fair Value ${fv['fair_value_avg']:.0f} "
+                               f"(mind. 10% Rabatt nötig)"),
+                    market_regime=regime,
+                    fair_value_avg=fv.get("fair_value_avg"),
+                    fair_value_discount=discount,
+                )
+
+            # Value Trap Warnung → nicht blocken, aber Hinweis fürs Log/LLM
+            if fv["value_trap_risk"] == "high":
+                print(f"⚠️ {ticker}: Value Trap Risiko hoch!")
+
+            # Fair Value Discount als Score-Bonus (max +10 für tiefe Unterbewertung)
+            fv_bonus = min(10, int(fv["discount_pct"] / 2))
+        # Kein Cache-Eintrag (z.B. ETFs ohne KGV) → nicht blocken, fv_bonus=0
+
     # Marktdaten laden
     df = fetch_market_data(ticker)
     if df is None:
@@ -490,6 +528,12 @@ def analyze_ticker(ticker: str) -> SignalResult:
     # Score berechnen
     result = calculate_score(ticker, df, fundamentals, is_inverse_etf)
     result.market_regime = regime
+    result.fair_value_avg = fv.get("fair_value_avg") if fv else None
+    result.fair_value_discount = fv.get("discount_pct") if fv else None
+
+    if fv_bonus:
+        result.score += fv_bonus
+        print(f"💰 Fair Value Bonus: +{fv_bonus} für {ticker} ({fv['discount_pct']:.0f}% Rabatt)")
 
     # Markt-Regime-Filter: in einem bärischen Markt werden LONG-Aktien
     # abgestraft und Inverse ETFs bevorzugt (score muss danach neu gegen
