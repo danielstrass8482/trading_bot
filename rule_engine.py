@@ -70,9 +70,19 @@ class SignalResult:
 
 
 def fetch_market_data(ticker: str, period: str = "1y", min_rows: int = 50) -> Optional[pd.DataFrame]:
-    """Lädt historische OHLCV-Daten via yfinance."""
+    """Lädt historische OHLCV-Daten via yfinance.
+
+    Nutzt yf.Ticker(ticker).history() statt yf.download() – Letzteres teilt
+    sich intern Shared-State über yfinances Multi-Ticker-Download-Maschinerie,
+    was unter dem 15-Worker-ThreadPoolExecutor (siehe
+    scan_all_watchlists_parallel) nachweislich zu Cross-Contamination
+    zwischen gleichzeitig gescannten Tickern führte (ES-Vorfall 2026-07-27:
+    SL/TP/Menge wurden mit dem Kurs eines anderen, parallel gescannten
+    Tickers berechnet – siehe [[trading-bot-deployment]]). Ticker(...) legt
+    pro Aufruf eine eigene, isolierte Session an.
+    """
     try:
-        df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+        df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
         if df.empty or len(df) < min_rows:
             return None
         # Spaltennamen normalisieren (yfinance gibt MultiIndex zurück bei manchen Versionen)
@@ -103,9 +113,7 @@ def fetch_fundamentals(ticker: str) -> dict:
 def calculate_atr(ticker: str, period: int = 14) -> Optional[float]:
     """Berechnet den Average True Range (ATR) für den SL/TP-Abstand."""
     try:
-        df = yf.download(ticker, period="1mo",
-                         interval="1d", progress=False,
-                         auto_adjust=False)
+        df = yf.Ticker(ticker).history(period="1mo", interval="1d", auto_adjust=False)
         if df.empty or len(df) < period:
             return None
         if isinstance(df.columns, pd.MultiIndex):
@@ -173,12 +181,22 @@ def check_correlation(ticker: str, open_tickers: list) -> tuple[bool, Optional[s
         return True, None
 
     try:
-        all_tickers = [ticker] + open_tickers
-        data = yf.download(all_tickers, period="3mo", interval="1d", progress=False)["Close"]
+        # Einzeln statt als yf.download(all_tickers, ...)-Batch abfragen:
+        # Letzteres läuft unter dem 15-Worker-ThreadPoolExecutor (siehe
+        # scan_all_watchlists_parallel) in dieselbe Cross-Contamination-
+        # Falle wie fetch_market_data() (siehe dort) - hier zusätzlich
+        # verschärft, weil sich sogar die Ticker-Liste je nach gerade
+        # offenen Positionen zwischen parallelen Aufrufen unterscheidet.
+        closes = {}
+        for t in [ticker] + open_tickers:
+            hist = yf.Ticker(t).history(period="3mo", interval="1d", auto_adjust=True)
+            if not hist.empty:
+                closes[t] = hist["Close"]
 
-        if data.empty:
+        if ticker not in closes:
             return True, None
 
+        data = pd.DataFrame(closes)
         returns = data.pct_change().dropna()
 
         for open_ticker in open_tickers:
