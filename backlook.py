@@ -20,8 +20,9 @@ import pytz
 from database import (
     get_session, Trade, get_active_weights, set_active_weights, WeightHistory,
     EntryTimeSlot, get_bot_config, get_pending_entry_proposal, set_pending_entry_proposal,
-    apply_entry_time_proposal,
+    apply_entry_time_proposal, CLOSED_STATUSES, get_learning_proposals, set_learning_proposals,
 )
+from config import get_live_config
 
 MIN_TRADES_REQUIRED       = 5
 MAX_WEIGHT_CHANGE_PER_RUN = 2
@@ -370,15 +371,236 @@ def analyze_entry_timing():
     print(f"{'='*60}\n")
 
 
+# ─────────────────────────────────────────────
+# INTELLIGENTER LERNZYKLUS – zusätzliche Analysen (Feature 4/5).
+# threshold- und watchlist-Analyse erzeugen Vorschläge über
+# save_learning_proposal(); sektor- und saisonalitäts-Analyse sind rein
+# informativ (Log-Ausgabe), erzeugen (noch) keinen Vorschlag.
+# ─────────────────────────────────────────────
+
+THRESHOLD_CANDIDATES               = [55, 60, 65, 70, 75]
+MIN_TRADES_FOR_THRESHOLD_ANALYSIS  = 20   # Gesamtzahl abgeschlossener Trades, sonst keine Analyse
+MIN_TRADES_PER_THRESHOLD           = 5    # je getestetem Schwellwert
+MIN_TRADES_FOR_THRESHOLD_PROPOSAL  = 10   # beim besten Schwellwert, sonst kein Vorschlag
+
+TICKER_LOOKBACK_DAYS      = 90
+MIN_TRADES_PER_TICKER     = 3
+TICKER_AVG_PNL_THRESHOLD  = -1.0
+TICKER_WIN_RATE_THRESHOLD = 30.0
+
+SECTOR_LOOKBACK_DAYS  = 90
+MIN_TRADES_PER_SECTOR = 2
+
+MIN_TRADES_FOR_SEASONALITY = 20
+DOW_LABELS = {0: "Mo", 1: "Di", 2: "Mi", 3: "Do", 4: "Fr"}
+
+
+def save_learning_proposal(session, typ: str, data: dict):
+    """Hängt einen neuen Lernvorschlag an die pending-Liste in bot_state an."""
+    proposals = get_learning_proposals(session)
+    proposals.append({
+        "typ": typ,
+        "erstellt": datetime.utcnow().isoformat(),
+        "data": data,
+        "status": "pending",
+    })
+    set_learning_proposals(session, proposals)
+
+
+def analyze_optimal_threshold(session):
+    """
+    Testet mehrere Score-Schwellwerte (THRESHOLD_CANDIDATES) gegen die
+    tatsächliche Performance abgeschlossener Trades (Trade.rule_score war
+    bereits zum Einstiegszeitpunkt gesetzt) und schlägt den Schwellwert mit
+    dem besten Ø P&L als neuen MIN_SIGNAL_SCORE vor, falls er vom aktuell
+    konfigurierten Wert abweicht.
+    """
+    trades = session.query(Trade).filter(
+        Trade.status.in_(CLOSED_STATUSES),
+        Trade.pnl_usd.isnot(None),
+    ).all()
+
+    if len(trades) < MIN_TRADES_FOR_THRESHOLD_ANALYSIS:
+        return None
+
+    results = {}
+    for threshold in THRESHOLD_CANDIDATES:
+        filtered = [t for t in trades if t.rule_score >= threshold]
+        if len(filtered) < MIN_TRADES_PER_THRESHOLD:
+            continue
+        wins = sum(1 for t in filtered if t.pnl_usd > 0)
+        avg_pnl = sum(t.pnl_usd for t in filtered) / len(filtered)
+        results[threshold] = {
+            "trades": len(filtered),
+            "win_rate": round(wins / len(filtered) * 100, 1),
+            "avg_pnl": round(avg_pnl, 2),
+        }
+
+    if not results:
+        return None
+
+    best_threshold, best_stats = max(results.items(), key=lambda kv: kv[1]["avg_pnl"])
+    current = int(get_live_config().get("MIN_SIGNAL_SCORE", 65))
+
+    if best_threshold != current and best_stats["trades"] >= MIN_TRADES_FOR_THRESHOLD_PROPOSAL:
+        save_learning_proposal(session, "threshold", {
+            "typ": "threshold_optimierung",
+            "aktuell": current,
+            "empfohlen": best_threshold,
+            "begruendung": (
+                f"Score {best_threshold} hatte beste Performance: "
+                f"Ø ${best_stats['avg_pnl']}/Trade, {best_stats['win_rate']}% Trefferquote "
+                f"({best_stats['trades']} Trades)"
+            ),
+        })
+    return results
+
+
+def analyze_ticker_performance(session):
+    """
+    Wertet abgeschlossene Trades der letzten TICKER_LOOKBACK_DAYS je Ticker
+    aus und schlägt Ticker mit konstant schlechter Performance (Ø P&L < -1$
+    und Trefferquote < 30%) zur Entfernung aus der Watchlist vor.
+    """
+    cutoff = datetime.utcnow() - timedelta(days=TICKER_LOOKBACK_DAYS)
+    trades = session.query(Trade).filter(
+        Trade.status.in_(CLOSED_STATUSES),
+        Trade.created_at >= cutoff,
+        Trade.pnl_usd.isnot(None),
+    ).all()
+
+    by_ticker: dict[str, list[Trade]] = {}
+    for t in trades:
+        by_ticker.setdefault(t.ticker, []).append(t)
+
+    ticker_stats = {}
+    proposals = []
+    for ticker, ts in by_ticker.items():
+        if len(ts) < MIN_TRADES_PER_TICKER:
+            continue
+        wins = sum(1 for t in ts if t.pnl_usd > 0)
+        avg_pnl = sum(t.pnl_usd for t in ts) / len(ts)
+        win_rate = wins / len(ts) * 100
+        ticker_stats[ticker] = {"trades": len(ts), "win_rate": round(win_rate, 1), "avg_pnl": round(avg_pnl, 2)}
+        if avg_pnl < TICKER_AVG_PNL_THRESHOLD and win_rate < TICKER_WIN_RATE_THRESHOLD:
+            proposals.append({
+                "ticker": ticker,
+                "aktion": "watchlist_entfernen",
+                "begruendung": f"Ø P&L: ${avg_pnl:.2f}, Trefferquote: {win_rate:.0f}% ({len(ts)} Trades)",
+            })
+
+    if proposals:
+        save_learning_proposal(session, "watchlist", {
+            "typ": "watchlist_optimierung",
+            "vorschlaege": proposals,
+        })
+    return ticker_stats
+
+
+def analyze_sector_performance(session):
+    """
+    Gruppiert abgeschlossene Trades der letzten SECTOR_LOOKBACK_DAYS nach
+    GICS-Sektor (yfinance .info) und gibt Performance je Sektor zurück – rein
+    informativ (Sektor-Rotation), erzeugt aktuell keinen Lernvorschlag.
+    """
+    import yfinance as yf
+
+    cutoff = datetime.utcnow() - timedelta(days=SECTOR_LOOKBACK_DAYS)
+    trades = session.query(Trade).filter(
+        Trade.status.in_(CLOSED_STATUSES),
+        Trade.created_at >= cutoff,
+        Trade.pnl_usd.isnot(None),
+    ).all()
+
+    sector_pnls: dict[str, list[float]] = {}
+    sector_wins: dict[str, int] = {}
+    for t in trades:
+        try:
+            sector = yf.Ticker(t.ticker).info.get("sector", "Unknown")
+        except Exception:
+            continue
+        sector_pnls.setdefault(sector, []).append(t.pnl_usd)
+        if t.pnl_usd > 0:
+            sector_wins[sector] = sector_wins.get(sector, 0) + 1
+
+    results = {}
+    for sector, pnls in sector_pnls.items():
+        if len(pnls) < MIN_TRADES_PER_SECTOR:
+            continue
+        results[sector] = {
+            "trades": len(pnls),
+            "win_rate": round(sector_wins.get(sector, 0) / len(pnls) * 100, 1),
+            "avg_pnl": round(sum(pnls) / len(pnls), 2),
+        }
+    return results
+
+
+def analyze_seasonality(session):
+    """
+    Ø P&L abgeschlossener Trades je Wochentag – Einstiegszeitpunkt wird dafür
+    von UTC nach Eastern Time konvertiert (nicht die rohe UTC-Stunde), damit
+    ein spätabendlicher UTC-Zeitstempel nicht auf den falschen ET-Handelstag
+    fällt. Rein informativ, erzeugt aktuell keinen Lernvorschlag.
+    """
+    trades = session.query(Trade).filter(
+        Trade.status.in_(CLOSED_STATUSES),
+        Trade.pnl_usd.isnot(None),
+    ).all()
+
+    if len(trades) < MIN_TRADES_FOR_SEASONALITY:
+        return None
+
+    by_day: dict[str, list[float]] = {}
+    for t in trades:
+        et_dt = pytz.utc.localize(t.created_at).astimezone(ET_TZ)
+        day = DOW_LABELS.get(et_dt.weekday())
+        if day is None:
+            continue
+        by_day.setdefault(day, []).append(t.pnl_usd)
+
+    return {
+        day: {"trades": len(pnls), "avg_pnl": round(sum(pnls) / len(pnls), 2)}
+        for day, pnls in by_day.items()
+    }
+
+
 def run_backlook():
     """
     Hauptfunktion: wird vom Scheduler jeden Montag 06:00 ET aufgerufen.
     Führt zuerst den Gewichtungs-Backlook aus, danach direkt im Anschluss die
     Einstiegszeitpunkt-Analyse (siehe Feature 3 – unabhängig vom Ergebnis des
-    Gewichtungs-Backlooks, da beide auf unterschiedlichen Datenbasen laufen).
+    Gewichtungs-Backlooks, da beide auf unterschiedlichen Datenbasen laufen),
+    und zuletzt den intelligenten Lernzyklus (Threshold-, Watchlist-,
+    Sektor- und Saisonalitäts-Analyse).
     """
     _run_weekly_weight_backlook()
     analyze_entry_timing()
+
+    print(f"\n{'='*60}")
+    print(f"🧠 Intelligenter Lernzyklus gestartet: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}")
+    with get_session() as session:
+        threshold_results = analyze_optimal_threshold(session)
+        if threshold_results:
+            print(f"🎯 Threshold-Analyse: {threshold_results}")
+
+        ticker_stats = analyze_ticker_performance(session)
+        if ticker_stats:
+            print(f"📈 Ticker-Performance: {len(ticker_stats)} Ticker mit ≥{MIN_TRADES_PER_TICKER} Trades ausgewertet")
+
+        try:
+            sector_stats = analyze_sector_performance(session)
+            if sector_stats:
+                print(f"🏭 Sektor-Performance: {sector_stats}")
+        except Exception as e:
+            print(f"⚠️  Sektor-Analyse fehlgeschlagen: {e}")
+
+        seasonality = analyze_seasonality(session)
+        if seasonality:
+            print(f"📅 Saisonalität: {seasonality}")
+
+        session.commit()
+    print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":

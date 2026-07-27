@@ -19,7 +19,10 @@ from sqlalchemy import text
 from jose import JWTError, jwt
 from typing import Optional
 
-from database import get_session, get_daily_trade_count, set_bot_config
+from database import (
+    get_session, get_daily_trade_count, set_bot_config,
+    get_learning_proposals, set_learning_proposals,
+)
 from config import get_live_config, TRADING_MODE
 from broker import get_portfolio_value
 from rule_engine import get_market_regime
@@ -327,6 +330,52 @@ def apply_bot_config_preset(body: dict):
             set_bot_config(session, key, value)
         session.commit()
     return {"message": f"Preset '{preset}' angewendet", "settings": BOT_CONFIG_PRESETS[preset]}
+
+
+@protected.get("/api/learning-proposals")
+def get_pending_learning_proposals():
+    """Offene (status='pending') KI-Lernvorschläge aus dem wöchentlichen
+    Lernzyklus (siehe backlook.py: analyze_optimal_threshold/analyze_ticker_performance).
+    Jeder Eintrag bekommt seinen Index in der ungefilterten Gesamtliste zurück
+    (statt des Index in dieser gefilterten Antwort) – accept/reject adressieren
+    darüber den richtigen Eintrag, auch wenn dazwischen bereits andere
+    Vorschläge akzeptiert/abgelehnt wurden."""
+    with get_session() as session:
+        all_proposals = get_learning_proposals(session)
+        return [
+            {**p, "index": i}
+            for i, p in enumerate(all_proposals)
+            if p.get("status") == "pending"
+        ]
+
+
+@protected.post("/api/learning-proposals/accept")
+def accept_learning_proposal(body: dict):
+    idx = body.get("index")
+    with get_session() as session:
+        proposals = get_learning_proposals(session)
+        if idx is None or not (0 <= idx < len(proposals)):
+            raise HTTPException(400, "Ungültiger Index")
+        proposal = proposals[idx]
+        proposal["status"] = "accepted"
+        if proposal["typ"] == "threshold":
+            set_bot_config(session, "MIN_SIGNAL_SCORE", str(proposal["data"]["empfohlen"]))
+        set_learning_proposals(session, proposals)
+        session.commit()
+    return {"ok": True}
+
+
+@protected.post("/api/learning-proposals/reject")
+def reject_learning_proposal(body: dict):
+    idx = body.get("index")
+    with get_session() as session:
+        proposals = get_learning_proposals(session)
+        if idx is None or not (0 <= idx < len(proposals)):
+            raise HTTPException(400, "Ungültiger Index")
+        proposals[idx]["status"] = "rejected"
+        set_learning_proposals(session, proposals)
+        session.commit()
+    return {"ok": True}
 
 
 @protected.get("/api/entry-slots")

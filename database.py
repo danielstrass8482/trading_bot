@@ -595,6 +595,22 @@ def set_pending_entry_proposal(session: Session, proposal: dict | None):
         BotState.set(session, "pending_entry_proposal", json.dumps(proposal, ensure_ascii=False))
 
 
+def get_learning_proposals(session: Session) -> list[dict]:
+    """Liest alle KI-Lernvorschläge (Intelligenter Lernzyklus, siehe backlook.py) aus bot_state."""
+    raw = BotState.get(session, "learning_proposals")
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+
+def set_learning_proposals(session: Session, proposals: list[dict]):
+    """Schreibt die vollständige Liste der Lernvorschläge in bot_state."""
+    BotState.set(session, "learning_proposals", json.dumps(proposals, ensure_ascii=False))
+
+
 def apply_entry_time_proposal(session: Session, vorschlaege: list[dict]):
     """
     Wendet eine Liste von Backlook-Zeitpunkt-Vorschlägen (Format siehe
