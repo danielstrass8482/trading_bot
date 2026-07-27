@@ -73,49 +73,134 @@ SMTP_TIMEOUT      = 10
 # ─────────────────────────────────────────────
 
 # Bullische Kandidaten – Bot kauft LONG wenn Score ≥ MIN_SIGNAL_SCORE
+# Seit 2026-07-27: komplette S&P-500-Watchlist (vorher nur ~90 handverlesene
+# Titel). Ggü. der vom User gelieferten Rohliste bereinigt:
+# - Duplikate entfernt (CF/MOS/EVRG/SWK/SOFI standen je zweimal drin)
+# - Delistete/umbenannte Ticker entfernt: ATVI (Activision, seit 2023 von MSFT
+#   übernommen, nicht mehr handelbar), JDSU (seit 2015 als VIAV notiert),
+#   ABC (AmerisourceBergen, seit 2023 als COR/Cencora notiert)
+# - Weitere 6 Ticker nach HTTP-404 beim ersten Fair-Value-Cache-Lauf
+#   (2026-07-27) als M&A-bedingt delistet identifiziert und entfernt:
+#   ANSS (Synopsys), JNPR (HPE), PARA (Paramount-Skydance-Merger),
+#   IPG (Omnicom), K/Kellanova (Mars), AMED (UnitedHealth/Optum)
+# - RBLX/SNAP ergänzt (kein S&P-500-Mitglied, aber Teil von VOLATILE_WATCHLIST
+#   unten – ohne sie hier würde der Bot sie nie scannen/kaufen und die
+#   Portfolio-Segmentierung liefe für diese zwei Ticker leer, siehe 2026-07-25).
 LONG_WATCHLIST = [
-    # Aktuelle Positionen
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META",
-    "NVDA", "JPM", "V", "UNH", "HD",
-    "PG", "MA", "BAC",
+    # INFORMATION TECHNOLOGY
+    "AAPL", "MSFT", "NVDA", "AVGO", "ORCL",
+    "CRM", "CSCO", "ADBE", "AMD", "INTC",
+    "QCOM", "TXN", "AMAT", "NOW", "INTU",
+    "MU", "KLAC", "LRCX", "SNPS", "CDNS",
+    "FTNT", "PANW", "CRWD", "MPWR",
+    "VRSN", "ENPH", "FSLR", "GLW", "HPQ",
+    "HPE", "NTAP", "STX", "WDC",
+    "ZBRA", "AKAM", "CDW", "FFIV", "GDDY",
+    "GEN", "GRMN", "IT", "KEYS",
+    "LDOS", "NTRS", "PTC", "QRVO", "SWKS",
+    "TER", "TRMB", "TYL", "VICI", "WU",
 
-    # Tech & Wachstum
-    "TSLA", "NFLX", "ADBE", "CRM", "ORCL",
-    "AMD", "INTC", "QCOM", "TXN", "AMAT",
-    "NOW", "SNOW", "UBER", "ABNB",
+    # COMMUNICATION SERVICES
+    "GOOGL", "META", "NFLX", "DIS", "CMCSA",
+    "T", "VZ", "TMUS", "CHTR", "WBD",
+    "FOX", "FOXA", "LYV",
+    "MTCH", "NWS", "NWSA", "OMC", "TTWO",
+    "EA",
 
-    # Finanzen
-    "GS", "MS", "BLK", "AXP", "WFC",
-    "C", "USB", "PNC", "TFC", "COF",
+    # CONSUMER DISCRETIONARY
+    "AMZN", "TSLA", "HD", "MCD", "NKE",
+    "SBUX", "TJX", "LOW", "BKNG", "CMG",
+    "ORLY", "AZO", "ROST", "DHI", "LEN",
+    "PHM", "NVR", "TOL", "KBH", "MDC",
+    "EXPE", "MAR", "HLT", "MGM", "WYNN",
+    "LVS", "RCL", "CCL", "NCLH", "HAS",
+    "MAT", "RL", "PVH", "TPR", "VFC",
+    "GPS", "ANF", "AEO", "URBN", "BBWI",
+    "DRI", "YUM", "QSR", "JACK", "WEN",
+    "F", "GM", "APTV", "BWA", "LEA",
+    "MHK", "WHR", "POOL", "SWK", "LULU",
+    "UBER", "LYFT", "ABNB", "DASH",
 
-    # Gesundheit (non-Pharma)
-    "ABT", "MDT", "SYK", "BSX", "EW",
-    "ISRG", "ZBH", "BDX",
+    # CONSUMER STAPLES
+    "PG", "KO", "PEP", "WMT", "COST",
+    "PM", "MO", "KHC", "GIS",
+    "CAG", "CPB", "MKC", "SJM", "HRL",
+    "CL", "CHD", "ENR", "SPB", "COTY",
+    "EL", "ULTA", "TGT", "DG", "DLTR",
+    "KR", "SYY", "USFD", "ADM", "BG",
+    "MOS", "CF", "NTR",
 
-    # Dividendentitel & Stabile Werte
-    "KO", "PEP", "MCD", "SBUX", "YUM",
-    "WMT", "TGT", "COST", "DG", "DLTR",
-    "T", "VZ", "TMUS",
+    # HEALTH CARE (non-Pharma wo möglich)
+    "UNH", "JNJ", "ABT", "MDT", "TMO",
+    "DHR", "SYK", "BSX", "EW", "ISRG",
+    "ZBH", "BDX", "BAX", "RMD", "DXCM",
+    "HOLX", "IDXX", "IQV", "A", "MTD",
+    "WAT", "PODD", "ALGN", "COO", "HSIC",
+    "VTRS", "HCA", "CNC", "MOH", "HUM",
+    "CVS", "CI", "ELV", "MCK", "CAH",
+    "DGX", "LH", "ACAD",
 
-    # Energie (non-Fossil)
+    # FINANCIALS
+    "BRK-B", "JPM", "BAC", "WFC", "GS",
+    "MS", "C", "AXP", "BLK", "SCHW",
+    "CB", "PGR", "MET", "PRU", "AIG",
+    "AFL", "ALL", "TRV", "HIG", "L",
+    "USB", "PNC", "TFC", "COF", "DFS",
+    "SYF", "AMP", "IVZ", "BEN", "TROW",
+    "NDAQ", "ICE", "CME", "CBOE", "MSCI",
+    "MCO", "SPGI", "FDS", "BR", "FIS",
+    "FISV", "GPN", "MA", "V", "PYPL",
+    "SQ", "AFRM", "SOFI",
+
+    # INDUSTRIALS
+    "GE", "HON", "CAT", "DE", "RTX",
+    "LMT", "NOC", "GD", "BA", "HII",
+    "TDG", "CARR", "OTIS", "EMR", "ETN",
+    "PH", "ROK", "AME", "ITW", "XYL",
+    "VRSK", "IR", "JCI", "TT", "FTV",
+    "GNRC", "HUBB", "NVT", "PAYC", "ROP",
+    "UPS", "FDX", "JBHT", "CHRW", "EXPD",
+    "GWW", "MSC", "FAST", "SNA",
+    "AOS", "MAS", "ALLE", "LECO", "ATI",
+    "HWM", "TXT", "WWD", "WAB", "CSX",
+    "NSC", "UNP", "CP", "CNI",
+
+    # ENERGIE (erneuerbar bevorzugt)
     "NEE", "DUK", "SO", "AEP", "EXC",
+    "PCG", "ED", "XEL", "ES", "FE",
+    "ETR", "PPL", "CMS", "NI", "AES",
+    "EVRG", "PNW", "OGE", "NRG", "VST",
+    # Fossil-Blacklist greift automatisch für XOM, CVX etc.
 
-    # Immobilien ETFs
-    "VNQ", "O", "SPG", "PLD", "AMT",
+    # MATERIALS
+    "LIN", "APD", "ECL", "SHW", "PPG",
+    "NEM", "FCX", "NUE", "STLD", "RS",
+    "PKG", "IP", "ALB",
+    "CE", "EMN", "FMC", "IFF", "RPM",
 
-    # Industrie & Materialien
-    "CAT", "DE", "HON", "MMM", "GE",
-    "RTX", "NOC",
+    # REAL ESTATE
+    "AMT", "PLD", "CCI", "EQIX", "PSA",
+    "O", "SPG", "VNQ", "WELL", "DLR",
+    "EXR", "AVB", "EQR", "MAA", "UDR",
+    "CPT", "ESS", "AIV", "NNN", "REG",
+    "FRT", "KIM", "BXP", "VTR", "PEAK",
 
-    # Konsumgüter
-    "NKE", "LULU", "TJX", "ROST",
+    # UTILITIES
+    "AWK", "WEC", "DTE", "CNP", "LNT",
+    "WTRG", "SRE", "AEE", "NFG",
 
-    # Volatile Titel (siehe VOLATILE_WATCHLIST) – bewusst mit dem User
-    # abgestimmt (2026-07-25), damit die Portfolio-Segmentierung tatsächlich
-    # wirksam wird (sonst würde der Bot diese Ticker nie scannen/kaufen).
-    "PLTR", "SOFI", "RIVN", "SOXL", "ARKK",
-    "MSTR", "COIN", "RBLX", "SNAP", "HOOD",
+    # VOLATILE / WACHSTUM
+    "PLTR", "HOOD", "RIVN", "LCID",
+    "ARKK", "SOXL", "MSTR", "COIN",
+    "RBLX", "SNAP",
 ]
+
+# Blacklist greift automatisch:
+# XOM, CVX, BP (Fossil)
+# MO, PM, BTI (Tobacco)
+# LMT, NOC, GD, RTX (Weapons) - bleiben aber drin
+#   weil manche Kunden keine Rüstungs-Blacklist wollen
+#   → individuell konfigurierbar
 
 # Bärische Instrumente – Bot kauft LONG auf Inverse ETF wenn Markt bärisch
 # Kein Short Selling, kein Margin-Konto nötig. SDS/SQQQ/SPXS sind gehebelte

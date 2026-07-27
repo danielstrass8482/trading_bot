@@ -25,11 +25,11 @@ from database import (
     EntryTimeSlot, get_active_entry_time_slots, get_daily_trade_count,
     get_open_trades, FairValueCache,
 )
-from rule_engine import scan_all_watchlists, check_vix, get_market_regime, get_benchmark_performance
+from rule_engine import scan_watchlist_parallel, check_vix, get_market_regime, get_benchmark_performance
 from llm_analyst import analyze_with_llm, get_market_brief
 from broker import place_trade, monitor_open_positions, get_portfolio_value, get_bot_performance, check_guardrails, GuardrailViolation
 from backlook import run_backlook
-from fair_value import update_fair_value_cache
+from fair_value import update_fair_value_cache, get_undervalued_tickers
 
 
 def _smtp_login_utf8(server, user, password):
@@ -392,8 +392,22 @@ def run_entry_cycle(slot: EntryTimeSlot):
         return
 
     # 4. Watchlists scannen
+    # Fair-Value-Vorfilter (Stufe 1) VOR dem teuren Marktdaten-Scan anwenden:
+    # nur Ticker, die im wöchentlichen Fair-Value-Cache bereits als unterbewertet
+    # markiert sind (siehe fair_value.py), plus die Short-Instrumente (die haben
+    # kein KGV/Cashflow und werden vom Fair-Value-Gatekeeper nicht erfasst).
+    # Ticker ohne Cache-Eintrag (noch nicht berechnet) werden hier ausgeschlossen,
+    # bekommen ihre Chance aber automatisch nach dem nächsten Montags-Lauf von
+    # update_fair_value_cache().
     print(f"\n--- Signal-Scan ---")
-    signals = scan_all_watchlists(LONG_WATCHLIST, ACTIVE_SHORT_INSTRUMENTS)
+    fv_undervalued = {t[0] for t in get_undervalued_tickers()}
+    all_tickers = LONG_WATCHLIST + ACTIVE_SHORT_INSTRUMENTS
+    scan_list = [
+        t for t in all_tickers
+        if t in fv_undervalued or t in ACTIVE_SHORT_INSTRUMENTS
+    ]
+    print(f"📊 {len(all_tickers)} Titel analysiert, {len(scan_list)} im aktiven Scan (Fair Value Vorfilter)")
+    signals = scan_watchlist_parallel(scan_list, max_workers=15)
 
     # Beste Kandidaten zuerst (höchster Score) – ein Trade-Slot soll dem
     # stärksten Signal zugutekommen, nicht einfach dem ersten in

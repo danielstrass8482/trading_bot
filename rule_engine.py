@@ -6,6 +6,7 @@ Entscheidet ob ein Trade freigegeben wird. Kein LLM involviert.
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
+import concurrent.futures
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
@@ -572,6 +573,35 @@ def scan_all_watchlists(long_watchlist: list, short_watchlist: list) -> list[Sig
         results.append(result)
 
     # Sortiert: Approved zuerst, dann nach Score
+    results.sort(key=lambda r: (not r.approved, -r.score))
+    return results
+
+
+def scan_watchlist_parallel(watchlist: list, max_workers: int = 15) -> list[SignalResult]:
+    """
+    Wie scan_all_watchlists(), aber mit einem ThreadPoolExecutor parallelisiert –
+    für die volle S&P-500-Watchlist (~390 Ticker) wäre der serielle Scan zu
+    langsam für ein 09:00-ET-Zeitfenster. analyze_ticker() holt Marktdaten/
+    Regime/Guardrails weiterhin selbst (keine zusätzlichen Parameter nötig),
+    daher hier nur ticker-parallel statt die Signatur zu ändern.
+    """
+    results = []
+    errors = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(analyze_ticker, ticker): ticker for ticker in watchlist}
+
+        for future in concurrent.futures.as_completed(futures):
+            ticker = futures[future]
+            try:
+                result = future.result(timeout=30)
+                if result:
+                    results.append(result)
+            except Exception as e:
+                errors += 1
+                print(f"⚠️ {ticker}: {e}")
+
+    print(f"✅ Parallel-Scan: {len(results)} Ergebnisse, {errors} Fehler")
     results.sort(key=lambda r: (not r.approved, -r.score))
     return results
 
