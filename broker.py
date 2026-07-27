@@ -174,6 +174,11 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
     sl_price = signal.stop_loss
     tp_price = signal.take_profit
 
+    # entry_price wird per Default vom Signalzeitpunkt übernommen (PAPER-Modus,
+    # oder LIVE-Fallback falls die Order nicht rechtzeitig gefüllt wird) –
+    # im LIVE-Modus unten durch den tatsächlichen Alpaca-Fill-Preis ersetzt.
+    entry_price = signal.current_price
+
     # ── LIVE TRADING via Alpaca ─────────────────────────────────────
     if TRADING_MODE == "LIVE":
         client = _get_alpaca_client()
@@ -182,7 +187,7 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
             return None
         try:
             if is_whole_share:
-                client.submit_order(
+                order = client.submit_order(
                     symbol=signal.ticker,
                     qty=int(quantity),
                     side="buy",
@@ -194,7 +199,7 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
                 )
                 print(f"✅ LIVE Bracket-Order platziert: {int(quantity)}x {signal.ticker} SL: ${sl_price} TP: ${tp_price}")
             else:
-                client.submit_order(
+                order = client.submit_order(
                     symbol=signal.ticker,
                     qty=quantity,
                     side="buy",
@@ -206,6 +211,31 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
             print(f"❌ Alpaca Order fehlgeschlagen: {e}")
             return None
 
+        # Echten Fill-Preis von Alpaca abfragen statt den yfinance-Kurs vom
+        # Signalzeitpunkt als entry_price zu übernehmen (siehe DUK-Vorfall
+        # 2026-07-27: eine veraltete/falsche yfinance-Quote landete sonst 1:1
+        # als entry_price + Stop Loss/Take Profit in der DB, während Alpaca
+        # tatsächlich zum echten Marktpreis gefüllt hat – der Stop Loss lag
+        # dadurch weit unter dem realen Kurs und löste sofort fälschlich aus).
+        # Market-Orders auf liquide Aktien füllen praktisch sofort, kurzes
+        # Polling reicht.
+        import time
+        for _ in range(3):
+            time.sleep(1)
+            try:
+                filled_order = client.get_order(order.id)
+            except Exception as e:
+                print(f"⚠️  Order-Status konnte nicht abgefragt werden: {e}")
+                break
+            if filled_order.filled_avg_price:
+                entry_price = float(filled_order.filled_avg_price)
+                break
+        else:
+            print(f"⚠️  {signal.ticker}: Order nach 3s noch nicht gefüllt – Signal-Kurs (${signal.current_price}) als entry_price-Fallback.")
+
+        if entry_price != signal.current_price:
+            print(f"ℹ️  {signal.ticker}: Entry-Preis aus Alpaca-Fill: ${entry_price} (Signal-Kurs war ${signal.current_price})")
+
     # ── PAPER TRADING (Simulation) ──────────────────────────────────
     else:
         if is_whole_share:
@@ -213,13 +243,19 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
         else:
             print(f"📄 PAPER Trade simuliert: {quantity}x {signal.ticker} @ ${signal.current_price}")
 
+    # capital_used anhand des tatsächlichen entry_price statt des vorläufigen
+    # Signal-Kurses – sonst würde z.B. bei DUK weiterhin $50 "capital_used"
+    # geloggt, obwohl real nur ~$20 investiert wurden (Menge wurde ja mit dem
+    # falschen Signal-Kurs berechnet).
+    capital_used = round(quantity * entry_price, 2)
+
     # ── In Datenbank loggen (beide Modi) ───────────────────────────
     import json as _json
     trade = Trade(
         ticker          = signal.ticker,
         direction       = signal.direction,
         instrument_type = signal.instrument_type,
-        entry_price     = signal.current_price,
+        entry_price     = entry_price,
         stop_loss       = signal.stop_loss,
         take_profit     = signal.take_profit,
         quantity        = quantity,
@@ -253,6 +289,70 @@ def count_trading_days(start_date, end_date) -> int:
     """
     import pandas as pd
     return len(pd.bdate_range(start_date, end_date))
+
+
+def _sell_position_at_alpaca(ticker: str, fallback_price: float) -> float | None:
+    """
+    Verkauft die komplette Alpaca-Position in `ticker` tatsächlich und gibt
+    den echten Fill-Preis zurück.
+
+    Kritischer Fix (siehe DUK/NVDA-Vorfall 2026-07-27): monitor_open_positions()
+    rief bisher direkt close_trade() auf, das NUR die DB aktualisiert und
+    NIE eine Order bei Alpaca platziert hat – Positionen liefen dadurch live
+    und komplett ungeschützt weiter, während der Bot sie für geschlossen
+    hielt (kein SL/TP/Trailing mehr, da get_open_trades() nur status='OPEN'
+    liefert).
+
+    Gibt None zurück, wenn der Verkauf fehlschlägt – der Trade bleibt dann
+    OPEN und der nächste Monitoring-Zyklus versucht es erneut, statt einen
+    nicht tatsächlich verkauften Trade als geschlossen zu markieren.
+    Ausnahme: existiert die Alpaca-Position gar nicht mehr (z.B. weil eine
+    broker-seitige Bracket-Order sie bei ganzen Aktien bereits geschlossen
+    hat), gilt sie als bereits geschlossen und `fallback_price` (aktueller
+    Kurs) wird zurückgegeben.
+    """
+    if TRADING_MODE != "LIVE":
+        return fallback_price  # Paper-Modus: kein echter Broker involviert
+
+    client = _get_alpaca_client()
+    if not client:
+        print(f"⚠️  {ticker}: Alpaca-Client nicht verfügbar – Verkauf übersprungen, Trade bleibt OPEN.")
+        return None
+
+    try:
+        position = client.get_position(ticker)
+    except Exception as e:
+        if "position does not exist" in str(e).lower() or "404" in str(e):
+            print(f"ℹ️  {ticker}: Keine Alpaca-Position mehr vorhanden (vermutlich bereits broker-seitig geschlossen).")
+            return fallback_price
+        print(f"⚠️  {ticker}: Alpaca-Position konnte nicht abgefragt werden ({e}) – Trade bleibt OPEN.")
+        return None
+
+    qty = abs(float(position.qty))
+    if qty <= 0:
+        return fallback_price
+
+    try:
+        order = client.submit_order(
+            symbol=ticker, qty=qty, side="sell", type="market", time_in_force="day",
+        )
+    except Exception as e:
+        print(f"⚠️  {ticker}: Verkaufsorder fehlgeschlagen ({e}) – Trade bleibt OPEN.")
+        return None
+
+    import time
+    for _ in range(3):
+        time.sleep(1)
+        try:
+            filled_order = client.get_order(order.id)
+        except Exception:
+            continue
+        if filled_order.filled_avg_price:
+            print(f"✅ {ticker}: Live verkauft @ ${filled_order.filled_avg_price}")
+            return float(filled_order.filled_avg_price)
+
+    print(f"⚠️  {ticker}: Verkaufsorder platziert, aber Fill nach 3s nicht bestätigt – Fallback-Kurs (${fallback_price}) für PnL-Berechnung.")
+    return fallback_price
 
 
 def monitor_open_positions():
@@ -300,15 +400,23 @@ def monitor_open_positions():
                 # Time-based Exit: unabhängig von SL/TP/Trailing.
                 days_held = count_trading_days(trade.created_at.date(), datetime.now().date())
                 if days_held >= max_days:
-                    close_trade(session, trade, current_price, "CLOSED_TIME_EXIT")
+                    real_exit_price = _sell_position_at_alpaca(trade.ticker, current_price)
+                    if real_exit_price is None:
+                        print(f"⏭️  {trade.ticker}: Time-Exit-Verkauf fehlgeschlagen – bleibt OPEN, nächster Versuch beim nächsten Zyklus.")
+                        continue
+                    close_trade(session, trade, real_exit_price, "CLOSED_TIME_EXIT")
                     print(f"⏰ {trade.ticker}: Time-Exit nach {days_held} Handelstagen (PnL: ${trade.pnl_usd:.2f})")
                     continue
 
                 if not trade.trailing_sl_active:
                     # Phase 1: Normaler fester SL/TP
                     if current_price <= trade.stop_loss:
-                        close_trade(session, trade, current_price, "CLOSED_SL")
-                        print(f"🔴 SL ausgelöst: {trade.ticker} @ ${current_price} (PnL: ${trade.pnl_usd:.2f})")
+                        real_exit_price = _sell_position_at_alpaca(trade.ticker, current_price)
+                        if real_exit_price is None:
+                            print(f"⏭️  {trade.ticker}: SL-Verkauf fehlgeschlagen – bleibt OPEN, nächster Versuch beim nächsten Zyklus.")
+                            continue
+                        close_trade(session, trade, real_exit_price, "CLOSED_SL")
+                        print(f"🔴 SL ausgelöst: {trade.ticker} @ ${real_exit_price} (PnL: ${trade.pnl_usd:.2f})")
                         continue
 
                     if current_price >= trade.take_profit:
@@ -331,8 +439,12 @@ def monitor_open_positions():
 
                     # Trailing SL ausgelöst?
                     if current_price <= trade.trailing_sl_price:
-                        close_trade(session, trade, current_price, "CLOSED_TRAILING_SL")
-                        print(f"🟢 Trailing SL ausgelöst: {trade.ticker} @ ${current_price} (PnL: ${trade.pnl_usd:.2f})")
+                        real_exit_price = _sell_position_at_alpaca(trade.ticker, current_price)
+                        if real_exit_price is None:
+                            print(f"⏭️  {trade.ticker}: Trailing-SL-Verkauf fehlgeschlagen – bleibt OPEN, nächster Versuch beim nächsten Zyklus.")
+                            continue
+                        close_trade(session, trade, real_exit_price, "CLOSED_TRAILING_SL")
+                        print(f"🟢 Trailing SL ausgelöst: {trade.ticker} @ ${real_exit_price} (PnL: ${trade.pnl_usd:.2f})")
                         continue
 
             except Exception as e:
