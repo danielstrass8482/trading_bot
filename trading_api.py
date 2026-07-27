@@ -180,6 +180,35 @@ def get_performance():
         }
 
 
+@protected.get("/api/trades/history")
+def get_trade_history(limit: int = 50):
+    with get_session() as session:
+        rows = session.execute(text("""
+            SELECT
+                ticker, direction, quantity,
+                entry_price, exit_price,
+                stop_loss, take_profit,
+                capital_used, pnl_usd, pnl_pct,
+                rule_score, status,
+                broker, mode,
+                created_at, closed_at,
+                CASE
+                    WHEN status = 'CLOSED_SL' THEN 'Stop Loss'
+                    WHEN status = 'CLOSED_TP' THEN 'Take Profit'
+                    WHEN status = 'CLOSED_TRAILING_SL' THEN 'Trailing Stop'
+                    WHEN status = 'CLOSED_TIME_EXIT' THEN 'Time Exit (5 Tage)'
+                    WHEN status = 'CLOSED_MANUAL' THEN 'Manuell'
+                    ELSE status
+                END as exit_grund
+            FROM trades
+            WHERE status NOT IN ('OPEN', 'PENDING')
+            ORDER BY closed_at DESC
+            LIMIT :limit
+        """), {"limit": limit}).fetchall()
+
+        return [dict(r._mapping) for r in rows]
+
+
 @protected.get("/api/benchmark")
 def get_benchmark(days: int = 30):
     """30-Tage Bot-vs-Markt-Vergleich (siehe rule_engine/broker, Feature
