@@ -243,6 +243,30 @@ def get_scan_log(limit: int = 500, ticker: Optional[str] = None):
         return list(days.values())
 
 
+@protected.get("/api/scan-log/stats")
+def get_scan_log_stats():
+    """Welche Filter haben in den letzten 30 Tagen wie oft geblockt (siehe
+    Filter-Statistik im Scan-Historie-Tab)."""
+    with get_session() as session:
+        rows = session.execute(text("""
+            SELECT
+                CASE
+                    WHEN ko_reason LIKE '%Blacklist%' THEN 'Blacklist'
+                    WHEN ko_reason LIKE '%Fair Value%' THEN 'Fair Value'
+                    WHEN ko_reason LIKE '%Earnings%' THEN 'Earnings'
+                    WHEN guardrail_reason IS NOT NULL THEN 'Guardrail'
+                    WHEN score < 65 THEN 'Score zu niedrig'
+                    ELSE 'Sonstiges'
+                END as grund,
+                COUNT(*) as anzahl
+            FROM scan_log
+            WHERE scan_time >= NOW() - INTERVAL '30 days'
+            GROUP BY grund
+            ORDER BY anzahl DESC
+        """)).fetchall()
+        return [dict(r._mapping) for r in rows]
+
+
 @protected.get("/api/bot-config")
 def get_bot_config_all():
     with get_session() as session:
