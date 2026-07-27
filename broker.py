@@ -40,10 +40,7 @@ def get_broker(user_id: int = None) -> BrokerInterface:
     broker_type = config.get("ACTIVE_BROKER", "alpaca")
 
     if broker_type == "ibkr":
-        ibkr_host = os.getenv("IBKR_HOST", "127.0.0.1")
-        ibkr_port = int(os.getenv("IBKR_PORT", "4001"))
-        ibkr_client_id = int(os.getenv("IBKR_CLIENT_ID", "1"))
-        return IBKRBroker(host=ibkr_host, port=ibkr_port, client_id=ibkr_client_id)
+        return IBKRBroker()
 
     # Alpaca (Standard)
     if user_id:
