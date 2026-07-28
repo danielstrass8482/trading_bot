@@ -201,6 +201,20 @@ def get_performance():
 
 @protected.get("/api/trades/history")
 def get_trade_history(limit: int = 50):
+    """
+    Alle Positionen (offen + geschlossen) für die Handelshistorie-Ansicht.
+    Bis 2026-07-28 wurden hier nur geschlossene Trades zurückgegeben (WHERE
+    status NOT IN ('OPEN', ...)) – offene Positionen fehlten trotz längst
+    bekanntem Kaufdatum/-preis komplett. Sortierung jetzt nach created_at
+    (Kaufzeitpunkt) statt closed_at, damit gerade gekaufte offene Positionen
+    sofort oben erscheinen, unabhängig vom Status.
+
+    pnl_usd/pnl_pct bleiben unverändert NULL für OPEN-Trades (das ist die
+    Definition "realisierter P&L", siehe database.get_total_pnl/get_daily_pnl
+    – hier NICHT angefasst). Für OPEN-Trades kommen current_price/
+    unrealized_pnl/unrealized_pnl_pct als zusätzliche, separate Felder dazu
+    (analog zu get_overview()'s open_trades-Anreicherung).
+    """
     with get_session() as session:
         rows = session.execute(text("""
             SELECT
@@ -212,6 +226,7 @@ def get_trade_history(limit: int = 50):
                 broker, mode,
                 created_at, closed_at,
                 CASE
+                    WHEN status = 'OPEN' THEN 'Offen'
                     WHEN status = 'CLOSED_SL' THEN 'Stop Loss'
                     WHEN status = 'CLOSED_TP' THEN 'Take Profit'
                     WHEN status = 'CLOSED_TRAILING_SL' THEN 'Trailing Stop'
@@ -220,12 +235,32 @@ def get_trade_history(limit: int = 50):
                     ELSE status
                 END as exit_grund
             FROM trades
-            WHERE status NOT IN ('OPEN', 'PENDING')
-            ORDER BY closed_at DESC
+            WHERE status != 'PENDING'
+            ORDER BY created_at DESC
             LIMIT :limit
         """), {"limit": limit}).fetchall()
 
-        return [dict(r._mapping) for r in rows]
+        result = []
+        for r in rows:
+            row = dict(r._mapping)
+            if row["status"] == "OPEN":
+                try:
+                    current_price = float(yf.Ticker(row["ticker"]).fast_info.get("lastPrice", row["entry_price"]))
+                except Exception:
+                    current_price = row["entry_price"]
+                row["current_price"] = current_price
+                row["unrealized_pnl"] = round((current_price - row["entry_price"]) * row["quantity"], 2)
+                row["unrealized_pnl_pct"] = (
+                    round((current_price - row["entry_price"]) / row["entry_price"] * 100, 2)
+                    if row["entry_price"] else 0
+                )
+            else:
+                row["current_price"] = None
+                row["unrealized_pnl"] = None
+                row["unrealized_pnl_pct"] = None
+            result.append(row)
+
+        return result
 
 
 @protected.get("/api/benchmark")
