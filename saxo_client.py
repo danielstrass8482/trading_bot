@@ -9,11 +9,22 @@ initialen One-Time-Seed nach dem manuellen OAuth-Login).
 """
 
 from datetime import datetime, timedelta
+import socket
 
 import requests
+import urllib3.util.connection as _urllib3_connection
 
 from config import SAXO_CLIENT_ID, SAXO_CLIENT_SECRET, SAXO_TOKEN_URL, SAXO_API_BASE_URL
 from database import get_session, get_saxo_token, upsert_saxo_token
+
+# Saxos Akamai-Edge liefert auf diesem VPS (Hoster-ASN dogado GmbH) über IPv6
+# ein hartes "403 Access Denied" (WAF-Block, kein Saxo-Auth-Fehler) – bestätigt
+# per `curl -4` (funktioniert, liefert korrektes 401 bei Test-Credentials) vs.
+# Standard-`curl` (IPv6, 403). Globaler Fix: urllib3 zwingen, bei DNS-Resolution
+# nur IPv4-Adressen zu berücksichtigen. Betrifft den ganzen Prozess (auch
+# Alpaca/yfinance-Requests), das ist aber unkritisch, da alle genutzten APIs
+# IPv4 unterstützen.
+_urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
 
 # Access Token gilt als "gleich ablaufend" wenn weniger als 2 Minuten Restlaufzeit
 # bleiben – proaktiver Refresh statt erst beim tatsächlichen Ablauf.
