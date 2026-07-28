@@ -31,6 +31,7 @@ from broker import place_trade, monitor_open_positions, get_portfolio_value, get
 from backlook import run_backlook
 from fair_value import update_fair_value_cache, get_undervalued_tickers
 from saxo_client import get_valid_access_token
+from post_exit_tracking import update_pending_tracking
 
 
 def _smtp_login_utf8(server, user, password):
@@ -290,16 +291,23 @@ def calculate_max_trades_today() -> int:
         return max(0, min(max_by_capital, max_by_positions))
 
 
-def get_trades_for_slot(slot: EntryTimeSlot, daily_count: int) -> int:
+def get_trades_for_slot(slot: EntryTimeSlot) -> int:
     """
     Dynamische Slot-Verteilung (ersetzt festes "Konservatives Frühbudget"-Cap):
     das verbleibende Tagesbudget wird gleichmäßig (aufgerundet) auf die noch
     verbleibenden aktiven Slots ab diesem Slot verteilt, statt frühen Slots
     das gesamte Restbudget zu überlassen. slot.max_trades_per_slot bleibt als
     optionale Obergrenze bestehen.
+
+    WICHTIG: calculate_max_trades_today() ist bereits das LIVE kapital-/
+    positions-bereinigte Restbudget (berechnet aus SUM(capital_used) aller
+    aktuell offenen Trades) – heute bereits ausgeführte Trades sind darüber
+    schon vollständig eingepreist. Ein zusätzlicher Abzug der heutigen
+    Trade-Anzahl (früher: `daily_count`-Parameter) wäre ein Doppelabzug:
+    einmal implizit über das reduzierte verfügbare Kapital, einmal explizit
+    über die Trade-Anzahl – das hat real noch mögliche Trades blockiert.
     """
-    max_trades_today = calculate_max_trades_today()
-    restbudget = max_trades_today - daily_count
+    restbudget = calculate_max_trades_today()
 
     if restbudget <= 0:
         return 0
@@ -380,14 +388,18 @@ def run_entry_cycle(slot: EntryTimeSlot):
     # 3. Budget für diesen Slot bestimmen: das Restbudget des Tages wird
     # dynamisch auf die verbleibenden aktiven Slots verteilt statt frühen
     # Slots das gesamte Restbudget zu überlassen (siehe get_trades_for_slot).
+    # max_trades_today ist bereits das LIVE kapital-/positions-bereinigte
+    # Restbudget – trades_heute dient hier NUR noch der Log-Anzeige, wird
+    # NICHT mehr davon abgezogen (früherer Doppelabzug-Bug, siehe
+    # get_trades_for_slot-Docstring).
     with get_session() as session:
         max_trades_today = calculate_max_trades_today()
         trades_heute = get_daily_trade_count(session)
-        restbudget = max_trades_today - trades_heute
 
-    erlaubt = get_trades_for_slot(slot, trades_heute)
+    erlaubt = get_trades_for_slot(slot)
 
-    print(f"🎯 Slot-Budget: {erlaubt} Trade(s) (Cap {slot.max_trades_per_slot}, Restbudget {restbudget}/{max_trades_today})")
+    print(f"🎯 Slot-Budget: {erlaubt} Trade(s) (Cap {slot.max_trades_per_slot}, "
+          f"Restbudget {max_trades_today} weitere(r) Trade(s) laut Kapital/Positionen, heute bereits {trades_heute} ausgeführt)")
     if erlaubt <= 0:
         print(f"⏭️  Slot {slot.stunde_et}:{slot.minute_et:02d} – kein Budget")
         return
@@ -658,6 +670,22 @@ def main():
         name="SL/TP Monitoring"
     )
 
+    # Post-Exit-Tracking Update: täglich 05:00 ET (vor Handelsbeginn und vor
+    # dem montäglichen Backlook 06:00 ET), füllt price_after_5/10_days für
+    # post_exit_tracking-Zeilen deren Beobachtungsfenster abgelaufen ist
+    # (siehe post_exit_tracking.py – Schwellenwert-Wirksamkeitsprüfung).
+    scheduler.add_job(
+        update_pending_tracking,
+        CronTrigger(
+            hour=5, minute=0,
+            day_of_week="mon-fri",
+            timezone=et_tz
+        ),
+        id="post_exit_tracking_update",
+        name="Post-Exit-Tracking Update",
+        replace_existing=True
+    )
+
     # Wöchentlicher Backlook: Montags 06:00 ET, vor dem Haupt-Zyklus (Option A Selbstlern)
     scheduler.add_job(
         run_backlook,
@@ -702,6 +730,7 @@ def main():
     print(f"⏰ Scheduler aktiv. Entry-Zyklen laufen zu den registrierten Zeitslots (Mo–Fr)")
     print(f"🌅 Morning Brief: täglich 08:30 ET")
     print(f"📡 Monitoring: alle {monitoring_interval} Min von 09:30–16:00 ET")
+    print(f"📉 Post-Exit-Tracking Update: täglich 05:00 ET")
     print(f"📚 Backlook: montags 06:00 ET")
     print(f"💰 Fair Value Update: montags 08:00 ET")
     print(f"🔑 Saxo Token Refresh: alle 10 Minuten")

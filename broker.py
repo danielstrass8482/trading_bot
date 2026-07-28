@@ -358,20 +358,51 @@ def _sell_position_at_alpaca(ticker: str, fallback_price: float) -> float | None
 def monitor_open_positions():
     """
     Prüft alle offenen Positionen gegen aktuelle Preise.
-    - Time-based Exit: Position wird nach MAX_HOLDING_DAYS Handelstagen
-      unabhängig von SL/TP geschlossen.
-    - Solange kein Trailing SL aktiv ist: normaler fester Stop Loss / Take
-      Profit. Erreicht der Kurs den Take Profit, wird NICHT sofort verkauft,
-      sondern ein ATR-basierter Trailing SL aktiviert (siehe Feature
-      Trailing SL nach erstem TP).
+    - Time-based Exit: Ohne aktiven Trailing-SL wird die Position nach
+      MAX_HOLDING_DAYS Handelstagen geschlossen (CLOSED_TIME_EXIT). Mit
+      aktivem Trailing-SL wird der Time-Exit ausgesetzt (der Trade läuft
+      bereits profitabel mit eigenem adaptiven Schutz) – als Sicherheitsnetz
+      greift stattdessen eine harte Obergrenze bei MAX_HOLDING_DAYS *
+      MAX_HOLDING_DAYS_TRAILING_MULTIPLIER Handelstagen (CLOSED_TIME_EXIT_
+      HARD_CAP). Beide Time-Exit-Varianten legen einen post_exit_tracking-
+      Eintrag an (siehe post_exit_tracking.py), der den Kursverlauf danach
+      beobachtet, um die Schwellenwerte selbst zu evaluieren (Backlook).
+    - Solange kein Trailing SL aktiv ist: normaler fester Stop Loss. Trailing
+      SL wird aktiviert, sobald der Kurs den NIEDRIGEREN der beiden Trigger
+      erreicht: den fixen TRAILING_ACTIVATION_PCT ggü. Entry, oder das
+      individuelle ATR-basierte Take Profit – je nachdem was zuerst kommt
+      (siehe Feature Trailing SL nach erstem TP). Es wird dabei NICHT sofort
+      verkauft, sondern der Trailing SL aktiviert.
     - Ist der Trailing SL aktiv: SL wird nachgezogen, sobald ein neuer Hoch-
       punkt erreicht wird; fällt der Kurs unter den Trailing SL, wird verkauft.
+      Die Trailing-Distanz ist ATR-basiert (ATR_MULTIPLIER_SL, konsistent mit
+      dem Entry-SL in rule_engine.py) und auf ATR_MIN_SL_PCT/ATR_MAX_SL_PCT
+      geclampt, damit bei sehr volatilen Tickern nicht unnötig viel bereits
+      erreichter Gewinn wieder preisgegeben wird, bevor der Trailing-Stop greift.
     Wird vom Scheduler regelmäßig aufgerufen.
     """
     from rule_engine import calculate_atr
+    from post_exit_tracking import start_tracking_if_applicable
 
     config = get_live_config()
     max_days = int(config.get("MAX_HOLDING_DAYS", 5))
+    max_days_trailing_multiplier = int(config.get("MAX_HOLDING_DAYS_TRAILING_MULTIPLIER", 2))
+    atr_multiplier_sl = config.get("ATR_MULTIPLIER_SL", 1.5)
+    min_sl_pct = config.get("ATR_MIN_SL_PCT", 0.01)
+    max_sl_pct = config.get("ATR_MAX_SL_PCT", 0.08)
+    trailing_activation_pct = config.get("TRAILING_ACTIVATION_PCT", 0.06)
+
+    def _clamped_trailing_distance(atr, reference_price):
+        """ATR-basierte Trailing-Distanz in $, auf ATR_MIN_SL_PCT/ATR_MAX_SL_PCT
+        geclampt (analog zum Entry-SL in rule_engine.py). Fallback 3% falls
+        kein ATR verfügbar. `reference_price` ist der Kurs, gegen den der
+        %-Anteil berechnet wird (bei Aktivierung: current_price; beim
+        Nachziehen: highest_price_since_entry, da davon abgezogen wird)."""
+        if atr and atr > 0:
+            raw_distance = atr * atr_multiplier_sl
+            pct = max(min_sl_pct, min(max_sl_pct, raw_distance / reference_price))
+            return reference_price * pct
+        return reference_price * 0.03
 
     with get_session() as session:
         open_trades = get_open_trades(session)
@@ -397,15 +428,31 @@ def monitor_open_positions():
                         current_price > trade.highest_price_since_entry):
                     trade.highest_price_since_entry = current_price
 
-                # Time-based Exit: unabhängig von SL/TP/Trailing.
+                # Time-based Exit: Bei aktivem Trailing-SL ausgesetzt (der Trade
+                # trägt bereits seinen eigenen adaptiven Schutz und ist nachweislich
+                # profitabel – ein stures Kappen nach MAX_HOLDING_DAYS würde genau
+                # die laufenden Gewinner unnötig abschneiden). Stattdessen greift
+                # eine harte Obergrenze bei MAX_HOLDING_DAYS * MAX_HOLDING_DAYS_
+                # TRAILING_MULTIPLIER als Sicherheitsnetz gegen endlos offene
+                # Positionen. Ohne aktiven Trailing-SL bleibt der normale Time-Exit
+                # unverändert bei MAX_HOLDING_DAYS.
                 days_held = count_trading_days(trade.created_at.date(), datetime.now().date())
-                if days_held >= max_days:
+                if trade.trailing_sl_active:
+                    time_exit_reason = None
+                    if days_held >= max_days * max_days_trailing_multiplier:
+                        time_exit_reason = "CLOSED_TIME_EXIT_HARD_CAP"
+                else:
+                    time_exit_reason = "CLOSED_TIME_EXIT" if days_held >= max_days else None
+
+                if time_exit_reason:
                     real_exit_price = _sell_position_at_alpaca(trade.ticker, current_price)
                     if real_exit_price is None:
                         print(f"⏭️  {trade.ticker}: Time-Exit-Verkauf fehlgeschlagen – bleibt OPEN, nächster Versuch beim nächsten Zyklus.")
                         continue
-                    close_trade(session, trade, real_exit_price, "CLOSED_TIME_EXIT")
-                    print(f"⏰ {trade.ticker}: Time-Exit nach {days_held} Handelstagen (PnL: ${trade.pnl_usd:.2f})")
+                    close_trade(session, trade, real_exit_price, time_exit_reason)
+                    start_tracking_if_applicable(session, trade)
+                    label = "Time-Exit (harte Obergrenze bei aktivem Trailing-SL)" if time_exit_reason == "CLOSED_TIME_EXIT_HARD_CAP" else "Time-Exit"
+                    print(f"⏰ {trade.ticker}: {label} nach {days_held} Handelstagen (PnL: ${trade.pnl_usd:.2f})")
                     continue
 
                 if not trade.trailing_sl_active:
@@ -419,18 +466,32 @@ def monitor_open_positions():
                         print(f"🔴 SL ausgelöst: {trade.ticker} @ ${real_exit_price} (PnL: ${trade.pnl_usd:.2f})")
                         continue
 
-                    if current_price >= trade.take_profit:
-                        # TP erreicht → Trailing SL aktivieren statt verkaufen
+                    # Trailing SL aktiviert sich beim NIEDRIGEREN der beiden
+                    # Trigger-Preise: fixer TRAILING_ACTIVATION_PCT ggü. Entry,
+                    # oder individuelles ATR-TP – je nachdem was zuerst erreicht wird.
+                    fixed_trigger_price = trade.entry_price * (1 + trailing_activation_pct)
+                    if fixed_trigger_price <= trade.take_profit:
+                        effective_trigger_price = fixed_trigger_price
+                        trigger_reason = f"TRAILING_ACTIVATION_PCT ({trailing_activation_pct:.1%})"
+                    else:
+                        effective_trigger_price = trade.take_profit
+                        tp_pct_label = f"{trade.tp_pct:.1%}" if trade.tp_pct else "?"
+                        trigger_reason = f"ATR-TP ({tp_pct_label})"
+
+                    if current_price >= effective_trigger_price:
+                        # Trigger erreicht → Trailing SL aktivieren statt verkaufen
                         trade.trailing_sl_active = True
                         atr = calculate_atr(trade.ticker)
-                        sl_distance = atr * 1.5 if atr else current_price * 0.03
+                        sl_distance = _clamped_trailing_distance(atr, current_price)
                         trade.trailing_sl_price = round(current_price - sl_distance, 2)
-                        print(f"🎯 {trade.ticker}: TP erreicht! Trailing SL aktiviert bei ${trade.trailing_sl_price:.2f}")
+                        print(f"🎯 {trade.ticker}: Trailing SL aktiviert via {trigger_reason} "
+                              f"(Kurs ${current_price:.2f} >= Trigger ${effective_trigger_price:.2f}) "
+                              f"bei ${trade.trailing_sl_price:.2f}")
 
                 else:
                     # Phase 2: Trailing SL aktiv – SL nach oben nachziehen
                     atr = calculate_atr(trade.ticker)
-                    sl_distance = atr * 1.5 if atr else current_price * 0.03
+                    sl_distance = _clamped_trailing_distance(atr, trade.highest_price_since_entry)
                     new_trailing_sl = round(trade.highest_price_since_entry - sl_distance, 2)
 
                     if new_trailing_sl > trade.trailing_sl_price:

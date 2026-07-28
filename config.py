@@ -305,6 +305,9 @@ MAX_OPEN_POSITIONS    = 5        # Max. gleichzeitig offene Positionen
 MAX_TRADES_PER_DAY    = 3        # Max. neue Trades pro Handelstag
 STOP_LOSS_PCT         = 0.03     # Automatischer Ausstieg bei -3%
 TAKE_PROFIT_PCT       = 0.06     # Gewinnmitnahme bei +6% (CRV = 2:1)
+TRAILING_ACTIVATION_PCT = 0.06   # Fixer Trailing-Aktivierungs-Trigger ggü. Entry;
+                                  # Trailing startet beim NIEDRIGEREN von (diesem
+                                  # Wert, individuellem ATR-TP) – siehe broker.py
 DAILY_LOSS_LIMIT_PCT  = 0.05     # Bot pausiert bei -5% Tagesverlust auf Gesamtkapital
 MIN_SIGNAL_SCORE      = 65       # Minimaler Rule-Engine-Score (0–100) für Trade-Freigabe
 
@@ -364,6 +367,7 @@ _LIVE_CONFIG_SPEC = {
     "MAX_TRADES_PER_DAY":      (int,   MAX_TRADES_PER_DAY),
     "STOP_LOSS_PCT":           (float, STOP_LOSS_PCT),
     "TAKE_PROFIT_PCT":         (float, TAKE_PROFIT_PCT),
+    "TRAILING_ACTIVATION_PCT": (float, TRAILING_ACTIVATION_PCT),
     "DAILY_LOSS_LIMIT_PCT":    (float, DAILY_LOSS_LIMIT_PCT),
     "MIN_SIGNAL_SCORE":        (int,   MIN_SIGNAL_SCORE),
     "VIX_PAUSE_THRESHOLD":     (float, VIX_PAUSE_THRESHOLD),
@@ -373,6 +377,7 @@ _LIVE_CONFIG_SPEC = {
     "ATR_MIN_SL_PCT":          (float, 0.01),
     "ATR_MAX_SL_PCT":          (float, 0.08),
     "MAX_HOLDING_DAYS":        (int,   5),
+    "MAX_HOLDING_DAYS_TRAILING_MULTIPLIER": (int, 2),  # harte Obergrenze bei aktivem Trailing-SL = MAX_HOLDING_DAYS * dieser Wert
     "VOLATILE_SEGMENT_PCT":    (float, 0.33),
     "VOLATILE_ATR_THRESHOLD":  (float, 0.025),
     "EARNINGS_BUFFER_DAYS":    (int,   EARNINGS_BUFFER_DAYS),

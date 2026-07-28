@@ -111,9 +111,13 @@ def fetch_fundamentals(ticker: str) -> dict:
 
 
 def calculate_atr(ticker: str, period: int = 14) -> Optional[float]:
-    """Berechnet den Average True Range (ATR) für den SL/TP-Abstand."""
+    """Berechnet den Average True Range (ATR) für den SL/TP-Abstand.
+    Historie bewusst mit 3 Monaten Puffer geladen (statt exakt 1mo) – bei
+    Feiertagshäufungen (Thanksgiving, Weihnachten/Neujahr) lieferte "1mo"
+    teils nur knapp über den 14 für die ATR-Rolling-Periode nötigen Handels-
+    tagen. Die ATR-Berechnung selbst (rolling(period).mean()) bleibt unverändert."""
     try:
-        df = yf.Ticker(ticker).history(period="1mo", interval="1d", auto_adjust=False)
+        df = yf.Ticker(ticker).history(period="3mo", interval="1d", auto_adjust=False)
         if df.empty or len(df) < period:
             return None
         if isinstance(df.columns, pd.MultiIndex):

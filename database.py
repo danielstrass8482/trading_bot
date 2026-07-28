@@ -62,7 +62,7 @@ class Trade(Base):
     llm_summary    = Column(Text, nullable=True)
     llm_risks      = Column(Text, nullable=True)           # JSON-Array als String
     score_breakdown = Column(Text, nullable=True)          # JSON-Objekt: Kriterium -> {score, max, value}
-    status         = Column(String(20), default="OPEN")   # OPEN / CLOSED_SL / CLOSED_TP / CLOSED_TRAILING_SL / CLOSED_TIME_EXIT / CLOSED_MANUAL
+    status         = Column(String(20), default="OPEN")   # OPEN / CLOSED_SL / CLOSED_TP / CLOSED_TRAILING_SL / CLOSED_TIME_EXIT / CLOSED_TIME_EXIT_HARD_CAP / CLOSED_MANUAL
     exit_price     = Column(Float, nullable=True)
     closed_at      = Column(DateTime, nullable=True)
     pnl_usd        = Column(Float, nullable=True)
@@ -104,6 +104,43 @@ class Trade(Base):
 
     def __repr__(self):
         return f"<Trade {self.ticker} {self.direction} {self.status} PnL={self.pnl_usd}>"
+
+
+class PostExitTracking(Base):
+    """
+    Schwellenwert-Wirksamkeitsprüfung (siehe post_exit_tracking.py): verfolgt
+    den Kursverlauf eines Tickers für 10 Handelstage NACH einem regelbasierten
+    Exit, um zu prüfen ob der auslösende Schwellenwert selbst zu früh/spät
+    greift. Aktuell nur für die Holding-Days-Grenze befüllt (CLOSED_TIME_EXIT/
+    CLOSED_TIME_EXIT_HARD_CAP) – die `parameter`-Spalte macht die Tabelle
+    bewusst wiederverwendbar für künftige Schwellenwerte nach demselben Muster
+    (z.B. STOP_LOSS_PCT, ATR_MULTIPLIER_TP, TRAILING_ACTIVATION_PCT), ohne
+    dass dafür eine neue Tabelle/neuer Code-Pfad nötig wäre.
+    """
+    __tablename__ = "post_exit_tracking"
+
+    id                     = Column(Integer, primary_key=True, autoincrement=True)
+    trade_id               = Column(Integer, nullable=False)
+    ticker                 = Column(String(10), nullable=False)
+    parameter              = Column(String(50), nullable=False, default="MAX_HOLDING_DAYS")
+    exit_reason            = Column(String(30), nullable=False)
+    exit_price             = Column(Float, nullable=False)
+    exit_date              = Column(DateTime, nullable=False)
+    pnl_pct_at_exit        = Column(Float, nullable=True)
+    price_after_5_days     = Column(Float, nullable=True)
+    pnl_pct_after_5_days   = Column(Float, nullable=True)
+    price_after_10_days    = Column(Float, nullable=True)
+    pnl_pct_after_10_days  = Column(Float, nullable=True)
+    # None = 10-Tage-Fenster noch nicht ausgewertet; True/False danach fix.
+    would_have_more_profit = Column(Boolean, nullable=True)
+    # pnl_pct_after_10_days - pnl_pct_at_exit: positiv = entgangener Gewinn
+    # durch den Exit, negativ = durch den Exit vermiedener weiterer Verlust.
+    forgone_profit_pct     = Column(Float, nullable=True)
+    created_at             = Column(DateTime, default=datetime.utcnow)
+    updated_at             = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<PostExitTracking trade={self.trade_id} {self.ticker} {self.parameter} {self.exit_reason}>"
 
 
 class BotState(Base):
@@ -152,6 +189,7 @@ DEFAULT_CONFIG = {
     "MAX_TRADES_PER_DAY":      ("3",      "Max. Trades pro Tag"),
     "STOP_LOSS_PCT":           ("0.03",   "Stop Loss %"),
     "TAKE_PROFIT_PCT":         ("0.06",   "Take Profit %"),
+    "TRAILING_ACTIVATION_PCT": ("0.06",   "Fixer Trailing-Aktivierungs-Trigger % ggü. Entry (niedrigerer von diesem und ATR-TP löst aus)"),
     "DAILY_LOSS_LIMIT_PCT":    ("0.05",   "Tagesverlust-Limit %"),
     "MIN_SIGNAL_SCORE":        ("65",     "Minimaler Score"),
     "VIX_PAUSE_THRESHOLD":     ("30",     "VIX-Limit"),
@@ -162,6 +200,7 @@ DEFAULT_CONFIG = {
     "ATR_MIN_SL_PCT":          ("0.01",   "Minimaler SL % (Sicherheitsnetz)"),
     "ATR_MAX_SL_PCT":          ("0.08",   "Maximaler SL % (Sicherheitsnetz)"),
     "MAX_HOLDING_DAYS":        ("5",      "Max. Haltedauer in Handelstagen"),
+    "MAX_HOLDING_DAYS_TRAILING_MULTIPLIER": ("2", "Harte Obergrenze bei aktivem Trailing-SL = MAX_HOLDING_DAYS x dieser Wert"),
     "VOLATILE_SEGMENT_PCT":    ("0.33",   "Anteil volatile Titel am Portfolio (0-1)"),
     "VOLATILE_ATR_THRESHOLD":  ("0.025",  "ATR/Preis Ratio ab dem ein Titel als volatil gilt (2.5%)"),
     "EARNINGS_BUFFER_DAYS":    ("3",      "Tage vor Earnings in denen nicht gekauft wird"),
@@ -546,7 +585,7 @@ def get_total_capital_in_trades(session: Session) -> float:
 # neue Exit-Gründe (z.B. Trailing SL, Time-Exit) nicht in get_total_pnl/
 # get_daily_pnl vergessen werden und so das Daily-Loss-Limit (Guardrail!)
 # unterlaufen.
-CLOSED_STATUSES = ["CLOSED_SL", "CLOSED_TP", "CLOSED_TRAILING_SL", "CLOSED_TIME_EXIT", "CLOSED_MANUAL"]
+CLOSED_STATUSES = ["CLOSED_SL", "CLOSED_TP", "CLOSED_TRAILING_SL", "CLOSED_TIME_EXIT", "CLOSED_TIME_EXIT_HARD_CAP", "CLOSED_MANUAL"]
 
 
 def get_total_pnl(session: Session) -> float:
@@ -571,7 +610,7 @@ def close_trade(session: Session, trade: Trade, exit_price: float, reason: str) 
     """Schließt einen Trade und berechnet P&L."""
     trade.exit_price = exit_price
     trade.closed_at  = datetime.utcnow()
-    trade.status     = reason  # CLOSED_SL / CLOSED_TP / CLOSED_MANUAL
+    trade.status     = reason  # z.B. CLOSED_SL / CLOSED_TP / CLOSED_TRAILING_SL / CLOSED_TIME_EXIT / CLOSED_TIME_EXIT_HARD_CAP / CLOSED_MANUAL
     trade.pnl_usd    = (exit_price - trade.entry_price) * trade.quantity
     trade.pnl_pct    = (exit_price - trade.entry_price) / trade.entry_price * 100
     return trade
@@ -685,6 +724,23 @@ def get_learning_proposals(session: Session) -> list[dict]:
 def set_learning_proposals(session: Session, proposals: list[dict]):
     """Schreibt die vollständige Liste der Lernvorschläge in bot_state."""
     BotState.set(session, "learning_proposals", json.dumps(proposals, ensure_ascii=False))
+
+
+def save_learning_proposal(session: Session, typ: str, data: dict):
+    """
+    Hängt einen neuen Lernvorschlag an die pending-Liste in bot_state an.
+    Ursprünglich in backlook.py definiert, hierher verschoben (liegt näher an
+    get_learning_proposals/set_learning_proposals) damit sowohl backlook.py
+    als auch post_exit_tracking.py sie ohne Circular-Import nutzen können.
+    """
+    proposals = get_learning_proposals(session)
+    proposals.append({
+        "typ": typ,
+        "erstellt": datetime.utcnow().isoformat(),
+        "data": data,
+        "status": "pending",
+    })
+    set_learning_proposals(session, proposals)
 
 
 def apply_entry_time_proposal(session: Session, vorschlaege: list[dict]):
