@@ -14,6 +14,7 @@ Alle Datenendpunkte liegen hinter dieser Prüfung – ohne sie wäre eine
 
 import os
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Cookie
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from jose import JWTError, jwt
@@ -75,6 +76,24 @@ protected = APIRouter(dependencies=[Depends(require_auth)])
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/saxo/callback")
+async def saxo_callback(code: str = None, error: str = None):
+    if error:
+        return {"error": error}
+    if code:
+        with open("/tmp/saxo_auth_code.txt", "w") as f:
+            f.write(code)
+        return HTMLResponse(content="""
+            <html><body style="background:#161412;color:#f0ede8;
+                               font-family:Inter;padding:2rem;">
+            <h2 style="color:#c9a252">✅ Saxo Login erfolgreich!</h2>
+            <p>Auth Code wurde gespeichert.</p>
+            <p>Du kannst diesen Tab schließen.</p>
+            </body></html>
+        """)
+    return {"error": "Kein Code erhalten"}
 
 
 @protected.get("/api/overview")
