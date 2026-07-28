@@ -66,18 +66,31 @@ MAX_CAPITAL_TOTAL        = 500.00   # Gesamtkapital in €
 MAX_CAPITAL_PER_TRADE    = 50.00    # Max. Einsatz pro Trade (10% des Kapitals)
 MAX_OPEN_POSITIONS       = 5        # Max. gleichzeitig offene Positionen
 MAX_TRADES_PER_DAY       = 3        # Max. neue Trades pro Handelstag
-STOP_LOSS_PCT            = 0.03     # Automatischer Ausstieg bei -3%
-TAKE_PROFIT_PCT          = 0.06     # Gewinnmitnahme bei +6% (CRV = 2:1)
+STOP_LOSS_PCT            = 0.03     # Fallback (falls ATR nicht berechenbar): -3%
+TAKE_PROFIT_PCT          = 0.06     # Fallback (falls ATR nicht berechenbar): +6% (CRV = 2:1)
 DAILY_LOSS_LIMIT_PCT     = 0.05     # Bot pausiert bei -5% Tagesverlust auf Gesamtkapital
 MIN_SIGNAL_CONFIDENCE    = 65       # Minimale Rule-Score in % für Freigabe
 ```
 
+> **Hinweis (Umsetzung weicht vom ursprünglichen Spec-Stand ab):** SL/TP sind
+> in der tatsächlichen Implementierung **ATR-adaptiv** statt fix -3%/+6% –
+> Distanz = ATR × ATR_MULTIPLIER_SL/_TP, geclampt auf ATR_MIN_SL_PCT/
+> ATR_MAX_SL_PCT (variiert also pro Ticker je nach Volatilität). STOP_LOSS_PCT/
+> TAKE_PROFIT_PCT oben gelten nur noch als Fallback, wenn für einen Ticker kein
+> ATR berechnet werden kann. Zusätzlich aktiviert sich ein Trailing-Stop beim
+> NIEDRIGEREN von (fixem TRAILING_ACTIVATION_PCT-Trigger, individuellem
+> ATR-TP) statt bei TP sofort zu verkaufen (siehe broker.py).
+
 ### 3.2 Chancen-Risiko-Verhältnis (CRV)
 
-Jeder Trade wird nur ausgeführt, wenn:
+Ursprüngliches Design – in der Umsetzung durch die ATR-adaptive Logik oben ersetzt:
 - **Stop Loss** bei -3% liegt
 - **Take Profit** bei min. +6% liegt
 - → CRV = mindestens **2:1** (bei 50% Trefferquote mathematisch profitabel)
+
+Das CRV-Verhältnis (ATR_MULTIPLIER_TP / ATR_MULTIPLIER_SL, aktuell 3.0/1.5 = 2:1)
+bleibt als Prinzip erhalten, nur die konkreten %-Werte sind jetzt pro Ticker
+volatilitätsabhängig statt fix.
 
 ### 3.3 Gewinnmitnahme-Strategie
 

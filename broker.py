@@ -72,6 +72,37 @@ def _get_alpaca_client(user_id: int = None):
         return None
 
 
+def get_alpaca_account_snapshot(user_id: int = None) -> dict | None:
+    """
+    Liest Cash/Buying-Power/Marktwert/unrealisierten G&V DIREKT von Alpaca
+    (GET /v2/account + /v2/positions) – im Gegensatz zu get_portfolio_value()
+    (das den Portfolio-Wert über yfinance-Kurse NACHRECHNET) ist das die
+    Broker-eigene Wahrheit. Wird für die Übersicht gebraucht, um "verfügbares
+    Kapital" (cash) von "gebunden in offenen Positionen" (long_market_value)
+    zu trennen – die bisherige Anzeige zeigte nur die Summe beider (equity)
+    und suggerierte damit mehr frei verfügbares Kapital als tatsächlich da war.
+    None falls Alpaca nicht erreichbar (Aufrufer fällt dann auf
+    get_portfolio_value() zurück, siehe trading_api.get_overview).
+    """
+    client = _get_alpaca_client(user_id)
+    if not client:
+        return None
+    try:
+        account = client.get_account()
+        positions = client.list_positions()
+    except Exception as e:
+        print(f"⚠️  Alpaca-Account-Snapshot fehlgeschlagen: {e}")
+        return None
+
+    return {
+        "cash": float(account.cash),
+        "buying_power": float(account.buying_power),
+        "equity": float(account.equity),
+        "long_market_value": float(account.long_market_value),
+        "unrealized_pl": round(sum(float(p.unrealized_pl) for p in positions), 2),
+    }
+
+
 def check_guardrails(signal: SignalResult) -> None:
     """
     Prüft ALLE Guardrails vor Trade-Ausführung.

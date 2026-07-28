@@ -25,7 +25,7 @@ from database import (
     get_learning_proposals, set_learning_proposals,
 )
 from config import get_live_config, TRADING_MODE
-from broker import get_portfolio_value
+from broker import get_portfolio_value, get_alpaca_account_snapshot
 from rule_engine import get_market_regime
 import yfinance as yf
 
@@ -126,11 +126,19 @@ def get_overview():
         # exakt mit main.py/dashboard.py übereinstimmt.
         daily_trades = get_daily_trade_count(session)
 
-    # Portfolio-Wert & Marktregime werden live berechnet (broker.py /
-    # rule_engine.py) statt aus bot_state gelesen – dort werden diese Werte
-    # nirgends geschrieben, ein bot_state-Read hätte hier immer nur den
-    # Fallback-Wert geliefert.
-    portfolio_value = get_portfolio_value()
+    # Cash/Marktwert/unrealisierter G&V kommen direkt von Alpaca (Broker-
+    # Wahrheit, siehe get_alpaca_account_snapshot) statt wie bisher nur den
+    # blendeten equity-Wert über yfinance nachzurechnen – Frontend trennt
+    # damit "verfügbares Kapital" von "gebunden in Positionen" (siehe
+    # Uebersicht.tsx). Fallback auf get_portfolio_value() falls Alpaca gerade
+    # nicht erreichbar ist (z.B. Wartungsfenster) – lieber ein etwas
+    # ungenauerer Wert als ein kompletter Ausfall der Übersicht.
+    alpaca_account = get_alpaca_account_snapshot()
+    portfolio_value = alpaca_account["equity"] if alpaca_account else get_portfolio_value()
+    cash = alpaca_account["cash"] if alpaca_account else None
+    long_market_value = alpaca_account["long_market_value"] if alpaca_account else None
+    unrealized_pnl_total = alpaca_account["unrealized_pl"] if alpaca_account else None
+
     market_regime = get_market_regime()
 
     try:
@@ -156,6 +164,9 @@ def get_overview():
 
     return {
         "portfolio_value": portfolio_value,
+        "cash": cash,
+        "long_market_value": long_market_value,
+        "unrealized_pnl": unrealized_pnl_total,
         "realized_pnl": realized_pnl,
         "open_trades": open_trades_out,
         "daily_trades": daily_trades,

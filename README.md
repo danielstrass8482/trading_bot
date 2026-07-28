@@ -215,16 +215,24 @@ Margin-Anforderungen, identische Order-Logik im Code.
 
 ---
 
-## Guardrails (unveränderlich im Code)
+## Guardrails (Defaults, DB-konfigurierbar über bot_config)
 
-| Parameter | Wert | Zweck |
+Hardcoded Fail-safe-Werte in config.py, per Dashboard/bot_config überschreibbar
+(siehe config.get_live_config) – Ausfall der DB fällt auf diese Defaults zurück.
+
+| Parameter | Default | Zweck |
 |---|---|---|
 | Max. Kapital/Trade | $50 | 10% des Startkapitals |
-| Max. Trades/Tag | 3 | Kein Overtrading |
-| Stop Loss | -3% | Verlust begrenzen |
-| Take Profit | +6% | CRV = 2:1 |
+| Max. Trades/Tag | dynamisch (Kapital-/Positions-Budget) | Kein Overtrading (siehe main.calculate_max_trades_today) |
+| Stop Loss | ATR-adaptiv (≈1–8%, Fallback -3%) | ATR × ATR_MULTIPLIER_SL, geclampt |
+| Take Profit / Trailing-Trigger | ATR-adaptiv (≈2–16%) ODER fix +6% ggü. Entry (niedrigerer von beiden löst aus) | Trailing SL statt Hard-Sell bei Erreichen, siehe broker.monitor_open_positions |
 | VIX-Limit | 30 | Kein Handel bei Panik |
 | Min. Score | 65/100 | Nur starke Signale |
+
+Stop Loss und Take Profit sind **nicht** fix -3%/+6% – das war die
+ursprüngliche Regel, wurde aber durch eine ATR-basierte (volatilitäts-
+abhängige) Berechnung pro Ticker ersetzt. -3%/+6% gelten nur noch als
+Fallback, falls für einen Ticker kein ATR berechenbar ist.
 
 ---
 

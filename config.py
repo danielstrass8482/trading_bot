@@ -303,8 +303,13 @@ MAX_CAPITAL_TOTAL     = 475.00   # Gesamtkapital in USD (Alpaca arbeitet in USD)
 MAX_CAPITAL_PER_TRADE = 50.00    # Max. Einsatz pro Trade (10% des Kapitals)
 MAX_OPEN_POSITIONS    = 5        # Max. gleichzeitig offene Positionen
 MAX_TRADES_PER_DAY    = 3        # Max. neue Trades pro Handelstag
-STOP_LOSS_PCT         = 0.03     # Automatischer Ausstieg bei -3%
-TAKE_PROFIT_PCT       = 0.06     # Gewinnmitnahme bei +6% (CRV = 2:1)
+# STOP_LOSS_PCT/TAKE_PROFIT_PCT sind NICHT die primäre SL/TP-Regel, sondern
+# nur der Fallback, falls für einen Ticker kein ATR berechnet werden kann
+# (siehe rule_engine.analyze_ticker) – im Regelfall ist SL/TP ATR-adaptiv
+# (ATR_MULTIPLIER_SL/_TP, geclampt auf ATR_MIN_SL_PCT/ATR_MAX_SL_PCT weiter
+# unten), variiert also pro Ticker statt fix bei -3%/+6% zu liegen.
+STOP_LOSS_PCT         = 0.03     # Fallback: Automatischer Ausstieg bei -3%
+TAKE_PROFIT_PCT       = 0.06     # Fallback: Gewinnmitnahme bei +6% (CRV = 2:1)
 TRAILING_ACTIVATION_PCT = 0.06   # Fixer Trailing-Aktivierungs-Trigger ggü. Entry;
                                   # Trailing startet beim NIEDRIGEREN von (diesem
                                   # Wert, individuellem ATR-TP) – siehe broker.py
