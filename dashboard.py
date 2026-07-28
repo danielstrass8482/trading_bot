@@ -18,12 +18,13 @@ from config import (
 from database import (
     init_db, get_session, get_open_trades, get_total_pnl,
     get_daily_trade_count, get_total_capital_in_trades, DailyLog, Trade, BotState,
-    WeightHistory, get_active_weights, CLOSED_STATUSES
+    WeightHistory, get_active_weights, CLOSED_STATUSES, PostExitTracking
 )
 from rule_engine import analyze_ticker, check_vix, get_benchmark_performance
 from broker import get_portfolio_value, get_bot_performance
 from main import calculate_max_trades_today
 from fair_value import get_undervalued_tickers
+from post_exit_tracking import analyze_threshold_effectiveness
 
 # ── PAGE CONFIG ────────────────────────────────────────────────────
 st.set_page_config(
@@ -592,3 +593,65 @@ with tab5:
     active_cols = st.columns(len(current_weights))
     for col, (criterion, weight) in zip(active_cols, current_weights.items()):
         col.metric(criterion.replace("_", " ").title(), f"{weight}")
+
+    # ══════════════════════════════════════════════════════════════
+    # SCHWELLENWERT-WIRKSAMKEIT (siehe post_exit_tracking.py)
+    # ══════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown('<div class="section-label">Schwellenwert-Wirksamkeit</div>', unsafe_allow_html=True)
+    st.markdown(
+        "Verfolgt den Kursverlauf für 10 Handelstage NACH einem Time-Exit "
+        "(Holding-Days-Grenze) weiter – ohne neuen Trade, rein zur Beobachtung. "
+        "Zeigt, ob die Grenze profitable Positionen systematisch zu früh kappt."
+    )
+
+    with get_session() as session:
+        stats_month = analyze_threshold_effectiveness(session, "MAX_HOLDING_DAYS", lookback_days=30)
+        stats_week = analyze_threshold_effectiveness(session, "MAX_HOLDING_DAYS", lookback_days=7)
+        tracking_rows = session.query(PostExitTracking).filter(
+            PostExitTracking.parameter == "MAX_HOLDING_DAYS"
+        ).order_by(PostExitTracking.exit_date.desc()).limit(50).all()
+        tracking_data = [{
+            "Ticker": r.ticker,
+            "Exit-Grund": r.exit_reason,
+            "Exit-Datum": r.exit_date.strftime("%d.%m.%Y") if r.exit_date else None,
+            "Exit-Preis": r.exit_price,
+            "PnL% bei Exit": r.pnl_pct_at_exit,
+            "Kurs +5 Tage": r.price_after_5_days,
+            "Kurs +10 Tage": r.price_after_10_days,
+            "PnL% +10 Tage": r.pnl_pct_after_10_days,
+            "Mehr Gewinn möglich?": (
+                "—" if r.would_have_more_profit is None
+                else ("Ja" if r.would_have_more_profit else "Nein")
+            ),
+            "Entgangen/Vermieden %": r.forgone_profit_pct,
+        } for r in tracking_rows]
+
+    if not stats_month:
+        st.info("Noch keine ausgewerteten Time-Exits (post_exit_tracking) – Daten füllen sich täglich (05:00 ET) nach.")
+    else:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Ausgewertete Time-Exits (30T)", stats_month["n"])
+        m2.metric("Hätten mehr gebracht", f"{stats_month['better_count']} ({stats_month['better_pct']:.0f}%)")
+        m3.metric("Ø entgangener Gewinn", f"{stats_month['avg_forgone_pct']:+.1f}%" if stats_month["avg_forgone_pct"] is not None else "–")
+        m4.metric("Ø vermiedener Verlust", f"{stats_month['avg_avoided_pct']:+.1f}%" if stats_month["avg_avoided_pct"] is not None else "–")
+
+        if stats_month["n"] >= 10 and stats_month["better_pct"] >= 70.0:
+            st.warning(
+                f"⚠️ Klares Muster (30 Tage, {stats_month['n']} Time-Exits): "
+                f"{stats_month['better_pct']:.0f}% hätten bei längerem Halten mehr Gewinn gebracht "
+                f"(Ø {stats_month['avg_forgone_pct']:+.1f}%, Median {stats_month['median_forgone_pct']:+.1f}%). "
+                f"Die Holding-Days-Grenze schneidet Gewinner ggf. systematisch zu früh ab. "
+                f"Keine automatische Änderung – dieselbe Einschätzung erscheint auch als Lernvorschlag "
+                f"unter 'Einstellungen'."
+            )
+
+        if stats_week:
+            st.caption(
+                f"Letzte 7 Tage: {stats_week['n']} ausgewertete Time-Exits, "
+                f"{stats_week['better_count']} hätten mehr gebracht ({stats_week['better_pct']:.0f}%)."
+            )
+
+    if tracking_data:
+        st.markdown("**Einzelne Time-Exits (neueste zuerst):**")
+        st.dataframe(pd.DataFrame(tracking_data), use_container_width=True, hide_index=True)

@@ -20,9 +20,10 @@ import pytz
 from database import (
     get_session, Trade, get_active_weights, set_active_weights, WeightHistory,
     EntryTimeSlot, get_bot_config, get_pending_entry_proposal, set_pending_entry_proposal,
-    apply_entry_time_proposal, CLOSED_STATUSES, get_learning_proposals, set_learning_proposals,
+    apply_entry_time_proposal, CLOSED_STATUSES, save_learning_proposal,
 )
 from config import get_live_config
+from post_exit_tracking import analyze_threshold_effectiveness, maybe_create_effectiveness_hint
 
 MIN_TRADES_REQUIRED       = 5
 MAX_WEIGHT_CHANGE_PER_RUN = 2
@@ -395,18 +396,6 @@ MIN_TRADES_FOR_SEASONALITY = 20
 DOW_LABELS = {0: "Mo", 1: "Di", 2: "Mi", 3: "Do", 4: "Fr"}
 
 
-def save_learning_proposal(session, typ: str, data: dict):
-    """Hängt einen neuen Lernvorschlag an die pending-Liste in bot_state an."""
-    proposals = get_learning_proposals(session)
-    proposals.append({
-        "typ": typ,
-        "erstellt": datetime.utcnow().isoformat(),
-        "data": data,
-        "status": "pending",
-    })
-    set_learning_proposals(session, proposals)
-
-
 def analyze_optimal_threshold(session):
     """
     Testet mehrere Score-Schwellwerte (THRESHOLD_CANDIDATES) gegen die
@@ -564,17 +553,70 @@ def analyze_seasonality(session):
     }
 
 
+def print_threshold_effectiveness_section(session):
+    """
+    Sektion "Schwellenwert-Wirksamkeit" (siehe post_exit_tracking.py): wertet
+    aus, ob die geschlossenen Time-Exits der letzten Woche/des letzten Monats
+    bei längerem Halten (10 Handelstage nach Exit, post_exit_tracking) mehr
+    oder weniger Gewinn gebracht hätten, und erzeugt bei klarem Muster einen
+    Hinweis (keine automatische Config-Änderung). Aktuell nur für die
+    Holding-Days-Grenze – siehe Modul-Docstring von post_exit_tracking.py für
+    die Erweiterung auf weitere Parameter.
+    """
+    print(f"\n{'='*60}")
+    print(f"⏱️  Schwellenwert-Wirksamkeit gestartet: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}")
+
+    stats_week = analyze_threshold_effectiveness(session, "MAX_HOLDING_DAYS", lookback_days=7)
+    stats_month = analyze_threshold_effectiveness(session, "MAX_HOLDING_DAYS", lookback_days=30)
+
+    if not stats_week and not stats_month:
+        print("⏭️  Noch keine ausgewerteten Time-Exits (post_exit_tracking) im Beobachtungsfenster.")
+    else:
+        if stats_week:
+            print(f"📊 Letzte 7 Tage – {stats_week['n']} ausgewertete Time-Exits: "
+                  f"{stats_week['better_count']} hätten mehr Gewinn gebracht ({stats_week['better_pct']:.0f}%), "
+                  f"{stats_week['worse_count']} weniger.")
+            if stats_week["avg_forgone_pct"] is not None:
+                print(f"   Ø entgangener Gewinn (bei den {stats_week['better_count']} 'hätte mehr gebracht'-Fällen): "
+                      f"{stats_week['avg_forgone_pct']:+.1f}% (Median {stats_week['median_forgone_pct']:+.1f}%)")
+            if stats_week["avg_avoided_pct"] is not None:
+                print(f"   Ø vermiedener Verlust (bei den {stats_week['worse_count']} 'gut dass verkauft'-Fällen): "
+                      f"{stats_week['avg_avoided_pct']:+.1f}% (Median {stats_week['median_avoided_pct']:+.1f}%)")
+
+        if stats_month:
+            print(f"📊 Letzte 30 Tage – {stats_month['n']} ausgewertete Time-Exits: "
+                  f"{stats_month['better_count']} hätten mehr Gewinn gebracht ({stats_month['better_pct']:.0f}%), "
+                  f"{stats_month['worse_count']} weniger.")
+            if stats_month["avg_forgone_pct"] is not None:
+                print(f"   Ø entgangener Gewinn: {stats_month['avg_forgone_pct']:+.1f}% (Median {stats_month['median_forgone_pct']:+.1f}%)")
+            if stats_month["avg_avoided_pct"] is not None:
+                print(f"   Ø vermiedener Verlust: {stats_month['avg_avoided_pct']:+.1f}% (Median {stats_month['median_avoided_pct']:+.1f}%)")
+
+        # Hinweis-Erzeugung auf Basis der breiteren 30-Tage-Datenbasis (mehr
+        # Stichprobenumfang als die 7-Tage-Sicht, weniger anfällig für
+        # Kurzfrist-Rauschen einer einzelnen Woche).
+        maybe_create_effectiveness_hint(session, stats_month)
+
+    print(f"{'='*60}\n")
+
+
 def run_backlook():
     """
     Hauptfunktion: wird vom Scheduler jeden Montag 06:00 ET aufgerufen.
     Führt zuerst den Gewichtungs-Backlook aus, danach direkt im Anschluss die
     Einstiegszeitpunkt-Analyse (siehe Feature 3 – unabhängig vom Ergebnis des
     Gewichtungs-Backlooks, da beide auf unterschiedlichen Datenbasen laufen),
+    dann die Schwellenwert-Wirksamkeitsprüfung (siehe post_exit_tracking.py),
     und zuletzt den intelligenten Lernzyklus (Threshold-, Watchlist-,
     Sektor- und Saisonalitäts-Analyse).
     """
     _run_weekly_weight_backlook()
     analyze_entry_timing()
+
+    with get_session() as session:
+        print_threshold_effectiveness_section(session)
+        session.commit()
 
     print(f"\n{'='*60}")
     print(f"🧠 Intelligenter Lernzyklus gestartet: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
