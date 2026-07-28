@@ -49,6 +49,32 @@ if DATABASE_URL.startswith("postgres://"):
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")
 
 # ─────────────────────────────────────────────
+# BROKER (Saxo Bank OpenAPI)
+# ─────────────────────────────────────────────
+# App Key/Secret aus dem Saxo Developer Portal (App-Registrierung). Der
+# eigentliche Access/Refresh Token wird NICHT hier gehalten, sondern in der
+# DB-Tabelle saxo_tokens gepflegt (siehe database.py/saxo_client.py) – Saxo
+# rotiert bei jedem Refresh beide Werte.
+SAXO_CLIENT_ID     = os.getenv("SAXO_CLIENT_ID", "")
+SAXO_CLIENT_SECRET = os.getenv("SAXO_CLIENT_SECRET", "")
+SAXO_REDIRECT_URI  = os.getenv("SAXO_REDIRECT_URI", "https://app.ai-tradingbot.de/saxo/callback")
+
+# Saxo LIVE-Umgebung (kein Sandbox/Simulation-Endpoint).
+SAXO_AUTH_BASE_URL = "https://live.logonvalidation.net"
+SAXO_TOKEN_URL     = f"{SAXO_AUTH_BASE_URL}/token"
+SAXO_API_BASE_URL  = "https://gateway.saxobank.com/openapi/"
+
+# Nur für den EINMALIGEN initialen DB-Seed genutzt (siehe
+# database._seed_saxo_token_from_env), direkt nach dem manuellen OAuth
+# Authorization Code Flow. Sollten aus .env wieder entfernt werden, sobald
+# saxo_tokens in der DB befüllt ist – danach pflegt der Bot Access/Refresh
+# Token ausschließlich per Refresh in der DB fort.
+SAXO_ACCESS_TOKEN_INITIAL       = os.getenv("SAXO_ACCESS_TOKEN_INITIAL", "")
+SAXO_REFRESH_TOKEN_INITIAL      = os.getenv("SAXO_REFRESH_TOKEN_INITIAL", "")
+SAXO_EXPIRES_IN_INITIAL         = int(os.getenv("SAXO_EXPIRES_IN_INITIAL", "0") or 0)
+SAXO_REFRESH_EXPIRES_IN_INITIAL = int(os.getenv("SAXO_REFRESH_EXPIRES_IN_INITIAL", "0") or 0)
+
+# ─────────────────────────────────────────────
 # ALERTS
 # ─────────────────────────────────────────────
 ALERT_EMAIL   = os.getenv("ALERT_EMAIL", "")

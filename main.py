@@ -30,6 +30,7 @@ from llm_analyst import analyze_with_llm, get_market_brief
 from broker import place_trade, monitor_open_positions, get_portfolio_value, get_bot_performance, check_guardrails, GuardrailViolation
 from backlook import run_backlook
 from fair_value import update_fair_value_cache, get_undervalued_tickers
+from saxo_client import get_valid_access_token
 
 
 def _smtp_login_utf8(server, user, password):
@@ -590,6 +591,21 @@ def run_monitoring_cycle():
     monitor_open_positions()
 
 
+def saxo_token_refresh_job():
+    """
+    Proaktiver Saxo-Token-Refresh alle 10 Minuten (siehe saxo_client.py) –
+    Access Token ist nur ~19,5 Min gültig, Refresh Token ~59,5 Min. Der
+    10-Minuten-Puffer erlaubt mehrere fehlgeschlagene Versuche, bevor der
+    Refresh Token selbst abläuft und ein manueller OAuth-Login nötig wird.
+    Fehler werden hier nur geloggt (die Warn-E-Mail bei einem echten
+    Refresh-Fehlschlag verschickt bereits saxo_client.refresh_saxo_token selbst).
+    """
+    try:
+        get_valid_access_token()
+    except Exception as e:
+        print(f"⚠️  Saxo Token-Refresh-Job fehlgeschlagen: {e}")
+
+
 def main():
     """Startet den Scheduler."""
     print("🚀 Trading Bot startet...")
@@ -673,11 +689,22 @@ def main():
     # Initialer Fair-Value-Update falls Cache noch leer (z.B. erster Start).
     init_fair_value_if_empty()
 
+    # Saxo Token Refresh: alle 10 Minuten, unabhängig von Handelszeiten (Access
+    # Token ~19,5 Min gültig, Refresh Token ~59,5 Min – siehe saxo_client.py).
+    scheduler.add_job(
+        saxo_token_refresh_job,
+        CronTrigger(minute="*/10", timezone=et_tz),
+        id="saxo_token_refresh",
+        name="Saxo Token Refresh (proaktiv)",
+        replace_existing=True
+    )
+
     print(f"⏰ Scheduler aktiv. Entry-Zyklen laufen zu den registrierten Zeitslots (Mo–Fr)")
     print(f"🌅 Morning Brief: täglich 08:30 ET")
     print(f"📡 Monitoring: alle {monitoring_interval} Min von 09:30–16:00 ET")
     print(f"📚 Backlook: montags 06:00 ET")
     print(f"💰 Fair Value Update: montags 08:00 ET")
+    print(f"🔑 Saxo Token Refresh: alle 10 Minuten")
     print(f"🛑 Zum Beenden: Ctrl+C\n")
 
     try:

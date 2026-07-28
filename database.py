@@ -3,7 +3,7 @@ database.py – Datenbankmodelle und Datenbankzugriff
 Verwendet SQLAlchemy mit SQLite (serverlos, kein Setup nötig).
 """
 
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from sqlalchemy import (
     create_engine, Column, Integer, Float, String,
     DateTime, Date, Text, Boolean, UniqueConstraint, func, text
@@ -14,7 +14,11 @@ import json
 
 from cryptography.fernet import Fernet
 
-from config import DATABASE_URL, SCORE_WEIGHTS, ENCRYPTION_KEY
+from config import (
+    DATABASE_URL, SCORE_WEIGHTS, ENCRYPTION_KEY,
+    SAXO_ACCESS_TOKEN_INITIAL, SAXO_REFRESH_TOKEN_INITIAL,
+    SAXO_EXPIRES_IN_INITIAL, SAXO_REFRESH_EXPIRES_IN_INITIAL,
+)
 
 Base = declarative_base()
 engine = create_engine(DATABASE_URL, echo=False)
@@ -164,6 +168,24 @@ DEFAULT_CONFIG = {
     "ACTIVE_BROKER":           ("alpaca", "Aktiver Broker für neue Trades: alpaca / ibkr"),
     "ALPACA_DRAIN_MODE":       ("true",   "Alpaca: Keine neuen Käufe, nur bestehende Positionen managen"),
 }
+
+
+class SaxoToken(Base):
+    """
+    OAuth Access-/Refresh-Token für die Saxo Bank OpenAPI (LIVE). Es gibt
+    genau einen Saxo-Account, daher pflegt upsert_saxo_token() immer nur
+    EINE Zeile per UPDATE – es wird nie eine zweite Zeile angelegt. Saxo
+    rotiert bei jedem Refresh sowohl Access- als auch Refresh Token (der alte
+    Refresh Token wird dabei sofort ungültig), siehe saxo_client.refresh_saxo_token.
+    """
+    __tablename__ = "saxo_tokens"
+
+    id                       = Column(Integer, primary_key=True, autoincrement=True)
+    access_token             = Column(Text, nullable=False)
+    refresh_token            = Column(Text, nullable=False)
+    access_token_expires_at  = Column(DateTime, nullable=False)
+    refresh_token_expires_at = Column(DateTime, nullable=False)
+    updated_at               = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class CurrentWeight(Base):
@@ -339,6 +361,7 @@ def init_db():
     _migrate_trades_broker_column()
     _migrate_scan_log_regime_column()
     _migrate_scan_log_fair_value_columns()
+    _seed_saxo_token_from_env()
     # Initiale Bot-State-Werte setzen falls nicht vorhanden
     with get_session() as session:
         if not BotState.get(session, "daily_trade_count"):
@@ -454,6 +477,32 @@ def _migrate_scan_log_fair_value_columns():
         conn.execute(text("ALTER TABLE scan_log ADD COLUMN IF NOT EXISTS fair_value_discount_pct FLOAT"))
 
 
+def _seed_saxo_token_from_env():
+    """
+    Einmaliger initialer Seed der saxo_tokens-Tabelle aus den .env-Werten
+    SAXO_ACCESS_TOKEN_INITIAL/SAXO_REFRESH_TOKEN_INITIAL (direkt nach dem
+    manuellen OAuth Authorization Code Flow). Läuft nur, solange noch KEINE
+    Zeile existiert UND ein initialer Access Token in .env gesetzt ist –
+    SAXO_ACCESS_TOKEN_INITIAL kann/soll danach wieder aus .env entfernt werden,
+    da der Bot Access/Refresh Token ab dann ausschließlich per Refresh in der
+    DB fortschreibt (siehe saxo_client.refresh_saxo_token).
+    """
+    if not SAXO_ACCESS_TOKEN_INITIAL or not SAXO_REFRESH_TOKEN_INITIAL:
+        return
+    with get_session() as session:
+        if get_saxo_token(session):
+            return  # bereits geseedet (oder längst per Refresh überschrieben)
+        now = datetime.utcnow()
+        session.add(SaxoToken(
+            access_token=SAXO_ACCESS_TOKEN_INITIAL,
+            refresh_token=SAXO_REFRESH_TOKEN_INITIAL,
+            access_token_expires_at=now + timedelta(seconds=SAXO_EXPIRES_IN_INITIAL or 1170),
+            refresh_token_expires_at=now + timedelta(seconds=SAXO_REFRESH_EXPIRES_IN_INITIAL or 3570),
+        ))
+        session.commit()
+    print("✅ Saxo-Token initial aus .env in DB geseedet.")
+
+
 @contextmanager
 def get_session():
     """Context Manager für sichere Datenbanksessions."""
@@ -526,6 +575,33 @@ def close_trade(session: Session, trade: Trade, exit_price: float, reason: str) 
     trade.pnl_usd    = (exit_price - trade.entry_price) * trade.quantity
     trade.pnl_pct    = (exit_price - trade.entry_price) / trade.entry_price * 100
     return trade
+
+
+def get_saxo_token(session: Session):
+    """Liest die einzige gepflegte saxo_tokens-Zeile (None falls noch nicht geseedet)."""
+    return session.query(SaxoToken).order_by(SaxoToken.id).first()
+
+
+def upsert_saxo_token(session: Session, access_token: str, refresh_token: str,
+                       access_token_expires_at: datetime, refresh_token_expires_at: datetime):
+    """
+    Schreibt/aktualisiert die einzige saxo_tokens-Zeile (ein Saxo-Account,
+    daher immer UPDATE statt einer neuen Zeile pro Refresh).
+    """
+    row = get_saxo_token(session)
+    if row:
+        row.access_token = access_token
+        row.refresh_token = refresh_token
+        row.access_token_expires_at = access_token_expires_at
+        row.refresh_token_expires_at = refresh_token_expires_at
+        row.updated_at = datetime.utcnow()
+    else:
+        session.add(SaxoToken(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            access_token_expires_at=access_token_expires_at,
+            refresh_token_expires_at=refresh_token_expires_at,
+        ))
 
 
 def get_bot_config(session: Session, key: str, default=None):
