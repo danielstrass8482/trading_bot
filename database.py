@@ -349,6 +349,31 @@ class DailyLog(Base):
     open_positions = Column(Integer, default=0)
 
 
+class DailyPositionSnapshot(Base):
+    """
+    Tages-Snapshot aller offenen Positionen + Gesamt-Portfoliowert, geschrieben
+    einmal täglich nach Handelsschluss (siehe main.py: capture_daily_position_snapshot,
+    Scheduler-Job 16:05 ET, kurz nach dem letzten Monitoring-Zyklus). Dient als
+    "Vortag-Endstand" UND direkt als Vergleichsbasis für die Tages-Mail des
+    FOLGENDEN Tages (ein Job reicht, kein separater Morgen-Snapshot nötig).
+    Pro Tag immer mindestens eine Zeile mit ticker=NULL (Portfolio-Total, auch
+    an Tagen ganz ohne offene Positionen), plus eine Zeile je offener Position.
+    """
+    __tablename__ = "daily_position_snapshot"
+
+    id                 = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_date       = Column(Date, nullable=False)   # ET-Handelstag
+    snapshot_time       = Column(DateTime, default=datetime.utcnow)
+    ticker              = Column(String(10), nullable=True)  # NULL = Portfolio-Total-Zeile
+    trade_id            = Column(Integer, nullable=True)     # FK trades.id, nur bei Ticker-Zeilen
+    quantity            = Column(Float, nullable=True)
+    entry_price         = Column(Float, nullable=True)
+    price               = Column(Float, nullable=True)       # Kurs zum Snapshot-Zeitpunkt
+    unrealized_pnl      = Column(Float, nullable=True)
+    unrealized_pnl_pct  = Column(Float, nullable=True)
+    portfolio_value     = Column(Float, nullable=False)   # Gesamtwert, auf jeder Zeile eines Snapshots identisch
+
+
 class EntryTimeSlot(Base):
     """
     Konfigurierbarer Einstiegszeitpunkt (ET) für den Entry-Scheduler (main.py:
@@ -796,6 +821,54 @@ def save_daily_snapshot(session: Session, portfolio_value: float):
             trades_count=get_daily_trade_count(session),
             open_positions=len(get_open_trades(session))
         ))
+
+
+def save_position_snapshot(session: Session, snapshot_date, portfolio_value: float, positions: list[dict]):
+    """
+    Schreibt den Tages-Positions-Snapshot (siehe DailyPositionSnapshot).
+    Idempotent: löscht zuerst evtl. bereits vorhandene Zeilen für
+    snapshot_date (z.B. bei einem manuell wiederholten Testlauf am selben
+    Tag), bevor neu geschrieben wird. positions: Liste von Dicts mit
+    ticker/trade_id/quantity/entry_price/price/unrealized_pnl/
+    unrealized_pnl_pct (siehe main.capture_daily_position_snapshot).
+    """
+    session.query(DailyPositionSnapshot).filter_by(snapshot_date=snapshot_date).delete()
+    now = datetime.utcnow()
+    session.add(DailyPositionSnapshot(
+        snapshot_date=snapshot_date, snapshot_time=now,
+        ticker=None, trade_id=None, portfolio_value=portfolio_value,
+    ))
+    for p in positions:
+        session.add(DailyPositionSnapshot(
+            snapshot_date=snapshot_date, snapshot_time=now, portfolio_value=portfolio_value,
+            ticker=p["ticker"], trade_id=p["trade_id"], quantity=p["quantity"],
+            entry_price=p["entry_price"], price=p["price"],
+            unrealized_pnl=p["unrealized_pnl"], unrealized_pnl_pct=p["unrealized_pnl_pct"],
+        ))
+
+
+def get_previous_position_snapshot(session: Session, before_date) -> dict | None:
+    """
+    Liest den letzten gespeicherten Positions-Snapshot VOR before_date
+    (typischerweise "heute", ET-Datum) – dient als Vorabend-Vergleichsbasis
+    für die Tages-Mail (siehe main.send_daily_summary_email). Gibt None
+    zurück, wenn noch nie ein Snapshot gespeichert wurde (allererster Lauf
+    seit Einführung des Features – Mail zeigt dann einen Hinweis statt
+    eines Vergleichs).
+    """
+    last_date = session.query(func.max(DailyPositionSnapshot.snapshot_date)).filter(
+        DailyPositionSnapshot.snapshot_date < before_date
+    ).scalar()
+    if last_date is None:
+        return None
+
+    rows = session.query(DailyPositionSnapshot).filter_by(snapshot_date=last_date).all()
+    total_row = next((r for r in rows if r.ticker is None), None)
+    return {
+        "snapshot_date": last_date,
+        "portfolio_value": total_row.portfolio_value if total_row else None,
+        "positions_by_trade_id": {r.trade_id: r for r in rows if r.ticker is not None},
+    }
 
 
 def get_alpaca_api_for_user(user_id: int):

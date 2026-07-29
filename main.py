@@ -24,6 +24,7 @@ from database import (
     init_db, get_session, save_daily_snapshot, BotState, ScanLog,
     EntryTimeSlot, get_active_entry_time_slots, get_daily_trade_count,
     get_open_trades, FairValueCache,
+    save_position_snapshot, get_previous_position_snapshot,
 )
 from rule_engine import scan_watchlist_parallel, check_vix, get_market_regime, get_benchmark_performance
 from llm_analyst import analyze_with_llm, get_market_brief
@@ -90,28 +91,67 @@ def send_email(subject: str, body: str):
         print(f"⚠️  E-Mail-Versand fehlgeschlagen: {e}")
 
 
-def is_last_slot_of_day(current_slot: EntryTimeSlot) -> bool:
+def _get_current_price_for_snapshot(ticker: str, fallback: float) -> float:
     """
-    Prüft ob current_slot der zeitlich letzte AKTIVE Einstiegszeitpunkt des
-    Tages ist – steuert, wann send_daily_summary_email() feuert (siehe FIX 7:
-    Tages-Mail nach dem letzten Slot statt zu einer festen Uhrzeit).
+    Einzelticker-Preisabruf via yf.Ticker(...).fast_info (KEIN yf.download()-
+    Batch – siehe KRITISCHER INCIDENT #2 / Commit 255ed64: Cross-Contamination
+    zwischen parallel gescannten Tickern bei geteiltem yfinance-Batch-State).
+    Läuft hier ohnehin sequenziell (kein ThreadPoolExecutor), Fallback auf
+    entry_price falls yfinance keinen Preis liefert.
     """
+    try:
+        import yfinance as yf
+        price = yf.Ticker(ticker).fast_info.get("lastPrice")
+        return float(price) if price else fallback
+    except Exception:
+        return fallback
+
+
+def capture_daily_position_snapshot():
+    """
+    Speichert den Tages-Snapshot aller offenen Positionen + Gesamt-Portfoliowert
+    (siehe database.DailyPositionSnapshot) – Scheduler-Job 16:05 ET, kurz NACH
+    dem letzten Monitoring-Zyklus des Tages (run_monitoring_cycle läuft bis
+    16:00 ET, siehe main(): CronTrigger(hour="9-16", ...)). Dient gleichzeitig
+    als "Vortag-Endstand" UND als Vergleichsbasis für die Tages-Mail des
+    nächsten Tages (siehe send_daily_summary_email) – ein Snapshot-Job deckt
+    beides ab, kein separater Morgen-Snapshot nötig.
+    """
+    et_tz = pytz.timezone("America/New_York")
+    today = datetime.now(et_tz).date()
+    portfolio_value = get_portfolio_value()
+
+    positions = []
     with get_session() as session:
-        active_slots = session.query(EntryTimeSlot).filter_by(aktiv=True).order_by(
-            EntryTimeSlot.stunde_et.desc(), EntryTimeSlot.minute_et.desc()
-        ).all()
-    if not active_slots:
-        return True
-    last = active_slots[0]
-    return current_slot.stunde_et == last.stunde_et and current_slot.minute_et == last.minute_et
+        for trade in get_open_trades(session):
+            current_price = _get_current_price_for_snapshot(trade.ticker, trade.entry_price)
+            positions.append({
+                "ticker": trade.ticker,
+                "trade_id": trade.id,
+                "quantity": trade.quantity,
+                "entry_price": trade.entry_price,
+                "price": current_price,
+                "unrealized_pnl": (current_price - trade.entry_price) * trade.quantity,
+                "unrealized_pnl_pct": (current_price - trade.entry_price) / trade.entry_price * 100,
+            })
+
+        save_position_snapshot(session, today, portfolio_value, positions)
+        session.commit()
+
+    print(f"📸 Positions-Snapshot gespeichert ({today}): {len(positions)} offene Position(en), "
+          f"Portfolio-Wert ${portfolio_value:.2f}")
 
 
 def send_daily_summary_email():
     """
-    Verschickt EINE Tages-Zusammenfassung nach dem letzten aktiven Entry-Slot
-    des Tages (siehe FIX 7) – ersetzt die frühere Pro-Slot-Mail (die nur bei
-    tatsächlich ausgeführten Trades verschickt wurde), damit auch tradefreie
-    Tage einen vollständigen Scan-Überblick per E-Mail bekommen.
+    Verschickt EINE Tages-Zusammenfassung nach Handelsschluss (Scheduler-Job
+    16:10 ET, siehe main() – 5 Min nach capture_daily_position_snapshot, damit
+    der Vorabend-Vergleich auf einem bereits geschriebenen Snapshot aufbaut).
+    Zeigt pro Slot die tatsächlich ausgeführten Trades im Detail (Ticker,
+    Entry, SL/TP je Preis+%, Kapital, Menge) bzw. bei tradefreien Slots einen
+    kurzen Grund, sowie einen Vorabend-vs-Heute-Vergleich aller offenen
+    Positionen und des Gesamt-Portfoliowerts (siehe database.
+    DailyPositionSnapshot/get_previous_position_snapshot).
     """
     et_tz = pytz.timezone("America/New_York")
     today = datetime.now(et_tz).date()
@@ -130,10 +170,48 @@ def send_daily_summary_email():
             ORDER BY slot_et
         """), {"today": today}).fetchall()
 
+        trade_rows = session.execute(text("""
+            SELECT sl.slot_et, sl.ticker, t.entry_price, t.stop_loss, t.take_profit,
+                   t.sl_pct, t.tp_pct, t.capital_used, t.quantity
+            FROM scan_log sl
+            JOIN trades t ON t.id = sl.trade_id
+            WHERE DATE(sl.scan_time AT TIME ZONE 'America/New_York') = :today
+              AND sl.trade_executed = true
+            ORDER BY sl.slot_et, sl.ticker
+        """), {"today": today}).fetchall()
+
+        trades_by_slot: dict = {}
+        for row in trade_rows:
+            trades_by_slot.setdefault(row.slot_et, []).append(row)
+
+        # Grund fürs Ausbleiben eines Trades je tradefreiem Slot: entweder kein
+        # Signal über Schwellwert, oder der bestbewertete freigegebene Kandidat
+        # wurde von einem Guardrail geblockt (siehe run_entry_cycle).
+        no_trade_reasons: dict = {}
+        for slot in slots_heute:
+            if slot.trades:
+                continue
+            if not slot.ueber_65:
+                no_trade_reasons[slot.slot_et] = f"Kein Signal über Schwellwert (Ø Score {slot.avg_score})"
+                continue
+            reason_row = session.execute(text("""
+                SELECT guardrail_reason FROM scan_log
+                WHERE slot_et = :slot_et
+                  AND DATE(scan_time AT TIME ZONE 'America/New_York') = :today
+                  AND score >= 65
+                ORDER BY score DESC LIMIT 1
+            """), {"slot_et": slot.slot_et, "today": today}).fetchone()
+            no_trade_reasons[slot.slot_et] = (
+                reason_row.guardrail_reason if reason_row and reason_row.guardrail_reason
+                else "Kein Trade ausgeführt (Grund nicht ermittelbar)"
+            )
+
         open_trades = session.execute(text("""
-            SELECT ticker, entry_price, quantity, capital_used
+            SELECT id, ticker, entry_price, quantity, capital_used
             FROM trades WHERE status = 'OPEN'
         """)).fetchall()
+
+        prev_snapshot = get_previous_position_snapshot(session, today)
 
     portfolio_value = get_portfolio_value()
 
@@ -143,29 +221,56 @@ def send_daily_summary_email():
 {'='*50}
 
 PORTFOLIO
-Portfolio-Wert: ${portfolio_value:.2f}
-
-SCAN-ÜBERSICHT
+Portfolio-Wert heute Abend: ${portfolio_value:.2f}
 """
+    if prev_snapshot and prev_snapshot["portfolio_value"] is not None:
+        prev_value = prev_snapshot["portfolio_value"]
+        diff = portfolio_value - prev_value
+        diff_pct = (diff / prev_value * 100) if prev_value else 0.0
+        body += (
+            f"Portfolio-Wert Vorabend ({prev_snapshot['snapshot_date'].strftime('%d.%m.%Y')}): ${prev_value:.2f}\n"
+            f"Veränderung: {diff:+.2f} $ ({diff_pct:+.2f}%)\n"
+        )
+    else:
+        body += "Erster Tag mit Snapshot-Tracking, Vergleich ab morgen verfügbar.\n"
+
+    body += "\nTRADES HEUTE\n"
     for slot in slots_heute:
         body += f"""
-Slot {slot.slot_et} ET:
-  Gescannt: {slot.gescannt} Ticker
-  Über Schwellwert (≥65): {slot.ueber_65}
-  Trades ausgeführt: {slot.trades}
-  Ø Score: {slot.avg_score}
+Slot {slot.slot_et} ET (gescannt: {slot.gescannt}, über Schwellwert: {slot.ueber_65}, Ø Score: {slot.avg_score}):
 """
+        slot_trades = trades_by_slot.get(slot.slot_et)
+        if slot_trades:
+            for t in slot_trades:
+                sl_pct = t.sl_pct * 100 if t.sl_pct is not None else (t.entry_price - t.stop_loss) / t.entry_price * 100
+                tp_pct = t.tp_pct * 100 if t.tp_pct is not None else (t.take_profit - t.entry_price) / t.entry_price * 100
+                body += (
+                    f"  {t.ticker}: Entry ${t.entry_price:.2f} | "
+                    f"SL ${t.stop_loss:.2f} (-{sl_pct:.1f}%) | TP ${t.take_profit:.2f} (+{tp_pct:.1f}%) | "
+                    f"Kapital ${t.capital_used:.2f} | Menge {t.quantity:.4f}\n"
+                )
+        else:
+            body += f"  Kein Trade – {no_trade_reasons.get(slot.slot_et, 'Kein Trade ausgeführt')}\n"
 
     trades_heute = sum(s.trades for s in slots_heute)
-    body += f"""
-GESAMT HEUTE
-Trades ausgeführt: {trades_heute}
+    body += f"\nGESAMT HEUTE\nTrades ausgeführt: {trades_heute}\n"
 
-OFFENE POSITIONEN
-"""
+    body += "\nOFFENE POSITIONEN – TAGESVERGLEICH\n"
     if open_trades:
+        prev_positions = prev_snapshot["positions_by_trade_id"] if prev_snapshot else {}
         for t in open_trades:
-            body += f"  {t.ticker}: {t.quantity:.4f} Stück @ ${t.entry_price:.2f}\n"
+            current_price = _get_current_price_for_snapshot(t.ticker, t.entry_price)
+            pnl_pct_heute = (current_price - t.entry_price) / t.entry_price * 100
+
+            prev_pos = prev_positions.get(t.id)
+            if prev_pos is not None:
+                delta_heute = pnl_pct_heute - prev_pos.unrealized_pnl_pct
+                body += (
+                    f"  {t.ticker}: Vorabend ${prev_pos.price:.2f} (uPnL {prev_pos.unrealized_pnl_pct:+.2f}%) "
+                    f"→ Heute ${current_price:.2f} (uPnL {pnl_pct_heute:+.2f}%) | Δ heute: {delta_heute:+.2f}%\n"
+                )
+            else:
+                body += f"  {t.ticker} (NEU heute gekauft): ${current_price:.2f} (uPnL {pnl_pct_heute:+.2f}%)\n"
     else:
         body += "  Keine offenen Positionen\n"
 
@@ -546,11 +651,6 @@ def run_entry_cycle(slot: EntryTimeSlot):
     print(f"✅ Entry-Zyklus abgeschlossen. Trades in diesem Slot: {len(executed_trades)}")
     print(f"{'='*60}\n")
 
-    # 8. Tages-Zusammenfassung per E-Mail nach dem letzten aktiven Slot des Tages
-    # (nicht mehr pro Slot bei Trades, siehe FIX 7) – deckt den ganzen Handelstag ab.
-    if is_last_slot_of_day(slot):
-        send_daily_summary_email()
-
 
 def schedule_entry_jobs(scheduler: BlockingScheduler, et_tz):
     """
@@ -686,6 +786,37 @@ def main():
         replace_existing=True
     )
 
+    # Positions-Snapshot: 16:05 ET, kurz NACH dem letzten Monitoring-Zyklus des
+    # Tages (der bis 16:00 ET läuft, siehe run_monitoring_cycle oben) – dient
+    # als Vorabend-Vergleichsbasis für die Tages-Mail des nächsten Tages
+    # (siehe database.DailyPositionSnapshot/capture_daily_position_snapshot).
+    scheduler.add_job(
+        capture_daily_position_snapshot,
+        CronTrigger(
+            hour=16, minute=5,
+            day_of_week="mon-fri",
+            timezone=et_tz
+        ),
+        id="daily_position_snapshot",
+        name="Tages-Positions-Snapshot (Vergleichsbasis)",
+        replace_existing=True
+    )
+
+    # Tages-Zusammenfassung per E-Mail: 16:10 ET, NACH dem Positions-Snapshot
+    # oben (ersetzt das frühere Feuern am Ende des letzten Entry-Slots, das vor
+    # Handelsschluss lag und noch keinen "heute Abend"-Snapshot hatte).
+    scheduler.add_job(
+        send_daily_summary_email,
+        CronTrigger(
+            hour=16, minute=10,
+            day_of_week="mon-fri",
+            timezone=et_tz
+        ),
+        id="daily_summary_email",
+        name="Tages-Zusammenfassung E-Mail",
+        replace_existing=True
+    )
+
     # Wöchentlicher Backlook: Montags 06:00 ET, vor dem Haupt-Zyklus (Option A Selbstlern)
     scheduler.add_job(
         run_backlook,
@@ -731,6 +862,8 @@ def main():
     print(f"🌅 Morning Brief: täglich 08:30 ET")
     print(f"📡 Monitoring: alle {monitoring_interval} Min von 09:30–16:00 ET")
     print(f"📉 Post-Exit-Tracking Update: täglich 05:00 ET")
+    print(f"📸 Positions-Snapshot: 16:05 ET")
+    print(f"📊 Tages-Zusammenfassung E-Mail: 16:10 ET")
     print(f"📚 Backlook: montags 06:00 ET")
     print(f"💰 Fair Value Update: montags 08:00 ET")
     print(f"🔑 Saxo Token Refresh: alle 10 Minuten")
