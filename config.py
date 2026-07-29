@@ -74,6 +74,19 @@ SAXO_REFRESH_TOKEN_INITIAL      = os.getenv("SAXO_REFRESH_TOKEN_INITIAL", "")
 SAXO_EXPIRES_IN_INITIAL         = int(os.getenv("SAXO_EXPIRES_IN_INITIAL", "0") or 0)
 SAXO_REFRESH_EXPIRES_IN_INITIAL = int(os.getenv("SAXO_REFRESH_EXPIRES_IN_INITIAL", "0") or 0)
 
+# Verschlüsselt saxo_tokens.access_token/refresh_token in der DB (seit
+# 2026-07-29) – Fernet (AES-basiert, bereits im Projekt für die
+# Alpaca-Key-Verschlüsselung in portfolio_os im Einsatz, siehe dortiges
+# ENCRYPTION_KEY) statt eines neuen Verfahrens, für Konsistenz. EIGENER Key
+# (nicht ENCRYPTION_KEY wiederverwendet) – andere Sicherheitsdomäne (Live-
+# Broker-Zugang vs. Alpaca-Keys). MUSS identisch in trading_bot/.env UND
+# trading_bot_saxo/.env stehen, da BEIDE Prozesse dieselbe saxo_tokens-Zeile
+# lesen/schreiben (eigener 10-Minuten-Refresh-Job hier, siehe saxo_client.py-
+# Modul-Docstring zur Koordination) – ein abweichender Key würde dort zu
+# einem Entschlüsselungsfehler führen. Liegt NUR in .env (VPS, chmod 600),
+# nicht in Git, nicht hardcoded, nicht in der DB selbst.
+SAXO_TOKEN_ENCRYPTION_KEY = os.getenv("SAXO_TOKEN_ENCRYPTION_KEY", "")
+
 # ─────────────────────────────────────────────
 # ALERTS
 # ─────────────────────────────────────────────
@@ -424,6 +437,12 @@ def validate_config() -> list[str]:
         warnings.append(f"TRADING_MODE='{TRADING_MODE}' unbekannt – Bot läuft sicherheitshalber im PAPER-Modus")
     if TRADING_MODE == "LIVE" and (not ALPACA_API_KEY or not ALPACA_SECRET_KEY):
         warnings.append("ALPACA Credentials fehlen – Live Trading nicht möglich")
+    if not SAXO_TOKEN_ENCRYPTION_KEY:
+        warnings.append(
+            "SAXO_TOKEN_ENCRYPTION_KEY fehlt – Saxo-Tokens würden beim nächsten Schreiben im "
+            "Klartext in der DB landen. get_saxo_token/upsert_saxo_token brechen deshalb bewusst "
+            "hart ab (kein stiller Klartext-Fallback) statt die Verschlüsselung zu umgehen."
+        )
     if sum(SCORE_WEIGHTS.values()) != 100:
         warnings.append(f"SCORE_WEIGHTS summieren nicht auf 100 (aktuell: {sum(SCORE_WEIGHTS.values())})")
     return warnings

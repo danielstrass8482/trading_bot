@@ -12,10 +12,10 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from contextlib import contextmanager
 import json
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 
 from config import (
-    DATABASE_URL, SCORE_WEIGHTS, ENCRYPTION_KEY,
+    DATABASE_URL, SCORE_WEIGHTS, ENCRYPTION_KEY, SAXO_TOKEN_ENCRYPTION_KEY,
     SAXO_ACCESS_TOKEN_INITIAL, SAXO_REFRESH_TOKEN_INITIAL,
     SAXO_EXPIRES_IN_INITIAL, SAXO_REFRESH_EXPIRES_IN_INITIAL,
 )
@@ -37,6 +37,73 @@ def _decrypt_field(value: str) -> str:
         return _fernet.decrypt(value.encode()).decode()
     except Exception:
         return value
+
+
+# Verschlüsselung von saxo_tokens.access_token/refresh_token (seit
+# 2026-07-29, siehe config.SAXO_TOKEN_ENCRYPTION_KEY-Docstring) – EIGENER Key,
+# nicht ENCRYPTION_KEY (andere Sicherheitsdomäne: Live-Broker-Zugang statt
+# Alpaca-Keys). Bewusst KEIN stiller No-Op-Fallback wie _decrypt_field oben:
+# Live-Broker-Zugangsdaten sollen bei fehlendem Key laut fehlschlagen statt
+# unbemerkt im Klartext gespeichert zu werden. MUSS identisch mit dem Key in
+# trading_bot_saxo/.env sein (siehe dortiges database.py – beide Prozesse
+# lesen/schreiben dieselbe saxo_tokens-Zeile).
+_saxo_token_fernet = Fernet(SAXO_TOKEN_ENCRYPTION_KEY.encode()) if SAXO_TOKEN_ENCRYPTION_KEY else None
+
+
+def _require_saxo_token_fernet() -> Fernet:
+    if _saxo_token_fernet is None:
+        raise RuntimeError(
+            "SAXO_TOKEN_ENCRYPTION_KEY fehlt – Saxo-Token-Verschlüsselung nicht möglich. "
+            "Kein Klartext-Fallback (siehe database.py-Modul-Docstring)."
+        )
+    return _saxo_token_fernet
+
+
+def _encrypt_saxo_token(plaintext: str) -> str:
+    return _require_saxo_token_fernet().encrypt(plaintext.encode()).decode()
+
+
+def _looks_like_fernet_token(value: str) -> bool:
+    """
+    Fernet-Tokens beginnen IMMER mit "gAAAAA" (siehe trading_bot_saxo/
+    database.py für die ausführliche Begründung) – dient in
+    _decrypt_or_migrate_saxo_token zur Unterscheidung "echtes Klartext-Alt-
+    Token" vs. "Ciphertext, das nur mit dem FALSCHEN Key nicht entschlüsselt
+    werden konnte" (sonst würde ein falsch konfigurierter Key den echten
+    Token fälschlich für Klartext halten und unwiederbringlich überschreiben).
+    """
+    return value.startswith("gAAAAA")
+
+
+def _decrypt_or_migrate_saxo_token(session: Session, row: "SaxoToken") -> None:
+    """
+    Entschlüsselt row.access_token/refresh_token IN-MEMORY (mutiert das ORM-
+    Objekt, aber committet nichts von sich aus – kein Autoflush-Risiko, siehe
+    trading_bot_saxo/database.py für die identische Implementierung/
+    Begründung). InvalidToken kann ZWEI Ursachen haben – echtes Klartext aus
+    der Zeit VOR diesem Fix (sicher migrierbar) oder Ciphertext mit einem
+    ANDEREN/falschen SAXO_TOKEN_ENCRYPTION_KEY (nicht migrierbar, siehe
+    _looks_like_fernet_token) – Fall 2 bricht laut ab statt zu überschreiben.
+    """
+    fernet = _require_saxo_token_fernet()
+    try:
+        row.access_token = fernet.decrypt(row.access_token.encode()).decode()
+        row.refresh_token = fernet.decrypt(row.refresh_token.encode()).decode()
+    except InvalidToken:
+        if _looks_like_fernet_token(row.access_token) or _looks_like_fernet_token(row.refresh_token):
+            raise RuntimeError(
+                "Saxo-Token sieht wie Fernet-Ciphertext aus, lässt sich mit dem aktuell "
+                "konfigurierten SAXO_TOKEN_ENCRYPTION_KEY aber nicht entschlüsseln – vermutlich "
+                "ein falscher/abweichender Key. ABBRUCH statt Migration, um den echten Token "
+                "nicht durch erneute Verschlüsselung des bereits verschlüsselten Werts zu zerstören."
+            )
+        plaintext_access, plaintext_refresh = row.access_token, row.refresh_token
+        row.access_token = fernet.encrypt(plaintext_access.encode()).decode()
+        row.refresh_token = fernet.encrypt(plaintext_refresh.encode()).decode()
+        session.commit()
+        print("🔐 Saxo-Tokens waren im Klartext gespeichert – einmalig verschlüsselt und migriert.")
+        row.access_token = plaintext_access
+        row.refresh_token = plaintext_refresh
 
 
 # ─────────────────────────────────────────────
@@ -557,12 +624,17 @@ def _seed_saxo_token_from_env():
         if get_saxo_token(session):
             return  # bereits geseedet (oder längst per Refresh überschrieben)
         now = datetime.utcnow()
-        session.add(SaxoToken(
+        # upsert_saxo_token() statt direktem SaxoToken(...)-Insert, damit der
+        # Seed-Pfad dieselbe Verschlüsselung durchläuft wie jeder reguläre
+        # Refresh (siehe _encrypt_saxo_token) – vorher schrieb dieser Pfad
+        # Klartext direkt in die Zeile.
+        upsert_saxo_token(
+            session,
             access_token=SAXO_ACCESS_TOKEN_INITIAL,
             refresh_token=SAXO_REFRESH_TOKEN_INITIAL,
             access_token_expires_at=now + timedelta(seconds=SAXO_EXPIRES_IN_INITIAL or 1170),
             refresh_token_expires_at=now + timedelta(seconds=SAXO_REFRESH_EXPIRES_IN_INITIAL or 3570),
-        ))
+        )
         session.commit()
     print("✅ Saxo-Token initial aus .env in DB geseedet.")
 
@@ -642,27 +714,40 @@ def close_trade(session: Session, trade: Trade, exit_price: float, reason: str) 
 
 
 def get_saxo_token(session: Session):
-    """Liest die einzige gepflegte saxo_tokens-Zeile (None falls noch nicht geseedet)."""
-    return session.query(SaxoToken).order_by(SaxoToken.id).first()
+    """
+    Liest die einzige gepflegte saxo_tokens-Zeile (None falls noch nicht
+    geseedet). access_token/refresh_token kommen entschlüsselt zurück (siehe
+    _decrypt_or_migrate_saxo_token – migriert bestehende Klartext-Zeilen
+    transparent beim ersten Lesen nach diesem Fix).
+    """
+    row = session.query(SaxoToken).order_by(SaxoToken.id).first()
+    if row is None:
+        return None
+    _decrypt_or_migrate_saxo_token(session, row)
+    return row
 
 
 def upsert_saxo_token(session: Session, access_token: str, refresh_token: str,
                        access_token_expires_at: datetime, refresh_token_expires_at: datetime):
     """
     Schreibt/aktualisiert die einzige saxo_tokens-Zeile (ein Saxo-Account,
-    daher immer UPDATE statt einer neuen Zeile pro Refresh).
+    daher immer UPDATE statt einer neuen Zeile pro Refresh). access_token/
+    refresh_token werden hier verschlüsselt (siehe _encrypt_saxo_token) –
+    Aufrufer übergeben immer Klartext.
     """
-    row = get_saxo_token(session)
+    encrypted_access = _encrypt_saxo_token(access_token)
+    encrypted_refresh = _encrypt_saxo_token(refresh_token)
+    row = session.query(SaxoToken).order_by(SaxoToken.id).first()
     if row:
-        row.access_token = access_token
-        row.refresh_token = refresh_token
+        row.access_token = encrypted_access
+        row.refresh_token = encrypted_refresh
         row.access_token_expires_at = access_token_expires_at
         row.refresh_token_expires_at = refresh_token_expires_at
         row.updated_at = datetime.utcnow()
     else:
         session.add(SaxoToken(
-            access_token=access_token,
-            refresh_token=refresh_token,
+            access_token=encrypted_access,
+            refresh_token=encrypted_refresh,
             access_token_expires_at=access_token_expires_at,
             refresh_token_expires_at=refresh_token_expires_at,
         ))
