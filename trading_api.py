@@ -13,6 +13,7 @@ Alle Datenendpunkte liegen hinter dieser Prüfung – ohne sie wäre eine
 """
 
 import os
+import json
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Cookie
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -210,6 +211,18 @@ def get_performance():
         }
 
 
+def _parse_json_field(raw, default):
+    """Deserialisiert ein Text-Column (llm_risks/score_breakdown, siehe database.py
+    Trade.get_llm_risks/get_score_breakdown), damit die API sie als echtes
+    JSON-Array/-Objekt statt als doppelt-kodierten String zurückgibt."""
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 @protected.get("/api/trades/history")
 def get_trade_history(limit: int = 50):
     """
@@ -236,6 +249,7 @@ def get_trade_history(limit: int = 50):
                 rule_score, status,
                 broker, mode,
                 created_at, closed_at,
+                llm_sentiment, llm_summary, llm_risks, score_breakdown,
                 CASE
                     WHEN status = 'OPEN' THEN 'Offen'
                     WHEN status = 'CLOSED_SL' THEN 'Stop Loss'
@@ -254,6 +268,8 @@ def get_trade_history(limit: int = 50):
         result = []
         for r in rows:
             row = dict(r._mapping)
+            row["llm_risks"] = _parse_json_field(row.get("llm_risks"), default=[])
+            row["score_breakdown"] = _parse_json_field(row.get("score_breakdown"), default={})
             if row["status"] == "OPEN":
                 try:
                     current_price = float(yf.Ticker(row["ticker"]).fast_info.get("lastPrice", row["entry_price"]))
