@@ -67,6 +67,12 @@ class SignalResult:
     volume_ratio:     Optional[float] = None
     sma50:            Optional[float] = None
     sma200:           Optional[float] = None
+    # yfinance-Sektor (siehe fetch_fundamentals) – bereits für die Branchen-
+    # Blacklist-Prüfung geladen, hier zusätzlich durchgereicht statt verworfen,
+    # damit broker.place_trade() ihn auf Trade.sector speichern kann (siehe
+    # Feature "Sektor-Spalte Handelshistorie"). None bei Inverse ETFs (keine
+    # Fundamentaldaten) oder falls yfinance keinen Sektor liefert.
+    sector:           Optional[str] = None
 
 
 def fetch_market_data(ticker: str, period: str = "1y", min_rows: int = 50) -> Optional[pd.DataFrame]:
@@ -453,6 +459,7 @@ def calculate_score(ticker: str, df: pd.DataFrame, fundamentals: dict, is_invers
         volume_ratio    = round(volume_ratio, 2),
         sma50           = round(sma50, 2) if sma50 else None,
         sma200          = round(sma200, 2) if sma200 else None,
+        sector          = fundamentals.get("sector"),
     )
 
 

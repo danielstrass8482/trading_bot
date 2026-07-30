@@ -14,6 +14,7 @@ Alle Datenendpunkte liegen hinter dieser Prüfung – ohne sie wäre eine
 
 import os
 import json
+from datetime import datetime
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Cookie
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,7 +27,7 @@ from database import (
     get_learning_proposals, set_learning_proposals,
 )
 from config import get_live_config, TRADING_MODE
-from broker import get_portfolio_value, get_alpaca_account_snapshot
+from broker import get_portfolio_value, get_alpaca_account_snapshot, count_trading_days
 from rule_engine import get_market_regime
 import yfinance as yf
 
@@ -147,6 +148,15 @@ def get_overview():
     except Exception:
         vix = 0
 
+    # Time-Exit-Countdown (siehe Feature "Time-Exit-Anzeige Uebersicht"):
+    # dieselbe count_trading_days()-Funktion und dieselben Schwellenwerte wie
+    # broker.monitor_open_positions() – ohne aktiven Trailing-SL greift
+    # MAX_HOLDING_DAYS, mit aktivem Trailing-SL die harte Obergrenze
+    # MAX_HOLDING_DAYS * MAX_HOLDING_DAYS_TRAILING_MULTIPLIER (Time-Exit dort
+    # ausgesetzt, siehe broker.py). Nur Alpaca – Saxo kennt kein Time-Exit.
+    max_holding_days = int(config.get("MAX_HOLDING_DAYS", 5))
+    max_holding_days_trailing_multiplier = int(config.get("MAX_HOLDING_DAYS_TRAILING_MULTIPLIER", 2))
+
     # Aktueller Kurs + unrealisierter G/V pro offener Position (fürs
     # Frontend, siehe Positions-Karten in Uebersicht.tsx) – analog zu
     # broker.get_portfolio_value()s Unrealisiert-Schleife, hier zusätzlich
@@ -161,6 +171,15 @@ def get_overview():
         row["current_price"] = current_price
         row["unrealized_pnl"] = round((current_price - row["entry_price"]) * row["quantity"], 2)
         row["unrealized_pnl_pct"] = round((current_price - row["entry_price"]) / row["entry_price"] * 100, 2) if row["entry_price"] else 0
+
+        days_held = count_trading_days(row["created_at"].date(), datetime.now().date())
+        limit = (
+            max_holding_days * max_holding_days_trailing_multiplier
+            if row["trailing_sl_active"]
+            else max_holding_days
+        )
+        row["time_exit_days_remaining"] = limit - days_held
+
         open_trades_out.append(row)
 
     return {
@@ -247,7 +266,7 @@ def get_trade_history(limit: int = 50):
                 stop_loss, take_profit,
                 capital_used, pnl_usd, pnl_pct,
                 rule_score, status,
-                broker, mode,
+                broker, mode, sector,
                 created_at, closed_at,
                 llm_sentiment, llm_summary, llm_risks, score_breakdown,
                 CASE

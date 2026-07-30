@@ -418,6 +418,7 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
         status          = "OPEN",
         mode            = TRADING_MODE,
         broker          = active_broker,
+        sector          = signal.sector,
     )
     trade.set_score_breakdown(signal.score_breakdown)
 

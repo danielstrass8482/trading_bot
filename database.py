@@ -142,6 +142,11 @@ class Trade(Base):
     trailing_sl_price          = Column(Float, nullable=True)    # aktueller Trailing-SL-Preis (nur wenn trailing_sl_active)
     highest_price_since_entry  = Column(Float, nullable=True)    # höchster beobachteter Kurs seit Entry (Basis für Trailing SL)
     broker                     = Column(String(20), default="alpaca")  # "alpaca" / "ibkr" (siehe broker.place_trade)
+    # yfinance-Sektor zum Entry-Zeitpunkt (siehe rule_engine.SignalResult.sector) –
+    # NULL bei Inverse ETFs und bei älteren Trades vor Einführung dieser Spalte
+    # (siehe _migrate_trades_sector_column: dort per FairValueCache nachgefüllt,
+    # soweit ein Cache-Eintrag existiert).
+    sector                     = Column(String(50), nullable=True)
 
     # ── State Machine für Exit-Übergänge (Aufgabe 2, 2026-07-30) ──────────
     # Additiv neben `status` (das weiterhin nur den TERMINALEN Zustand trägt:
@@ -563,6 +568,7 @@ def init_db():
     _migrate_trades_state_machine_columns()
     _migrate_scan_log_regime_column()
     _migrate_scan_log_fair_value_columns()
+    _migrate_trades_sector_column()
     _seed_saxo_token_from_env()
     # Initiale Bot-State-Werte setzen falls nicht vorhanden
     with get_session() as session:
@@ -696,6 +702,36 @@ def _migrate_scan_log_fair_value_columns():
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE scan_log ADD COLUMN IF NOT EXISTS fair_value_avg FLOAT"))
         conn.execute(text("ALTER TABLE scan_log ADD COLUMN IF NOT EXISTS fair_value_discount_pct FLOAT"))
+
+
+def _migrate_trades_sector_column():
+    """
+    Base.metadata.create_all() ändert keine Spalten einer bereits bestehenden
+    Tabelle – sector (Sektor-Spalte Handelshistorie) kam nachträglich zur
+    trades-Tabelle dazu, daher ein idempotentes ALTER TABLE ... ADD COLUMN
+    IF NOT EXISTS. Neue Trades bekommen sector ab sofort direkt von
+    broker.place_trade() gesetzt (siehe rule_engine.SignalResult.sector) –
+    hier zusätzlich ein einmaliger, kostenloser Backfill für Bestandstrades:
+    fair_value_cache.sector wird wöchentlich pro Ticker ohnehin schon
+    gepflegt (siehe fair_value.py), ein erneuter yfinance-Call für den
+    Backfill ist also unnötig. Ticker ohne Cache-Eintrag (z.B. Inverse ETFs,
+    ETFs ohne KGV) bleiben NULL – kein Live-Nachladen bei jedem Bot-Neustart,
+    um Rate-Limits/Startup-Zeit nicht unnötig zu belasten.
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS sector VARCHAR(50)"))
+        conn.execute(text("""
+            UPDATE trades t
+            SET sector = fvc.sector
+            FROM (
+                SELECT DISTINCT ON (ticker) ticker, sector
+                FROM fair_value_cache
+                WHERE sector IS NOT NULL
+                ORDER BY ticker, updated_at DESC
+            ) fvc
+            WHERE t.sector IS NULL AND t.ticker = fvc.ticker
+        """))
 
 
 def _seed_saxo_token_from_env():
