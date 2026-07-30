@@ -560,6 +560,7 @@ def init_db():
     _migrate_trades_atr_columns()
     _migrate_trades_trailing_sl_columns()
     _migrate_trades_broker_column()
+    _migrate_trades_state_machine_columns()
     _migrate_scan_log_regime_column()
     _migrate_scan_log_fair_value_columns()
     _seed_saxo_token_from_env()
@@ -652,6 +653,25 @@ def _migrate_trades_broker_column():
         conn.execute(text("UPDATE trades SET broker = 'alpaca' WHERE broker IS NULL"))
         conn.execute(text("ALTER TABLE scan_log ADD COLUMN IF NOT EXISTS broker VARCHAR(20) DEFAULT 'alpaca'"))
         conn.execute(text("UPDATE scan_log SET broker = 'alpaca' WHERE broker IS NULL"))
+
+
+def _migrate_trades_state_machine_columns():
+    """
+    Base.metadata.create_all() ändert keine Spalten einer bereits bestehenden
+    Tabelle – status_detail/pending_client_order_id/pending_exit_reason
+    (State Machine für Exit-Übergänge, Aufgabe 2, 2026-07-30, siehe Trade-
+    Klasse) kamen nachträglich zur trades-Tabelle dazu, daher ein idempotentes
+    ALTER TABLE ... ADD COLUMN IF NOT EXISTS. KRITISCHER FUND beim Deploy
+    2026-07-30: ohne diese Migration crasht jeder get_open_trades()-Aufruf
+    mit UndefinedColumn, sobald das ORM-Modell die Spalten erwartet, aber die
+    echte Tabelle sie noch nicht hat (create_all() legt NUR fehlende Tabellen
+    an, nie fehlende Spalten einer bestehenden Tabelle).
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS status_detail VARCHAR(20)"))
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS pending_client_order_id VARCHAR(64)"))
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS pending_exit_reason VARCHAR(30)"))
 
 
 def _migrate_scan_log_regime_column():
