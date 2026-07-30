@@ -12,7 +12,7 @@ from sqlalchemy import text
 
 from config import (
     LONG_WATCHLIST, ACTIVE_SHORT_INSTRUMENTS, VOLATILE_WATCHLIST,
-    PROFIT_ALERT_TARGET, MAX_CAPITAL_TOTAL, TRADING_MODE,
+    PROFIT_ALERT_TARGET, MAX_CAPITAL_TOTAL, TRADING_MODE, DEFAULT_USER_ID,
     validate_config, get_live_config,
 )
 from database import (
@@ -20,6 +20,7 @@ from database import (
     EntryTimeSlot, get_active_entry_time_slots, get_daily_trade_count,
     get_open_trades, FairValueCache, BotHeartbeat,
     save_position_snapshot, get_previous_position_snapshot,
+    get_user_live_config, get_connected_alpaca_users, get_total_capital_in_trades,
 )
 from notifications import send_email
 from rule_engine import scan_watchlist_parallel, check_vix, get_market_regime, get_benchmark_performance
@@ -27,6 +28,7 @@ from llm_analyst import analyze_with_llm, get_market_brief
 from broker import (
     place_trade, monitor_open_positions, get_portfolio_value, get_bot_performance,
     check_guardrails, check_position_consistency, GuardrailViolation,
+    get_alpaca_account_snapshot,
 )
 from backlook import run_backlook
 from fair_value import update_fair_value_cache, get_undervalued_tickers
@@ -309,53 +311,89 @@ def log_scan_results(signals: list, slot_et: str, executed_trades: dict, guardra
         session.commit()
 
 
-def calculate_max_trades_today() -> int:
+def get_connected_user_ids() -> list[int]:
+    """
+    Multi-Tenant-Handelsloop (2026-07-30): alle Nutzer, für die run_entry_cycle/
+    run_monitoring_cycle eigenständig handeln/überwachen sollen. DEFAULT_USER_ID
+    (Daniel) ist IMMER enthalten, an erster Stelle (bestehendes Verhalten bleibt
+    exakt erhalten, egal ob er je eigene Keys verbindet) – zusätzlich jeder in
+    get_connected_alpaca_users() gefundene Nutzer, dedupliziert gegen
+    DEFAULT_USER_ID (der könnte theoretisch selbst dort auftauchen, falls Daniel
+    irgendwann eigene Keys hinterlegt).
+    """
+    other_ids = [u["id"] for u in get_connected_alpaca_users() if u["id"] != DEFAULT_USER_ID]
+    return [DEFAULT_USER_ID] + other_ids
+
+
+def calculate_max_trades_today(user_id: int = DEFAULT_USER_ID) -> int:
     """
     Ersetzt die feste MAX_TRADES_PER_DAY-Grenze: berechnet täglich neu, wie
-    viele neue Trades tatsächlich möglich sind – begrenzt durch das noch
-    verfügbare Kapital (MAX_CAPITAL_TOTAL - bereits investiert) UND durch
-    die Anzahl noch freier offener Positionen (MAX_OPEN_POSITIONS).
+    viele neue Trades für EINEN Nutzer tatsächlich möglich sind – begrenzt durch
+    das noch verfügbare KONFIGURIERTE Kapital (MAX_CAPITAL_TOTAL - bereits
+    investiert), durch die Anzahl noch freier offener Positionen
+    (MAX_OPEN_POSITIONS) UND (AUFGABE 4, 2026-07-30) zusätzlich hart durch das
+    ECHTE, gerade jetzt bei Alpaca verfügbare Kapital dieses Nutzers (GET
+    /v2/account cash) – ein zu hoch konfiguriertes Limit kann dieses reale
+    Limit NICHT überschreiben. user_id=DEFAULT_USER_ID hält jeden bestehenden
+    Aufrufer (z.B. dashboard.py) unverändert.
+
+    Liegt real_cash unter dem noch offenen konfigurierten Budget, wird das klar
+    geloggt ("konfiguriertes Limit übersteigt echtes Kapital") statt einfach
+    stillschweigend 0 zurückzugeben – der Aufrufer (run_entry_cycle) übersetzt
+    ein daraus resultierendes erlaubt=0 in einen sauberen Skip für GENAU diesen
+    Nutzer (kein Guardrail-Exception-Pfad nötig, siehe dortige Doku) und handelt
+    unabhängig davon für alle anderen Nutzer normal weiter.
     """
-    config = get_live_config()
+    config = get_user_live_config(user_id)
     max_capital_total = float(config.get("MAX_CAPITAL_TOTAL", 475))
     max_per_trade = float(config.get("MAX_CAPITAL_PER_TRADE", 50))
     max_open = int(config.get("MAX_OPEN_POSITIONS", 5))
 
     with get_session() as session:
-        invested = session.execute(text("""
-            SELECT COALESCE(SUM(capital_used), 0) as invested
-            FROM trades WHERE status = 'OPEN'
-        """)).scalar()
-        invested = float(invested or 0)
+        invested = get_total_capital_in_trades(session, user_id)
         available_capital = max_capital_total - invested
 
-        current_open = session.execute(text("""
-            SELECT COUNT(*) FROM trades WHERE status = 'OPEN'
-        """)).scalar()
+        current_open = len(get_open_trades(session, user_id))
 
-        max_by_capital = int(available_capital / max_per_trade) if max_per_trade > 0 else 0
-        max_by_positions = max_open - int(current_open)
+    real_snapshot = get_alpaca_account_snapshot(user_id)
+    if real_snapshot is not None:
+        real_cash = real_snapshot["cash"]
+        if real_cash < available_capital:
+            print(f"⚠️  Nutzer {user_id}: konfiguriertes Limit übersteigt echtes Kapital "
+                  f"(konfiguriert verfügbar: ${available_capital:.2f}, echtes Cash bei Alpaca: ${real_cash:.2f}) "
+                  f"– echtes Kapital gilt als harte Obergrenze.")
+        available_capital = min(available_capital, real_cash)
+    # real_snapshot is None: Alpaca gerade nicht erreichbar – bewusst KEIN
+    # zusätzlicher Abzug (Fail-safe wie schon immer: rein konfigurationsbasiert
+    # weiterrechnen, statt Handel für alle Nutzer auszusetzen nur weil ein
+    # einzelner Status-Abruf fehlschlug).
 
-        return max(0, min(max_by_capital, max_by_positions))
+    max_by_capital = int(available_capital / max_per_trade) if max_per_trade > 0 else 0
+    max_by_positions = max_open - current_open
+
+    return max(0, min(max_by_capital, max_by_positions))
 
 
-def get_trades_for_slot(slot: EntryTimeSlot) -> int:
+def get_trades_for_slot(slot: EntryTimeSlot, user_id: int = DEFAULT_USER_ID) -> int:
     """
     Dynamische Slot-Verteilung (ersetzt festes "Konservatives Frühbudget"-Cap):
-    das verbleibende Tagesbudget wird gleichmäßig (aufgerundet) auf die noch
-    verbleibenden aktiven Slots ab diesem Slot verteilt, statt frühen Slots
-    das gesamte Restbudget zu überlassen. slot.max_trades_per_slot bleibt als
-    optionale Obergrenze bestehen.
+    das verbleibende Tagesbudget EINES Nutzers wird gleichmäßig (aufgerundet)
+    auf die noch verbleibenden aktiven Slots ab diesem Slot verteilt, statt
+    frühen Slots das gesamte Restbudget zu überlassen. slot.max_trades_per_slot
+    bleibt als optionale Obergrenze bestehen (GLOBAL, gilt für alle Nutzer
+    gleich – der Zeitplan selbst ist nicht Teil dieses Auftrags pro Nutzer
+    konfigurierbar).
 
-    WICHTIG: calculate_max_trades_today() ist bereits das LIVE kapital-/
-    positions-bereinigte Restbudget (berechnet aus SUM(capital_used) aller
-    aktuell offenen Trades) – heute bereits ausgeführte Trades sind darüber
-    schon vollständig eingepreist. Ein zusätzlicher Abzug der heutigen
-    Trade-Anzahl (früher: `daily_count`-Parameter) wäre ein Doppelabzug:
-    einmal implizit über das reduzierte verfügbare Kapital, einmal explizit
-    über die Trade-Anzahl – das hat real noch mögliche Trades blockiert.
+    WICHTIG: calculate_max_trades_today(user_id) ist bereits das LIVE kapital-/
+    positions-/echtkapital-bereinigte Restbudget DIESES Nutzers (berechnet aus
+    SUM(capital_used) seiner aktuell offenen Trades, siehe AUFGABE 4) – heute
+    bereits ausgeführte Trades sind darüber schon vollständig eingepreist. Ein
+    zusätzlicher Abzug der heutigen Trade-Anzahl (früher: `daily_count`-
+    Parameter) wäre ein Doppelabzug: einmal implizit über das reduzierte
+    verfügbare Kapital, einmal explizit über die Trade-Anzahl – das hat real
+    noch mögliche Trades blockiert.
     """
-    restbudget = calculate_max_trades_today()
+    restbudget = calculate_max_trades_today(user_id)
 
     if restbudget <= 0:
         return 0
@@ -384,6 +422,20 @@ def run_entry_cycle(slot: EntryTimeSlot):
     schedule_entry_jobs). Wie der frühere run_bot_cycle, aber nur Signal-Scan +
     Trade-Platzierung – kein SL/TP-Monitoring (läuft separat, siehe
     run_monitoring_cycle alle MONITORING_INTERVAL_MIN Minuten).
+
+    Multi-Tenant-Handelsloop (2026-07-30): der Markt-Scan (Schritt 4) läuft
+    EINMAL zentral – Kandidaten/Scores sind für alle Nutzer identisch (siehe
+    config.DEFAULT_USER_ID-Docstring, warum SL/TP/Score-Berechnung bewusst
+    nicht pro Nutzer divergieren). Ab Schritt 5 (Guardrail-Prüfung + Order-
+    Platzierung) läuft die Kandidatenliste dagegen für JEDEN verbundenen
+    Nutzer (get_connected_user_ids()) unabhängig durch – eigene Guardrails,
+    eigener Alpaca-Client, eigene trades-Zeilen (siehe broker.check_guardrails/
+    place_trade). Ein Fehler oder ein zu knappes Kapital bei EINEM Nutzer darf
+    NIE die anderen Nutzer im selben Zyklus beeinträchtigen (AUFGABE 4) – siehe
+    die try/except-Grenze pro Nutzer unten. VIX-Check, Fair-Value-Vorfilter und
+    das Scan-Log/Snapshot/Heartbeat am Ende bleiben bewusst wie bisher an
+    DEFAULT_USER_ID/global verankert (Dashboard/Scan-Historie-UI ist nicht Teil
+    dieses Auftrags – nur der Handelsloop selbst wurde multi-tenant-fähig gemacht).
     """
     print(f"\n{'='*60}")
     print(f"🤖 Entry-Zyklus {slot.stunde_et:02d}:{slot.minute_et:02d} ET gestartet: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -433,18 +485,15 @@ def run_entry_cycle(slot: EntryTimeSlot):
             )
         )
 
-    # 3. Budget für diesen Slot bestimmen: das Restbudget des Tages wird
-    # dynamisch auf die verbleibenden aktiven Slots verteilt statt frühen
-    # Slots das gesamte Restbudget zu überlassen (siehe get_trades_for_slot).
-    # max_trades_today ist bereits das LIVE kapital-/positions-bereinigte
-    # Restbudget – trades_heute dient hier NUR noch der Log-Anzeige, wird
-    # NICHT mehr davon abgezogen (früherer Doppelabzug-Bug, siehe
-    # get_trades_for_slot-Docstring).
+    # 3. Budget für diesen Slot bestimmen (DEFAULT_USER_ID, für die
+    # unveränderten Scan-Log/Dashboard-Variablen unten) – jeder andere
+    # verbundene Nutzer bekommt sein eigenes Budget weiter unten in der
+    # Multi-Tenant-Schleife (Schritt 5) berechnet, nicht hier.
     with get_session() as session:
-        max_trades_today = calculate_max_trades_today()
-        trades_heute = get_daily_trade_count(session)
+        max_trades_today = calculate_max_trades_today(DEFAULT_USER_ID)
+        trades_heute = get_daily_trade_count(session, DEFAULT_USER_ID)
 
-    erlaubt = get_trades_for_slot(slot)
+    erlaubt = get_trades_for_slot(slot, DEFAULT_USER_ID)
 
     print(f"🎯 Slot-Budget: {erlaubt} Trade(s) (Cap {slot.max_trades_per_slot}, "
           f"Restbudget {max_trades_today} weitere(r) Trade(s) laut Kapital/Positionen, heute bereits {trades_heute} ausgeführt)")
@@ -477,101 +526,166 @@ def run_entry_cycle(slot: EntryTimeSlot):
     approved = sorted((s for s in signals if s.approved), key=lambda s: s.score, reverse=True)
     print(f"\n✅ {len(approved)} Trade-Signale über Schwellwert:")
 
-    # 5. Für jedes freigegebene Signal (bis zum Slot-Kontingent): Guardrail
-    # zuerst prüfen (spart LLM-Aufrufe für ohnehin geblockte Kandidaten), dann
-    # LLM + Trade. WICHTIG (FIX Slot-Cap): nur ein tatsächlich AUSGEFÜHRTER
-    # Trade verbraucht das Slot-Kontingent – ein von einem Guardrail
-    # geblockter Kandidat (z.B. "Position auf TICKER bereits offen", was nur
-    # DIESEN einen Ticker betrifft) darf keinen Slot verbrauchen und nicht
-    # verhindern, dass der nächste Kandidat noch versucht wird.
-    executed_trades = []
-    guardrail_reasons = {}
-    trades_in_slot = 0
-    verlustlimit_alert_gesendet = False
+    # 5. Für jeden verbundenen Nutzer unabhängig: für jedes freigegebene Signal
+    # (bis zum jeweils EIGENEN Slot-Kontingent) Guardrail zuerst prüfen (spart
+    # LLM-Aufrufe für ohnehin geblockte Kandidaten), dann LLM + Trade. WICHTIG
+    # (FIX Slot-Cap): nur ein tatsächlich AUSGEFÜHRTER Trade verbraucht das
+    # Slot-Kontingent – ein von einem Guardrail geblockter Kandidat (z.B.
+    # "Position auf TICKER bereits offen", was nur DIESEN einen Ticker
+    # betrifft) darf keinen Slot verbrauchen und nicht verhindern, dass der
+    # nächste Kandidat noch versucht wird.
+    #
+    # llm_cache: LLM-Analyse eines Kandidaten ist nutzerunabhängig (derselbe
+    # Ticker, derselbe Marktkontext) – wird beim ersten Nutzer, der ihn kauft,
+    # einmalig berechnet und für alle weiteren Nutzer wiederverwendet statt pro
+    # Nutzer erneut abgerufen zu werden (spart LLM-Kosten/Latenz).
+    llm_cache: dict = {}
+    results_by_user: dict = {}
+    connected_user_ids = get_connected_user_ids()
+    if len(connected_user_ids) > 1:
+        print(f"\n👥 Multi-Tenant: {len(connected_user_ids)} verbundene Nutzer in diesem Zyklus "
+              f"({', '.join(str(u) for u in connected_user_ids)})")
 
-    for signal in approved:
-        if trades_in_slot >= erlaubt:
-            break
-
-        # check_guardrails() fragt open_trades/daily_trade_count/daily_pnl bei
-        # jedem Aufruf frisch aus der DB ab – reflektiert also automatisch
-        # bereits in diesem Zyklus ausgeführte Trades, keine veralteten Werte.
+    for user_id in connected_user_ids:
+        # Jeder Nutzer läuft in seiner eigenen try/except-Grenze: ein
+        # unerwarteter Fehler bei EINEM Nutzer (z.B. Netzwerkproblem mit
+        # dessen individuellem Alpaca-Client) darf niemals die Verarbeitung
+        # der ANDEREN Nutzer im selben Zyklus verhindern (AUFGABE 4-Prinzip).
         try:
-            check_guardrails(signal)
-        except GuardrailViolation as gv:
-            guardrail_reasons[signal.ticker] = str(gv)
-            print(f"   🛡️  {signal.ticker}: Guardrail – {gv}")
-            if "Verlustlimit" in str(gv) and not verlustlimit_alert_gesendet:
-                send_email(
-                    subject="🛑 Trading Bot – Daily Loss Limit erreicht",
-                    body=(
-                        f"{gv}\n\n"
-                        f"Portfolio-Wert: ${portfolio_value:.2f}\n"
-                        f"Der Bot wurde automatisch pausiert und handelt erst nach "
-                        f"manueller Freigabe wieder."
-                    )
-                )
-                verlustlimit_alert_gesendet = True
-            continue  # NICHT trades_in_slot erhöhen – geblockter Kandidat verbraucht keinen Slot
+            user_erlaubt = erlaubt if user_id == DEFAULT_USER_ID else get_trades_for_slot(slot, user_id)
+            user_executed_trades = []
+            user_guardrail_reasons = {}
+            user_trades_in_slot = 0
+            verlustlimit_alert_gesendet = False
 
-        # Portfolio-Segmentierung: Anteil volatiler Titel (VOLATILE_WATCHLIST)
-        # an den offenen Positionen begrenzen bzw. gezielt auffüllen (siehe
-        # Feature Portfolio-Segmentierung). Frisch pro Kandidat berechnet,
-        # damit bereits in diesem Zyklus ausgeführte Trades berücksichtigt sind.
-        seg_config = get_live_config()
-        volatile_target = float(seg_config.get("VOLATILE_SEGMENT_PCT", 0.33))
+            for signal in approved:
+                if user_trades_in_slot >= user_erlaubt:
+                    break
 
-        with get_session() as seg_session:
-            open_trades_all = get_open_trades(seg_session)
-        total_open = len(open_trades_all)
-        volatile_open = sum(1 for t in open_trades_all if t.ticker in VOLATILE_WATCHLIST)
-        volatile_ratio = (volatile_open / total_open) if total_open > 0 else 0
+                # check_guardrails() fragt open_trades/daily_trade_count/daily_pnl
+                # bei jedem Aufruf frisch aus der DB ab (pro Nutzer gefiltert) –
+                # reflektiert also automatisch bereits in diesem Zyklus
+                # ausgeführte Trades DIESES Nutzers, keine veralteten Werte.
+                try:
+                    check_guardrails(signal, user_id)
+                except GuardrailViolation as gv:
+                    user_guardrail_reasons[signal.ticker] = str(gv)
+                    print(f"   🛡️  Nutzer {user_id}, {signal.ticker}: Guardrail – {gv}")
+                    if "Verlustlimit" in str(gv) and not verlustlimit_alert_gesendet:
+                        send_email(
+                            subject="🛑 Trading Bot – Daily Loss Limit erreicht",
+                            body=(
+                                f"{gv}\n\n"
+                                f"Nutzer: {user_id}\n"
+                                f"Der Bot wurde automatisch pausiert und handelt erst nach "
+                                f"manueller Freigabe wieder."
+                            )
+                        )
+                        verlustlimit_alert_gesendet = True
+                    continue  # NICHT trades_in_slot erhöhen – geblockter Kandidat verbraucht keinen Slot
 
-        if signal.ticker in VOLATILE_WATCHLIST:
-            if volatile_ratio > volatile_target + 0.15:
-                # Zu viele volatile Titel offen: diesen Kandidaten blockieren
-                guardrail_reasons[signal.ticker] = f"Volatile Segment voll ({volatile_ratio*100:.0f}%)"
-                print(f"   🛡️  {signal.ticker}: Volatile Segment voll ({volatile_ratio*100:.0f}%)")
-                continue  # NICHT trades_in_slot erhöhen
-            elif volatile_ratio < volatile_target:
-                # Volatiles Segment unterrepräsentiert: Score-Bonus
-                signal.score += 5
-                print(f"   📊 {signal.ticker}: Volatile Segment unterrepräsentiert ({volatile_ratio*100:.0f}%) – Score +5")
+                # Portfolio-Segmentierung: Anteil volatiler Titel (VOLATILE_WATCHLIST)
+                # an den offenen Positionen DIESES Nutzers begrenzen bzw. gezielt
+                # auffüllen (siehe Feature Portfolio-Segmentierung). Frisch pro
+                # Kandidat berechnet, damit bereits in diesem Zyklus ausgeführte
+                # Trades berücksichtigt sind. VOLATILE_SEGMENT_PCT bleibt bewusst
+                # global (nicht Teil der Pro-Nutzer-Guardrails in AUFGABE 1).
+                seg_config = get_live_config()
+                volatile_target = float(seg_config.get("VOLATILE_SEGMENT_PCT", 0.33))
 
-        print(f"\n--- Trade-Kandidat: {signal.ticker} (Score: {signal.score}/100) ---")
+                with get_session() as seg_session:
+                    open_trades_all = get_open_trades(seg_session, user_id)
+                total_open = len(open_trades_all)
+                volatile_open = sum(1 for t in open_trades_all if t.ticker in VOLATILE_WATCHLIST)
+                volatile_ratio = (volatile_open / total_open) if total_open > 0 else 0
 
-        # LLM-Analyse (non-blocking – Bot läuft weiter bei Fehler)
-        print(f"🧠 LLM-Analyse für {signal.ticker}...")
-        llm_result = analyze_with_llm(signal)
+                if signal.ticker in VOLATILE_WATCHLIST:
+                    if volatile_ratio > volatile_target + 0.15:
+                        # Zu viele volatile Titel offen: diesen Kandidaten blockieren
+                        user_guardrail_reasons[signal.ticker] = f"Volatile Segment voll ({volatile_ratio*100:.0f}%)"
+                        print(f"   🛡️  Nutzer {user_id}, {signal.ticker}: Volatile Segment voll ({volatile_ratio*100:.0f}%)")
+                        continue  # NICHT trades_in_slot erhöhen
+                    elif volatile_ratio < volatile_target:
+                        # Volatiles Segment unterrepräsentiert: Score-Bonus
+                        signal.score += 5
+                        print(f"   📊 Nutzer {user_id}, {signal.ticker}: Volatile Segment unterrepräsentiert ({volatile_ratio*100:.0f}%) – Score +5")
 
-        if llm_result.get("summary"):
-            print(f"   Summary: {llm_result['summary'][:100]}...")
-        if llm_result.get("risks"):
-            for r in llm_result["risks"]:
-                print(f"   ⚠️  {r}")
+                print(f"\n--- Nutzer {user_id}, Trade-Kandidat: {signal.ticker} (Score: {signal.score}/100) ---")
 
-        # Trade platzieren (Guardrails werden intern nochmal geprüft – Sicherheitsnetz
-        # falls sich der Zustand zwischen Vor-Check und Order-Platzierung ändert).
-        try:
-            trade = place_trade(signal, llm_result)
-            if trade:
-                executed_trades.append(trade)
-                trades_in_slot += 1  # Nur hier erhöhen – ein echter Trade wurde ausgeführt
-                print(f"   ✅ Trade #{trade.id} ausgeführt ({trades_in_slot}/{erlaubt})")
-        except GuardrailViolation as gv:
-            guardrail_reasons[signal.ticker] = str(gv)
-            print(f"   🛡️  Guardrail: {gv}")
-            if "Verlustlimit" in str(gv) and not verlustlimit_alert_gesendet:
-                send_email(
-                    subject="🛑 Trading Bot – Daily Loss Limit erreicht",
-                    body=(
-                        f"{gv}\n\n"
-                        f"Portfolio-Wert: ${portfolio_value:.2f}\n"
-                        f"Der Bot wurde automatisch pausiert und handelt erst nach "
-                        f"manueller Freigabe wieder."
-                    )
-                )
-                verlustlimit_alert_gesendet = True
+                # LLM-Analyse (non-blocking – Bot läuft weiter bei Fehler),
+                # gecacht pro Ticker über alle Nutzer hinweg (siehe llm_cache oben).
+                if signal.ticker not in llm_cache:
+                    print(f"🧠 LLM-Analyse für {signal.ticker}...")
+                    llm_cache[signal.ticker] = analyze_with_llm(signal)
+                llm_result = llm_cache[signal.ticker]
+
+                if llm_result.get("summary"):
+                    print(f"   Summary: {llm_result['summary'][:100]}...")
+                if llm_result.get("risks"):
+                    for r in llm_result["risks"]:
+                        print(f"   ⚠️  {r}")
+
+                # Trade platzieren (Guardrails werden intern nochmal geprüft – Sicherheitsnetz
+                # falls sich der Zustand zwischen Vor-Check und Order-Platzierung ändert).
+                try:
+                    trade = place_trade(signal, llm_result, user_id)
+                    if trade:
+                        user_executed_trades.append(trade)
+                        user_trades_in_slot += 1  # Nur hier erhöhen – ein echter Trade wurde ausgeführt
+                        print(f"   ✅ Nutzer {user_id}: Trade #{trade.id} ausgeführt ({user_trades_in_slot}/{user_erlaubt})")
+                except GuardrailViolation as gv:
+                    user_guardrail_reasons[signal.ticker] = str(gv)
+                    print(f"   🛡️  Nutzer {user_id}: Guardrail – {gv}")
+                    if "Verlustlimit" in str(gv) and not verlustlimit_alert_gesendet:
+                        send_email(
+                            subject="🛑 Trading Bot – Daily Loss Limit erreicht",
+                            body=(
+                                f"{gv}\n\n"
+                                f"Nutzer: {user_id}\n"
+                                f"Der Bot wurde automatisch pausiert und handelt erst nach "
+                                f"manueller Freigabe wieder."
+                            )
+                        )
+                        verlustlimit_alert_gesendet = True
+
+            results_by_user[user_id] = {
+                "executed_trades": user_executed_trades,
+                "guardrail_reasons": user_guardrail_reasons,
+                "trades_in_slot": user_trades_in_slot,
+                "erlaubt": user_erlaubt,
+                "budget_exhausted": user_erlaubt <= 0,
+            }
+
+        except Exception as e:
+            # Nicht als GuardrailViolation gefangene, echte Fehler (z.B. ein
+            # unerwarteter API-Fehler) dürfen NIE den gesamten Entry-Zyklus für
+            # ALLE Nutzer abbrechen (AUFGABE 4) – klare Log-/Alarm-Meldung,
+            # dann normal weiter zum nächsten Nutzer.
+            print(f"🚨 Nutzer {user_id}: unerwarteter Fehler im Entry-Zyklus ({e}) – "
+                  f"dieser Nutzer wird für diesen Zyklus übersprungen, andere Nutzer nicht betroffen.")
+            send_email(
+                subject=f"🚨 Trading Bot – Fehler im Entry-Zyklus (Nutzer {user_id})",
+                body=f"{e}\n\nNutzer {user_id} wurde in diesem Zyklus übersprungen. Andere Nutzer liefen normal weiter."
+            )
+            results_by_user[user_id] = {
+                "executed_trades": [], "guardrail_reasons": {}, "trades_in_slot": 0,
+                "erlaubt": 0, "budget_exhausted": True,
+            }
+
+    # Bestehende Variablen für Scan-Log/Dashboard (siehe Schritt 6 unten)
+    # bleiben exakt an DEFAULT_USER_IDs Ergebnis gebunden – keine Änderung an
+    # der (nicht Teil dieses Auftrags) Single-Tenant-Scan-Historie-UI.
+    default_result = results_by_user.get(DEFAULT_USER_ID, {
+        "executed_trades": [], "guardrail_reasons": {}, "trades_in_slot": 0, "erlaubt": erlaubt, "budget_exhausted": budget_exhausted,
+    })
+    executed_trades = default_result["executed_trades"]
+    guardrail_reasons = default_result["guardrail_reasons"]
+    trades_in_slot = default_result["trades_in_slot"]
+
+    total_executed = sum(len(r["executed_trades"]) for r in results_by_user.values())
+    if len(connected_user_ids) > 1:
+        summary = ", ".join(f"Nutzer {uid}: {len(r['executed_trades'])}" for uid, r in results_by_user.items())
+        print(f"\n👥 Multi-Tenant-Zusammenfassung dieses Slots – {total_executed} Trade(s) insgesamt ({summary})")
 
     # Kandidaten, die wegen erreichtem Slot-Kontingent gar nicht mehr geprüft
     # wurden (Schleife oben per break beendet), bekommen fürs Scan-Log trotzdem
@@ -659,9 +773,23 @@ def run_monitoring_cycle():
     Leichtgewichtiger Zyklus: Nur SL/TP überwachen (alle 30 Min während Handelszeit).
     Seit 2026-07-30 zusätzlich: Positions-Konsistenz-Watchdog (Aufgabe 3,
     eigenständige Funktion in broker.py, siehe dort) und Heartbeat (Aufgabe 1).
+
+    Multi-Tenant (2026-07-30): läuft für JEDEN verbundenen Nutzer einzeln
+    (eigene Positionen, eigener Alpaca-Client) – ein Fehler bei einem Nutzer
+    darf die anderen nicht vom Monitoring/Watchdog ausschließen (analog zum
+    Prinzip in run_entry_cycle).
     """
-    monitor_open_positions()
-    check_position_consistency()
+    for user_id in get_connected_user_ids():
+        try:
+            monitor_open_positions(user_id)
+            check_position_consistency(user_id)
+        except Exception as e:
+            print(f"🚨 Nutzer {user_id}: unerwarteter Fehler im Monitoring-Zyklus ({e}) – "
+                  f"andere Nutzer nicht betroffen.")
+            send_email(
+                subject=f"🚨 Trading Bot – Fehler im Monitoring-Zyklus (Nutzer {user_id})",
+                body=f"{e}"
+            )
     with get_session() as session:
         BotHeartbeat.touch(session, "alpaca", "monitoring")
         session.commit()

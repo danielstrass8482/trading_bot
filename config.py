@@ -48,6 +48,18 @@ if DATABASE_URL.startswith("postgres://"):
 # zu entschluesseln (siehe database.get_alpaca_api_for_user, Feature 8 Multi-Tenant).
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")
 
+# pos_users.id von Daniel (portfolio_os-DB) – der "Default-Nutzer", auf den alle
+# VOR dem Multi-Tenant-Umbau (2026-07-30) entstandenen trades-Zeilen migriert
+# wurden (siehe database._migrate_trades_user_id_column). Läuft weiterhin exakt
+# wie vorher: get_alpaca_api_for_user(DEFAULT_USER_ID) liefert aktuell None (Daniel
+# hat nie eigene Keys über den Connect-Flow hinterlegt), _get_alpaca_client()
+# faellt dadurch automatisch auf die globalen .env-Keys zurück – keine
+# Verhaltensänderung für den bestehenden Live-Account. get_user_live_config()
+# liefert für DEFAULT_USER_ID bewusst 1:1 die bestehende globale bot_config-
+# Tabelle (nicht die neue user_bot_config-Tabelle), damit das Dashboard
+# (Einstellungen.tsx, /api/bot-config) unverändert weiterfunktioniert.
+DEFAULT_USER_ID = 1
+
 # ─────────────────────────────────────────────
 # BROKER (Saxo Bank OpenAPI)
 # ─────────────────────────────────────────────

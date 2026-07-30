@@ -17,7 +17,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from config import (
     DATABASE_URL, SCORE_WEIGHTS, ENCRYPTION_KEY, SAXO_TOKEN_ENCRYPTION_KEY,
     SAXO_ACCESS_TOKEN_INITIAL, SAXO_REFRESH_TOKEN_INITIAL,
-    SAXO_EXPIRES_IN_INITIAL, SAXO_REFRESH_EXPIRES_IN_INITIAL,
+    SAXO_EXPIRES_IN_INITIAL, SAXO_REFRESH_EXPIRES_IN_INITIAL, DEFAULT_USER_ID,
 )
 
 Base = declarative_base()
@@ -147,6 +147,12 @@ class Trade(Base):
     # (siehe _migrate_trades_sector_column: dort per FairValueCache nachgefüllt,
     # soweit ein Cache-Eintrag existiert).
     sector                     = Column(String(50), nullable=True)
+    # Multi-Tenant (2026-07-30): pos_users.id, wessen Alpaca-Account diesen Trade
+    # gehandelt hat. Nullable (additive Migration, siehe _migrate_trades_user_id_
+    # column) statt NOT NULL – Bestandstrades werden per Backfill auf
+    # config.DEFAULT_USER_ID (Daniel) gesetzt, neue Trades bekommen den Wert immer
+    # explizit von broker.place_trade() gesetzt.
+    user_id                    = Column(Integer, nullable=True)
 
     # ── State Machine für Exit-Übergänge (Aufgabe 2, 2026-07-30) ──────────
     # Additiv neben `status` (das weiterhin nur den TERMINALEN Zustand trägt:
@@ -348,6 +354,47 @@ DEFAULT_CONFIG = {
     "EARNINGS_BUFFER_DAYS":    ("3",      "Tage vor Earnings in denen nicht gekauft wird"),
     "ACTIVE_BROKER":           ("alpaca", "Aktiver Broker für neue Trades: alpaca / ibkr"),
     "ALPACA_DRAIN_MODE":       ("true",   "Alpaca: Keine neuen Käufe, nur bestehende Positionen managen"),
+}
+
+
+class UserBotConfig(Base):
+    """
+    Pro-Nutzer-Guardrails für den Multi-Tenant-Handelsloop (2026-07-30, siehe
+    main.run_entry_cycle). Bewusst eine EIGENE Tabelle statt user_id auf
+    BotConfig zu ergänzen: BotConfig bleibt unverändert Daniels/DEFAULT_USER_IDs
+    Konfiguration (dieselbe Tabelle, die /api/bot-config und Einstellungen.tsx
+    schon immer gelesen/geschrieben haben – keine Breaking Change dort). Andere
+    Nutzer bekommen ihre Zeilen hier erst lazy angelegt (siehe
+    get_user_live_config), sobald sie das erste Mal im Multi-Tenant-Loop
+    auftauchen. Absichtlich NUR die Guardrail-Keys, die pro Nutzer wirklich
+    unterschiedlich sein müssen (Kapital/Positions-/Tageslimits) – SL/TP-
+    Prozentsätze, ATR-Parameter, Time-Exit-Schwellen etc. bleiben bewusst
+    GLOBAL (aus get_live_config()) für alle Nutzer gleich, da sie nicht
+    Teil dieses Auftrags waren und der gemeinsame Signal-Scan ohnehin pro
+    Ticker einen einzigen SL/TP-Preis berechnet (nutzerunabhängig).
+    """
+    __tablename__ = "user_bot_config"
+
+    user_id      = Column(Integer, primary_key=True)
+    key          = Column(String(100), primary_key=True)
+    value        = Column(Text, nullable=False)
+    updated_at   = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# Konservative Default-Werte für neu verbundene Nutzer, solange es noch kein
+# eigenes Einstellungen-UI für sie gibt (nur der Trading-Bot-Loop selbst ist
+# Teil dieses Auftrags) – bewusst kleiner als Daniels DEFAULT_CONFIG-Werte
+# oben, damit ein frisch verbundener Account nicht versehentlich mit einem für
+# ihn viel zu hohen Kapital-Limit loslegt. AUFGABE 4 (echtes Broker-Kapital als
+# harte Obergrenze) fängt eine grobe Fehlkonfiguration zusätzlich ab.
+# Format wie config._LIVE_CONFIG_SPEC: key -> (cast, default_value) – expliziter
+# Typ statt String-Heuristik beim Rücklesen in get_user_live_config().
+DEFAULT_USER_CONFIG: dict = {
+    "MAX_CAPITAL_TOTAL":     (float, 100.0),
+    "MAX_CAPITAL_PER_TRADE": (float, 20.0),
+    "MAX_OPEN_POSITIONS":    (int,   3),
+    "MAX_TRADES_PER_DAY":    (int,   2),
+    "DAILY_LOSS_LIMIT_PCT":  (float, 0.05),
 }
 
 
@@ -569,6 +616,8 @@ def init_db():
     _migrate_scan_log_regime_column()
     _migrate_scan_log_fair_value_columns()
     _migrate_trades_sector_column()
+    _migrate_trades_user_id_column()
+    _migrate_pending_order_attempts_user_id_column()
     _seed_saxo_token_from_env()
     # Initiale Bot-State-Werte setzen falls nicht vorhanden
     with get_session() as session:
@@ -734,6 +783,39 @@ def _migrate_trades_sector_column():
         """))
 
 
+def _migrate_trades_user_id_column():
+    """
+    Base.metadata.create_all() ändert keine Spalten einer bereits bestehenden
+    Tabelle – user_id (Multi-Tenant-Handelsloop, 2026-07-30) kam nachträglich
+    zur trades-Tabelle dazu, daher ein idempotentes ALTER TABLE ... ADD COLUMN
+    IF NOT EXISTS. ALLE Bestandstrades (ausnahmslos vor diesem Feature über
+    Daniels Account gelaufen) werden auf config.DEFAULT_USER_ID zurückgeschrieben
+    – kein Datenverlust, nur eine nachträgliche Zuordnung. Analog zum
+    broker-Spalten-Backfill vom 2026-07-26 (_migrate_trades_broker_column).
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS user_id INTEGER"))
+        conn.execute(text(
+            "UPDATE trades SET user_id = :default_user_id WHERE user_id IS NULL"
+        ), {"default_user_id": DEFAULT_USER_ID})
+
+
+def _migrate_pending_order_attempts_user_id_column():
+    """
+    Idempotentes ADD COLUMN IF NOT EXISTS für pending_order_attempts.user_id
+    (siehe PendingOrderAttempt-Docstring) – analog zu
+    _migrate_trades_user_id_column, gleicher Backfill-Grund (Bestandszeilen
+    liefen ausnahmslos über Daniels Account).
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE pending_order_attempts ADD COLUMN IF NOT EXISTS user_id INTEGER"))
+        conn.execute(text(
+            "UPDATE pending_order_attempts SET user_id = :default_user_id WHERE user_id IS NULL"
+        ), {"default_user_id": DEFAULT_USER_ID})
+
+
 def _seed_saxo_token_from_env():
     """
     Einmaliger initialer Seed der saxo_tokens-Tabelle aus den .env-Werten
@@ -782,25 +864,33 @@ def get_session():
 # TRADE HELPER FUNKTIONEN
 # ─────────────────────────────────────────────
 
-def get_open_trades(session: Session) -> list[Trade]:
-    return session.query(Trade).filter_by(status="OPEN").all()
+def get_open_trades(session: Session, user_id: int = DEFAULT_USER_ID) -> list[Trade]:
+    """
+    user_id=DEFAULT_USER_ID (Daniel) als Default hält jeden bestehenden
+    Aufrufer (dashboard.py, trading_api.py, rule_engine.py, main.py-Snapshot-
+    Code) unverändert – nur main.py's Multi-Tenant-Handelsloop übergibt
+    explizit andere user_id-Werte (siehe DEFAULT_USER_ID-Docstring in config.py).
+    """
+    return session.query(Trade).filter_by(status="OPEN", user_id=user_id).all()
 
 
-def get_daily_trade_count(session: Session) -> int:
-    """Zählt Trades die heute eröffnet wurden."""
+def get_daily_trade_count(session: Session, user_id: int = DEFAULT_USER_ID) -> int:
+    """Zählt Trades die heute eröffnet wurden (siehe get_open_trades zum user_id-Default)."""
     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     return session.query(Trade).filter(
         Trade.created_at >= today_start,
+        Trade.user_id == user_id,
         Trade.status != "OPEN"  # Zählt auch bereits geschlossene des Tages
     ).count() + session.query(Trade).filter(
         Trade.created_at >= today_start,
+        Trade.user_id == user_id,
         Trade.status == "OPEN"
     ).count()
 
 
-def get_total_capital_in_trades(session: Session) -> float:
-    """Gesamtkapital aktuell in offenen Positionen gebunden."""
-    result = session.query(func.sum(Trade.capital_used)).filter_by(status="OPEN").scalar()
+def get_total_capital_in_trades(session: Session, user_id: int = DEFAULT_USER_ID) -> float:
+    """Gesamtkapital aktuell in offenen Positionen gebunden (siehe get_open_trades zum user_id-Default)."""
+    result = session.query(func.sum(Trade.capital_used)).filter_by(status="OPEN", user_id=user_id).scalar()
     return result or 0.0
 
 
@@ -811,19 +901,21 @@ def get_total_capital_in_trades(session: Session) -> float:
 CLOSED_STATUSES = ["CLOSED_SL", "CLOSED_TP", "CLOSED_TRAILING_SL", "CLOSED_TIME_EXIT", "CLOSED_TIME_EXIT_HARD_CAP", "CLOSED_MANUAL"]
 
 
-def get_total_pnl(session: Session) -> float:
-    """Gesamter realisierter P&L aller abgeschlossenen Trades."""
+def get_total_pnl(session: Session, user_id: int = DEFAULT_USER_ID) -> float:
+    """Gesamter realisierter P&L aller abgeschlossenen Trades (siehe get_open_trades zum user_id-Default)."""
     result = session.query(func.sum(Trade.pnl_usd)).filter(
-        Trade.status.in_(CLOSED_STATUSES)
+        Trade.status.in_(CLOSED_STATUSES),
+        Trade.user_id == user_id,
     ).scalar()
     return result or 0.0
 
 
-def get_daily_pnl(session: Session) -> float:
-    """Realisierter P&L der heute geschlossenen Trades (für das Daily-Loss-Limit)."""
+def get_daily_pnl(session: Session, user_id: int = DEFAULT_USER_ID) -> float:
+    """Realisierter P&L der heute geschlossenen Trades (für das Daily-Loss-Limit; siehe get_open_trades zum user_id-Default)."""
     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     result = session.query(func.sum(Trade.pnl_usd)).filter(
         Trade.status.in_(CLOSED_STATUSES),
+        Trade.user_id == user_id,
         Trade.closed_at >= today_start
     ).scalar()
     return result or 0.0
@@ -869,6 +961,14 @@ class PendingOrderAttempt(Base):
     ticker          = Column(String(10), nullable=False)
     client_order_id = Column(String(64), nullable=False, unique=True)
     status          = Column(String(20), nullable=False, default="PENDING")  # PENDING / FILLED / FAILED
+    # Multi-Tenant (2026-07-30): OHNE user_id würde ein PENDING-Eintrag von
+    # Nutzer A für TICKER fälschlich als "schon versucht" gelten, wenn Nutzer B
+    # im selben Zyklus denselben TICKER kauft (zwei komplett unabhängige
+    # Alpaca-Accounts!) – siehe broker._reconcile_pending_entry_attempt, das
+    # jetzt nach (ticker, user_id) statt nur ticker filtert. Nullable + Backfill
+    # auf DEFAULT_USER_ID wie bei trades.user_id (siehe
+    # _migrate_pending_order_attempts_user_id_column).
+    user_id         = Column(Integer, nullable=True)
 
 
 def get_saxo_token(session: Session):
@@ -1124,8 +1224,11 @@ def get_alpaca_api_for_user(user_id: int):
 
     Gibt None zurück, wenn kein Nutzer/keine Keys gefunden wurden – der
     Aufrufer (siehe broker._get_alpaca_client) fällt dann auf die globalen
-    .env-Keys zurück (Beta-Phase: Daniel als einziger aktiver Trader,
-    Multi-User-Trading kommt erst in Phase 2).
+    .env-Keys zurück. Seit dem Multi-Tenant-Handelsloop (2026-07-30, siehe
+    main.run_entry_cycle) ist das der reguläre Pfad für DEFAULT_USER_ID
+    (Daniel hat nie eigene Keys über den Connect-Flow hinterlegt) – für jeden
+    ANDEREN Nutzer in get_connected_alpaca_users() liefert diese Funktion
+    dagegen einen echten, eigenen Client.
     """
     with engine.connect() as conn:
         row = conn.execute(text(
@@ -1147,6 +1250,98 @@ def get_alpaca_api_for_user(user_id: int):
     except Exception as e:
         print(f"⚠️  Alpaca-Client für Nutzer {user_id} nicht verfügbar: {e}")
         return None
+
+
+def get_trade_mode_for_user(user_id: int) -> str:
+    """
+    "PAPER"/"LIVE" für trades.mode (Multi-Tenant-Handelsloop, 2026-07-30).
+    Bewusst NICHT einfach config.TRADING_MODE übernommen: das ist ein
+    globaler Schalter, der nur steuert OB überhaupt ein echter Alpaca-Call
+    versucht wird – WELCHES Alpaca-Environment (Paper- oder Live-Sandbox)
+    dabei tatsächlich angesprochen wird, hängt für jeden Nutzer AUSSER
+    DEFAULT_USER_ID von dessen eigenem pos_users.alpaca_mode ab (siehe
+    get_alpaca_api_for_user). Ohne diesen Resolver würde z.B. ein im Paper-
+    Modus verbundener Nutzer bei globalem TRADING_MODE=LIVE fälschlich mit
+    trades.mode='LIVE' geloggt, obwohl sein Trade nachweislich im Alpaca-
+    Sandbox ausgeführt wurde.
+    """
+    from config import TRADING_MODE
+
+    if user_id == DEFAULT_USER_ID:
+        return TRADING_MODE
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT alpaca_mode FROM pos_users WHERE id = :uid"
+        ), {"uid": user_id}).fetchone()
+    return (row[0] if row and row[0] else "paper").upper()
+
+
+def get_connected_alpaca_users() -> list[dict]:
+    """
+    Multi-Tenant-Handelsloop (2026-07-30, siehe main.run_entry_cycle): alle
+    Nutzer mit einem über den Connect-Flow hinterlegten eigenen Alpaca-Key
+    (trading_react: AlpacaOnboarding.tsx -> POST /api/user/alpaca-connect).
+    Rohes SQL wie get_alpaca_api_for_user() (pos_users "gehört" portfolio_os,
+    kein eigenes ORM-Modell hier). "Verbunden" heißt konkret
+    `alpaca_api_key_encrypted IS NOT NULL` – es gibt in pos_users KEINEN
+    status='connected'-Wert (status ist die Account-Freischaltung
+    pending/active/rejected, siehe portfolio_os; verifiziert 2026-07-30: aktuell
+    existiert nur 'active'). Zusätzlich auf status='active' gefiltert, damit ein
+    abgelehnter/noch nicht freigeschalteter Account nicht gehandelt wird, selbst
+    wenn dort (theoretisch) schon Keys hinterlegt wären.
+
+    Enthält potenziell auch DEFAULT_USER_ID, falls Daniel selbst irgendwann über
+    denselben Flow eigene Keys hinterlegt – der Aufrufer in main.py dedupliziert
+    das gegen die immer enthaltene DEFAULT_USER_ID.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT id, email, alpaca_mode FROM pos_users "
+            "WHERE alpaca_api_key_encrypted IS NOT NULL AND status = 'active'"
+        )).fetchall()
+    return [{"id": r[0], "email": r[1], "alpaca_mode": r[2] or "paper"} for r in rows]
+
+
+def get_user_live_config(user_id: int) -> dict:
+    """
+    Pro-Nutzer-Guardrail-Konfiguration für den Multi-Tenant-Handelsloop.
+    DEFAULT_USER_ID (Daniel) bekommt bewusst 1:1 config.get_live_config() –
+    dieselbe globale bot_config-Tabelle wie schon immer, damit /api/bot-config
+    und Einstellungen.tsx unverändert bleiben (keine zweite Quelle der
+    Wahrheit für den bereits existierenden Nutzer/UI).
+
+    Andere Nutzer lesen aus user_bot_config; fehlende Keys werden lazy mit
+    DEFAULT_USER_CONFIG geseedet (persistiert beim ersten Aufruf, damit ein
+    künftiges Pro-Nutzer-Einstellungen-UI dieselben Zeilen vorfindet/ändern
+    kann – nicht Teil dieses Auftrags, nur die Backend-Grundlage dafür).
+    Nicht-Guardrail-Keys (SL/TP, ATR-Parameter, Time-Exit etc.) werden IMMER
+    aus der globalen config.get_live_config() ergänzt (siehe UserBotConfig-
+    Docstring) – das zurückgegebene dict ist also immer vollständig nutzbar.
+    """
+    from config import get_live_config
+
+    cfg = get_live_config()  # Basis: globale, nicht-user-spezifische Werte
+
+    if user_id == DEFAULT_USER_ID:
+        return cfg
+
+    with get_session() as session:
+        rows = {r.key: r.value for r in session.query(UserBotConfig).filter_by(user_id=user_id).all()}
+        missing_keys = [k for k in DEFAULT_USER_CONFIG if k not in rows]
+        for key in missing_keys:
+            _cast, default_value = DEFAULT_USER_CONFIG[key]
+            rows[key] = str(default_value)
+            session.add(UserBotConfig(user_id=user_id, key=key, value=str(default_value)))
+        if missing_keys:
+            session.commit()
+
+    for key, (cast, fallback) in DEFAULT_USER_CONFIG.items():
+        raw = rows.get(key)
+        try:
+            cfg[key] = cast(raw) if raw is not None else fallback
+        except (ValueError, TypeError):
+            cfg[key] = fallback  # ungültiger DB-Wert -> Default statt globalem bot_config-Wert
+    return cfg
 
 
 if __name__ == "__main__":

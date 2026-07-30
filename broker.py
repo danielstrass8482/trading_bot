@@ -9,14 +9,15 @@ import pytz
 from datetime import datetime
 from config import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL,
-    TRADING_MODE, get_live_config
+    TRADING_MODE, get_live_config, DEFAULT_USER_ID,
 )
 from database import (
     get_session, Trade, get_open_trades,
     get_daily_trade_count, get_total_capital_in_trades,
     get_total_pnl, get_daily_pnl, close_trade, BotState,
     get_alpaca_api_for_user, PendingOrderAttempt,
-    get_active_entry_time_slots,
+    get_active_entry_time_slots, get_user_live_config,
+    get_trade_mode_for_user,
 )
 from rule_engine import SignalResult
 from broker_interface import BrokerInterface
@@ -107,25 +108,44 @@ def get_alpaca_account_snapshot(user_id: int = None) -> dict | None:
     }
 
 
-def check_guardrails(signal: SignalResult) -> None:
+def _user_pause_key(user_id: int) -> str:
     """
-    Prüft ALLE Guardrails vor Trade-Ausführung.
+    DEFAULT_USER_ID nutzt bewusst den EXISTIERENDEN globalen "bot_paused"-Key
+    (100% Verhaltens-Kompatibilität – ein Daily-Loss-Limit-Hit von Daniel
+    pausiert wie schon immer "den Bot"). Jeder andere Nutzer bekommt einen
+    eigenen Key, damit ein Verlustlimit-Hit bei EINEM Nutzer nicht alle
+    anderen mit-pausiert (siehe check_guardrails Punkt 5, AUFGABE 4-Prinzip
+    "ein Nutzer darf andere nicht beeinträchtigen" – gilt hier analog).
+    """
+    return "bot_paused" if user_id == DEFAULT_USER_ID else f"bot_paused_user_{user_id}"
+
+
+def check_guardrails(signal: SignalResult, user_id: int = DEFAULT_USER_ID) -> None:
+    """
+    Prüft ALLE Guardrails vor Trade-Ausführung, für EINEN Nutzer (Multi-Tenant-
+    Handelsloop, 2026-07-30). user_id=DEFAULT_USER_ID hält jeden bestehenden
+    Aufrufer unverändert (siehe config.DEFAULT_USER_ID-Docstring).
     Wirft GuardrailViolation wenn eine Regel verletzt wird.
     Diese Funktion kann NICHT durch LLM-Output beeinflusst werden.
     """
-    cfg = get_live_config()  # Guardrail-Limits aus DB (mit hardcoded Fallback)
+    # Für DEFAULT_USER_ID identisch zu vorher (globale bot_config-Tabelle);
+    # für andere Nutzer aus user_bot_config (siehe database.get_user_live_config).
+    cfg = get_user_live_config(user_id)
     with get_session() as session:
-        # 1. Bot pausiert?
+        # 0. Globaler Not-Aus (immer geprüft, unabhängig von user_id) UND
+        #    ggf. dieser Nutzer eigens pausiert (z.B. eigenes Tagesverlustlimit).
         if BotState.get(session, "bot_paused") == "true":
             raise GuardrailViolation("Bot ist manuell pausiert")
+        if user_id != DEFAULT_USER_ID and BotState.get(session, _user_pause_key(user_id)) == "true":
+            raise GuardrailViolation(f"Nutzer {user_id} ist pausiert (eigenes Tagesverlustlimit erreicht)")
 
         # 2. Tageslimit Trades
-        daily_count = get_daily_trade_count(session)
+        daily_count = get_daily_trade_count(session, user_id)
         if daily_count >= cfg["MAX_TRADES_PER_DAY"]:
             raise GuardrailViolation(f"Tageslimit erreicht ({daily_count}/{cfg['MAX_TRADES_PER_DAY']} Trades)")
 
         # 3. Max. offene Positionen
-        open_trades = get_open_trades(session)
+        open_trades = get_open_trades(session, user_id)
         if len(open_trades) >= cfg["MAX_OPEN_POSITIONS"]:
             raise GuardrailViolation(f"Max. offene Positionen erreicht ({len(open_trades)}/{cfg['MAX_OPEN_POSITIONS']})")
 
@@ -135,15 +155,38 @@ def check_guardrails(signal: SignalResult) -> None:
             raise GuardrailViolation(f"Position auf {signal.ticker} bereits offen")
 
         # 5. Tägliches Verlustlimit
-        daily_pnl = get_daily_pnl(session)
+        daily_pnl = get_daily_pnl(session, user_id)
         daily_loss_limit = cfg["MAX_CAPITAL_TOTAL"] * cfg["DAILY_LOSS_LIMIT_PCT"]
         if daily_pnl < 0 and abs(daily_pnl) >= daily_loss_limit:
-            BotState.set(session, "bot_paused", "true")
+            BotState.set(session, _user_pause_key(user_id), "true")
             session.commit()
             raise GuardrailViolation(
                 f"Tägliches Verlustlimit erreicht (${abs(daily_pnl):.2f} / ${daily_loss_limit:.2f}). "
-                f"Bot pausiert automatisch."
+                f"{'Bot' if user_id == DEFAULT_USER_ID else f'Nutzer {user_id}'} pausiert automatisch."
             )
+
+        # 6. AUFGABE 4 (2026-07-30): konfiguriertes Kapital-Limit vs. echtes
+        # Broker-Kapital. Redundant zur (primären) Prüfung in
+        # main.calculate_max_trades_today()/get_trades_for_slot() – die
+        # verhindert im Normalfall schon, dass place_trade() für einen so
+        # fehlkonfigurierten Nutzer überhaupt aufgerufen wird (erlaubt=0). Diese
+        # zweite, unabhängige Prüfung HIER (jeder place_trade()-Aufruf ruft
+        # check_guardrails() als allerersten Schritt) ist Verteidigung in der
+        # Tiefe: selbst falls place_trade() je direkt/ohne den Slot-Budget-Gate
+        # aufgerufen würde, darf ein Nutzer mit unrealistischem Limit trotzdem
+        # NIE einen Trade auslösen – KEINE Exception, die andere Nutzer
+        # beeinträchtigt (GuardrailViolation wird vom Aufrufer immer lokal pro
+        # Kandidat/Nutzer gefangen, siehe main.run_entry_cycle).
+        real_snapshot = get_alpaca_account_snapshot(user_id)
+        if real_snapshot is not None:
+            invested = get_total_capital_in_trades(session, user_id)
+            real_total_capital = real_snapshot["cash"] + invested
+            if cfg["MAX_CAPITAL_TOTAL"] > real_total_capital:
+                raise GuardrailViolation(
+                    f"Nutzer {user_id}: konfiguriertes Limit übersteigt echtes Kapital "
+                    f"(konfiguriert: ${cfg['MAX_CAPITAL_TOTAL']:.2f}, echt: ${real_total_capital:.2f}), "
+                    f"Kandidat übersprungen"
+                )
 
 
 MIN_ORDER_USD = 1.00  # Mindestorder bei Fractional Shares (Alpaca-Minimum)
@@ -161,7 +204,7 @@ def calculate_quantity(price: float, max_capital: float = None) -> float:
     return round(qty, 6)
 
 
-def _submit_order_idempotent(client, ticker: str, **submit_kwargs):
+def _submit_order_idempotent(client, ticker: str, user_id: int = DEFAULT_USER_ID, **submit_kwargs):
     """
     Idempotenz-Schutz (Aufgabe 1, 2026-07-30): platziert eine Alpaca-Order mit
     einer selbst generierten client_order_id (NICHT vom Broker vergeben,
@@ -177,11 +220,15 @@ def _submit_order_idempotent(client, ticker: str, **submit_kwargs):
 
     Gibt (order, client_order_id) zurück oder wirft die ursprüngliche
     Exception weiter, falls die Order nachweislich nie angekommen ist
-    (dann ist ein neuer Versuch mit neuer ID sicher).
+    (dann ist ein neuer Versuch mit neuer ID sicher). user_id (Multi-Tenant,
+    2026-07-30) wird auf den PendingOrderAttempt-Eintrag geschrieben, damit
+    zwei Nutzer, die im selben Zyklus denselben Ticker kaufen, sich nicht
+    gegenseitig über pending_order_attempts blockieren (siehe
+    _reconcile_pending_entry_attempt).
     """
     client_order_id = str(uuid.uuid4())
     with get_session() as session:
-        session.add(PendingOrderAttempt(ticker=ticker, client_order_id=client_order_id))
+        session.add(PendingOrderAttempt(ticker=ticker, client_order_id=client_order_id, user_id=user_id))
         session.commit()
 
     def _resolve(status: str):
@@ -212,12 +259,16 @@ def _submit_order_idempotent(client, ticker: str, **submit_kwargs):
             raise e
 
 
-def _reconcile_pending_entry_attempt(client, ticker: str):
+def _reconcile_pending_entry_attempt(client, ticker: str, user_id: int = DEFAULT_USER_ID):
     """
     Wird VOR jedem neuen Entry-Versuch für `ticker` aufgerufen (Aufgabe 1):
     prüft, ob ein vorheriger, durch einen Prozess-Absturz o.ä. unterbrochener
     Order-Versuch für denselben Ticker noch als PENDING in der DB steht, und
     klärt ihn zuerst, statt blind einen neuen Kauf zu starten.
+
+    Nach (ticker, user_id) gefiltert (Multi-Tenant, 2026-07-30) – sonst würde
+    ein PENDING-Eintrag von Nutzer A hier fälschlich Nutzer Bs (komplett
+    unabhängiger Alpaca-Account!) Kaufversuch für denselben Ticker blockieren.
 
     Gibt die existierende Alpaca-Order zurück, falls der alte Versuch
     tatsächlich durchging (Aufrufer darf dann KEINEN neuen Kauf platzieren),
@@ -227,7 +278,7 @@ def _reconcile_pending_entry_attempt(client, ticker: str):
     with get_session() as session:
         pending = (
             session.query(PendingOrderAttempt)
-            .filter_by(ticker=ticker, status="PENDING")
+            .filter_by(ticker=ticker, status="PENDING", user_id=user_id)
             .order_by(PendingOrderAttempt.created_at.desc())
             .first()
         )
@@ -261,16 +312,18 @@ def _reconcile_pending_entry_attempt(client, ticker: str):
     return existing
 
 
-def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
+def place_trade(signal: SignalResult, llm_result: dict, user_id: int = DEFAULT_USER_ID) -> Trade | None:
     """
-    Führt Trade aus (Paper oder Live).
-    1. Guardrails prüfen
+    Führt Trade aus (Paper oder Live), für EINEN Nutzer (Multi-Tenant-
+    Handelsloop, 2026-07-30). user_id=DEFAULT_USER_ID hält jeden bestehenden
+    Aufrufer unverändert (siehe config.DEFAULT_USER_ID-Docstring).
+    1. Guardrails prüfen (inkl. echtem Kapital-Check, siehe unten)
     2. Order bei Alpaca platzieren (oder Paper-Simulation)
-    3. Trade in DB loggen
+    3. Trade in DB loggen (mit user_id)
     Gibt Trade-Objekt zurück oder None bei Fehler.
     """
     # Guardrails zuerst – keine Ausnahmen
-    check_guardrails(signal)  # Wirft GuardrailViolation bei Verstoß
+    check_guardrails(signal, user_id)  # Wirft GuardrailViolation bei Verstoß
 
     # Sicherheitsnetz: die eigentliche Order-Platzierung unten spricht aus-
     # schließlich die Alpaca-API an – IBKR-Order-Routing ist (noch) nicht
@@ -278,13 +331,31 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
     # siehe broker.get_broker). Wäre ACTIVE_BROKER="ibkr" hier folgenlos, würde
     # der Trade fälschlich als "ibkr" geloggt, obwohl tatsächlich Alpaca (Live-
     # Geld!) gehandelt hat – daher lieber gar kein Trade als eine falsche
-    # Broker-Zuordnung im Log.
+    # Broker-Zuordnung im Log. ACTIVE_BROKER bleibt bewusst GLOBAL (Broker-Wahl
+    # fürs gesamte Deployment, kein Teil dieses Auftrags als Pro-Nutzer-Einstellung).
     active_broker = get_live_config().get("ACTIVE_BROKER", "alpaca")
     if active_broker != "alpaca":
         print(f"❌ ACTIVE_BROKER='{active_broker}', aber Order-Routing ist aktuell nur für Alpaca implementiert – Trade übersprungen.")
         return None
 
-    quantity = calculate_quantity(signal.current_price)
+    # AUFGABE 4 (2026-07-30): echtes, gerade jetzt verfügbares Kapital dieses
+    # Nutzers als harte Obergrenze für die Positionsgröße – zusätzlich zum
+    # bereits in calculate_max_trades_today() eingerechneten Cash-Limit (das
+    # bestimmt nur OB dieser Slot für diesen Nutzer noch Budget hat, nicht wie
+    # viel EXAKT für DIESEN einen Kandidaten noch übrig ist, falls der Nutzer
+    # innerhalb desselben Zyklus bereits andere Kandidaten gekauft hat).
+    user_cfg = get_user_live_config(user_id)
+    max_capital_per_trade = user_cfg["MAX_CAPITAL_PER_TRADE"]
+    real_snapshot = get_alpaca_account_snapshot(user_id)
+    if real_snapshot is not None:
+        max_capital_per_trade = min(max_capital_per_trade, real_snapshot["cash"])
+
+    quantity = calculate_quantity(signal.current_price, max_capital_per_trade)
+    if quantity <= 0:
+        real_cash_label = "unbekannt" if real_snapshot is None else f"${real_snapshot['cash']:.2f}"
+        print(f"❌ Nutzer {user_id}: {signal.ticker} übersprungen – kein Kapital für auch nur eine Bruchteil-Aktie "
+              f"(echtes verfügbares Kapital: {real_cash_label}).")
+        return None
 
     # Ganze Aktie möglich → broker-seitige Bracket-Order (echter SL/TP-Schutz
     # auch über Nacht/Wochenende). Bruchteil → weiterhin Simple Order, da
@@ -315,10 +386,18 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
     entry_price = signal.current_price
 
     # ── LIVE TRADING via Alpaca ─────────────────────────────────────
+    # TRADING_MODE bleibt global (steuert nur OB überhaupt echte API-Calls
+    # versucht werden) – OB dabei echtes Geld bewegt wird, entscheidet einzig
+    # die base_url DIESES Nutzer-Clients (get_alpaca_api_for_user() baut sie
+    # aus pos_users.alpaca_mode: "paper" -> paper-api.alpaca.markets, "live"
+    # -> api.alpaca.markets). Ein per Connect-Flow im Paper-Modus verbundener
+    # Nutzer landet also selbst bei globalem TRADING_MODE=LIVE sicher im
+    # Alpaca-Sandbox, nicht auf echtem Geld – nur DEFAULT_USER_IDs Fallback
+    # auf die .env-Keys spricht tatsächlich das reale Live-Konto an.
     if TRADING_MODE == "LIVE":
-        client = _get_alpaca_client()
+        client = _get_alpaca_client(user_id)
         if not client:
-            print("❌ Live Trade abgebrochen: Alpaca nicht verfügbar")
+            print(f"❌ Nutzer {user_id}: Live Trade abgebrochen: Alpaca nicht verfügbar")
             return None
 
         # Idempotenz-Schutz (Aufgabe 1, 2026-07-30): bevor ein NEUER Kauf
@@ -326,7 +405,7 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
         # o.ä. unterbrochener Entry-Versuch für denselben Ticker noch offen
         # ist – sonst könnte ein Retry nach einem unklaren Timeout versehent-
         # lich zu einer zweiten echten Position führen.
-        existing_order = _reconcile_pending_entry_attempt(client, signal.ticker)
+        existing_order = _reconcile_pending_entry_attempt(client, signal.ticker, user_id)
         if existing_order is not None:
             order = existing_order
             print(f"ℹ️  {signal.ticker}: nutze bereits bestehende Order aus vorherigem Versuch statt neu zu kaufen.")
@@ -334,7 +413,7 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
             try:
                 if is_whole_share:
                     order, _coid = _submit_order_idempotent(
-                        client, signal.ticker,
+                        client, signal.ticker, user_id,
                         symbol=signal.ticker,
                         qty=int(quantity),
                         side="buy",
@@ -347,7 +426,7 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
                     print(f"✅ LIVE Bracket-Order platziert: {int(quantity)}x {signal.ticker} SL: ${sl_price} TP: ${tp_price}")
                 else:
                     order, _coid = _submit_order_idempotent(
-                        client, signal.ticker,
+                        client, signal.ticker, user_id,
                         symbol=signal.ticker,
                         qty=quantity,
                         side="buy",
@@ -416,9 +495,10 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
         llm_summary     = llm_result.get("summary"),
         llm_risks       = _json.dumps(llm_result.get("risks", []), ensure_ascii=False),
         status          = "OPEN",
-        mode            = TRADING_MODE,
+        mode            = get_trade_mode_for_user(user_id),
         broker          = active_broker,
         sector          = signal.sector,
+        user_id         = user_id,
     )
     trade.set_score_breakdown(signal.score_breakdown)
 
@@ -470,8 +550,15 @@ def _sell_position_at_alpaca(session, trade: Trade, exit_reason: str, fallback_p
     nicht mehr (z.B. weil eine broker-seitige Bracket-Order sie bei ganzen
     Aktien bereits geschlossen hat), gilt sie als bereits geschlossen und
     `fallback_price` (aktueller Kurs) wird zurückgegeben.
+
+    Multi-Tenant (2026-07-30): nutzt trade.user_id (statt eines eigenen
+    Parameters) für den passenden Alpaca-Client UND für die
+    PendingOrderAttempt-Zuordnung – jede Trade-Zeile trägt bereits ihren
+    Besitzer, ein zusätzlicher Parameter wäre eine redundante zweite Quelle
+    der Wahrheit, die auseinanderlaufen könnte.
     """
     ticker = trade.ticker
+    user_id = trade.user_id if trade.user_id is not None else DEFAULT_USER_ID
 
     def _reset_pending():
         trade.status_detail = None
@@ -488,7 +575,7 @@ def _sell_position_at_alpaca(session, trade: Trade, exit_reason: str, fallback_p
         _reset_pending()  # Paper-Modus: kein echter Broker involviert, State Machine nicht nötig
         return fallback_price
 
-    client = _get_alpaca_client()
+    client = _get_alpaca_client(user_id)
     if not client:
         print(f"⚠️  {ticker}: Alpaca-Client nicht verfügbar – Verkauf übersprungen, Trade bleibt OPEN.")
         _reset_pending()
@@ -517,7 +604,7 @@ def _sell_position_at_alpaca(session, trade: Trade, exit_reason: str, fallback_p
 
     try:
         order, client_order_id = _submit_order_idempotent(
-            client, ticker, symbol=ticker, qty=qty, side="sell", type="market", time_in_force="day",
+            client, ticker, user_id, symbol=ticker, qty=qty, side="sell", type="market", time_in_force="day",
         )
         trade.pending_client_order_id = client_order_id
         session.commit()
@@ -562,8 +649,11 @@ def _reconcile_pending_exit(session, trade: Trade):
     konnte. Trifft hier bewusst KEINE neue Exit-Entscheidung (kein erneutes
     SL/TP/Trailing/Time-Exit-Check) – sonst könnte ein zweiter, unabhängiger
     Verkauf ausgelöst werden, während der erste ggf. längst gefüllt ist.
+    Multi-Tenant (2026-07-30): nutzt trade.user_id für den passenden Client
+    (siehe _sell_position_at_alpaca).
     """
     ticker = trade.ticker
+    user_id = trade.user_id if trade.user_id is not None else DEFAULT_USER_ID
 
     if trade.status_detail == "EXIT_REQUESTED" and not trade.pending_client_order_id:
         # Entscheidung wurde dokumentiert, aber der Order-Request selbst kam
@@ -577,7 +667,7 @@ def _reconcile_pending_exit(session, trade: Trade):
         return
 
     client_order_id = trade.pending_client_order_id
-    client = _get_alpaca_client()
+    client = _get_alpaca_client(user_id)
     if not client:
         print(f"⚠️  {ticker}: Reconciliation übersprungen – Alpaca-Client nicht verfügbar.")
         return
@@ -612,12 +702,17 @@ def _reconcile_pending_exit(session, trade: Trade):
               f"keine neue Aktion in diesem Zyklus.")
 
 
-def check_position_consistency():
+def check_position_consistency(user_id: int = DEFAULT_USER_ID):
     """
     Positions-Konsistenz-Watchdog (Aufgabe 3, 2026-07-30): vergleicht JEDE
     DB-Position mit status=OPEN gegen die tatsächlich bei Alpaca offenen
     Positionen (GET /v2/positions via client.list_positions()) – unabhängig
     vom sonstigen SL/TP-Software-Monitoring in monitor_open_positions().
+    Multi-Tenant (2026-07-30): pro Nutzer aufzurufen (main.run_entry_cycle
+    ruft sie einmal je verbundenem Nutzer), da sowohl der Alpaca-Client als
+    auch die DB-Vergleichsbasis (get_open_trades/Trade-Query) strikt an
+    user_id gebunden sind – sonst würde z.B. Nutzer As Live-Position gegen
+    Nutzer Bs DB-Trade-Historie für denselben Ticker verglichen.
     Bewusst eine eigenständige Funktion (nicht mit monitor_open_positions()
     vermischt), analog zu check_stop_order_health() im Saxo-Bot, aber
     allgemeiner: hier geht es um reine Positions-EXISTENZ, nicht um
@@ -645,21 +740,21 @@ def check_position_consistency():
     """
     from datetime import timedelta
 
-    client = _get_alpaca_client()
+    client = _get_alpaca_client(user_id)
     if not client:
-        print("⚠️  Positions-Konsistenz-Check: Alpaca-Client nicht verfügbar, übersprungen.")
+        print(f"⚠️  Positions-Konsistenz-Check (Nutzer {user_id}): Alpaca-Client nicht verfügbar, übersprungen.")
         return
 
     try:
         live_positions = client.list_positions()
     except Exception as e:
-        print(f"⚠️  Positions-Konsistenz-Check: Alpaca-Positionsabfrage fehlgeschlagen: {e} – Check übersprungen.")
+        print(f"⚠️  Positions-Konsistenz-Check (Nutzer {user_id}): Alpaca-Positionsabfrage fehlgeschlagen: {e} – Check übersprungen.")
         return
 
     problems = []
 
     with get_session() as session:
-        open_trades = get_open_trades(session)
+        open_trades = get_open_trades(session, user_id)
         live_tickers = {p.symbol for p in live_positions}
         missing = [t for t in open_trades if t.ticker not in live_tickers]
         if missing:
@@ -678,7 +773,7 @@ def check_position_consistency():
             ticker = pos.symbol
             latest_trade = (
                 session.query(Trade)
-                .filter_by(ticker=ticker, broker="alpaca")
+                .filter_by(ticker=ticker, broker="alpaca", user_id=user_id)
                 .order_by(Trade.id.desc())
                 .first()
             )
@@ -697,16 +792,17 @@ def check_position_consistency():
                 "Fill übernommen hat. Bitte manuell prüfen und ggf. Order-Status bei Alpaca nachschlagen."
             )
 
+    user_label = "Alpaca" if user_id == DEFAULT_USER_ID else f"Alpaca, Nutzer {user_id}"
     if problems:
         msg = "\n\n".join(problems)
-        print(f"🚨 Positions-Konsistenz-Watchdog (Alpaca): {msg}")
-        send_email(subject="🚨 Positions-Konsistenz-Warnung (Alpaca)", body=msg)
+        print(f"🚨 Positions-Konsistenz-Watchdog ({user_label}): {msg}")
+        send_email(subject=f"🚨 Positions-Konsistenz-Warnung ({user_label})", body=msg)
     else:
-        print(f"✅ Positions-Konsistenz-Check (Alpaca): alle {len(open_trades)} offene(n) DB-Position(en) "
+        print(f"✅ Positions-Konsistenz-Check ({user_label}): alle {len(open_trades)} offene(n) DB-Position(en) "
               f"und {len(live_positions)} Alpaca-Live-Position(en) konsistent.")
 
 
-def _time_exit_currently_allowed(session) -> bool:
+def _time_exit_currently_allowed(session, user_id: int = DEFAULT_USER_ID) -> bool:
     """
     Guard für Time-Exit-Verkäufe (Aufgabe 2026-07-30, Incident UNH/AMZN/PSQ):
     days_held >= max_days sagt nichts darüber aus, ob der Markt gerade offen
@@ -720,8 +816,14 @@ def _time_exit_currently_allowed(session) -> bool:
     Volatilitäts-Puffer, den Entries bereits nutzen –, damit ein Time-Exit
     nicht direkt in der volatilen ersten Handelsminute feuert. SL/TP/Trailing
     sind von diesem Guard NICHT betroffen und bleiben sofort-reagierend.
+
+    user_id (Multi-Tenant, 2026-07-30) bestimmt nur, WESSEN Client für den
+    Markt-Uhr-Abruf genutzt wird (NYSE-Handelszeiten sind objektiv identisch
+    für alle Nutzer) – schlägt genau dieser Client fehl, wird der Time-Exit
+    für DIESEN Nutzer in diesem Zyklus ausgesetzt, statt einen anderen
+    Nutzer-Client als Fallback zu missbrauchen.
     """
-    client = _get_alpaca_client()
+    client = _get_alpaca_client(user_id)
     if not client:
         return False
     try:
@@ -742,9 +844,16 @@ def _time_exit_currently_allowed(session) -> bool:
     return (now_et.hour, now_et.minute) >= (buffer_hour, buffer_minute)
 
 
-def monitor_open_positions():
+def monitor_open_positions(user_id: int = DEFAULT_USER_ID):
     """
-    Prüft alle offenen Positionen gegen aktuelle Preise.
+    Prüft alle offenen Positionen EINES Nutzers gegen aktuelle Preise (Multi-
+    Tenant, 2026-07-30 – main.run_monitoring_cycle ruft dies einmal je
+    verbundenem Nutzer auf; user_id=DEFAULT_USER_ID hält den bisherigen
+    Single-User-Aufrufer unverändert). SL/TP/Trailing/Time-Exit-Parameter
+    (MAX_HOLDING_DAYS, ATR-Multiplikatoren etc.) bleiben bewusst GLOBAL aus
+    get_live_config() für alle Nutzer gleich (siehe UserBotConfig-Docstring
+    in database.py) – nur WELCHE Positionen/welcher Broker-Client betroffen
+    sind, ist pro Nutzer getrennt.
     - Time-based Exit: Ohne aktiven Trailing-SL wird die Position nach
       MAX_HOLDING_DAYS Handelstagen geschlossen (CLOSED_TIME_EXIT). Mit
       aktivem Trailing-SL wird der Time-Exit ausgesetzt (der Trade läuft
@@ -792,16 +901,17 @@ def monitor_open_positions():
         return reference_price * 0.03
 
     with get_session() as session:
-        open_trades = get_open_trades(session)
+        open_trades = get_open_trades(session, user_id)
         if not open_trades:
             return
 
-        print(f"👁️  Monitoring {len(open_trades)} offene Position(en)...")
+        user_label = "" if user_id == DEFAULT_USER_ID else f" (Nutzer {user_id})"
+        print(f"👁️  Monitoring {len(open_trades)} offene Position(en){user_label}...")
 
         # Einmal pro Zyklus geprüft (nicht pro Trade) – Guard siehe
         # _time_exit_currently_allowed(). Betrifft NUR Time-Exit, SL/TP/
         # Trailing unten bleiben unverändert sofort-reagierend.
-        time_exit_allowed = _time_exit_currently_allowed(session)
+        time_exit_allowed = _time_exit_currently_allowed(session, user_id)
 
         for trade in open_trades:
             try:
@@ -918,14 +1028,16 @@ def monitor_open_positions():
         session.commit()
 
 
-def get_portfolio_value() -> float:
+def get_portfolio_value(user_id: int = DEFAULT_USER_ID) -> float:
     """
-    Berechnet aktuellen Portfolio-Wert:
+    Berechnet aktuellen Portfolio-Wert für EINEN Nutzer:
     Startkapital + realisierter P&L + unrealisierter P&L offener Positionen.
+    user_id=DEFAULT_USER_ID hält jeden bestehenden Aufrufer (Dashboard/API)
+    unverändert (siehe config.DEFAULT_USER_ID-Docstring).
     """
     with get_session() as session:
-        realized_pnl = get_total_pnl(session)
-        open_trades = get_open_trades(session)
+        realized_pnl = get_total_pnl(session, user_id)
+        open_trades = get_open_trades(session, user_id)
 
         unrealized_pnl = 0.0
         for trade in open_trades:
@@ -936,7 +1048,7 @@ def get_portfolio_value() -> float:
             except Exception:
                 pass  # Unrealisiert ≈ 0 wenn Preis nicht abrufbar
 
-        max_capital_total = get_live_config()["MAX_CAPITAL_TOTAL"]
+        max_capital_total = get_user_live_config(user_id)["MAX_CAPITAL_TOTAL"]
         return round(max_capital_total + realized_pnl + unrealized_pnl, 2)
 
 
