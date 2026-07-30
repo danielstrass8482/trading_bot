@@ -10,6 +10,7 @@ import math
 import smtplib
 import base64
 from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
 import pytz
 from sqlalchemy import text
 
@@ -72,6 +73,8 @@ def send_email(subject: str, body: str):
     msg["Subject"] = subject
     msg["From"] = SMTP_USER
     msg["To"] = ALERT_EMAIL
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid()
 
     try:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
