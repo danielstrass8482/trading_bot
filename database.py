@@ -143,6 +143,34 @@ class Trade(Base):
     highest_price_since_entry  = Column(Float, nullable=True)    # höchster beobachteter Kurs seit Entry (Basis für Trailing SL)
     broker                     = Column(String(20), default="alpaca")  # "alpaca" / "ibkr" (siehe broker.place_trade)
 
+    # ── State Machine für Exit-Übergänge (Aufgabe 2, 2026-07-30) ──────────
+    # Additiv neben `status` (das weiterhin nur den TERMINALEN Zustand trägt:
+    # OPEN oder ein CLOSED_*-Grund) – status_detail beschreibt den Zwischen-
+    # zustand WÄHREND status noch "OPEN" ist, solange ein Exit in Arbeit ist:
+    #   None -> EXIT_REQUESTED -> WAITING_FILL -> (close_trade() setzt
+    #   status auf CLOSED_* und status_detail zurück auf None)
+    # monitor_open_positions() darf für eine Position NUR dann eine NEUE
+    # Exit-Entscheidung (SL/TP/Trailing/Time-Exit) treffen, wenn status_detail
+    # None ist – das verhindert, dass z.B. TP-Erkennung und Time-Exit im
+    # selben oder einem überlappenden Zyklus beide einen Verkauf auslösen
+    # (Doppelorder-Risiko). Liegt status_detail bereits auf EXIT_REQUESTED/
+    # WAITING_FILL (z.B. weil der Prozess zwischen Entscheidung und Bestätigung
+    # abgestürzt ist), wird stattdessen zuerst per _reconcile_pending_exit()
+    # geklärt, was aus dem vorherigen Versuch wurde.
+    status_detail        = Column(String(20), nullable=True)
+    # Eigene, vom Bot generierte Order-ID (Aufgabe 1, siehe broker._submit_order_idempotent)
+    # für den AKTUELL laufenden Exit-Versuch dieser Position – Alpaca nimmt
+    # eine Order mit derselben client_order_id garantiert nur einmal an, ein
+    # verunglückter Retry nach Timeout kann darüber sicher nachgeprüft werden
+    # statt blind ein zweites Mal zu verkaufen.
+    pending_client_order_id = Column(String(64), nullable=True)
+    # Welcher Exit-Grund wurde entschieden, BEVOR die Order abgeschickt wurde
+    # (CLOSED_SL/CLOSED_TP/CLOSED_TRAILING_SL/CLOSED_TIME_EXIT/...) – wird von
+    # close_trade() als `reason` verwendet, sobald der Fill bestätigt ist,
+    # damit der ursprüngliche Auslöser auch nach einem Prozess-Neustart
+    # zwischen Entscheidung und Bestätigung erhalten bleibt.
+    pending_exit_reason     = Column(String(30), nullable=True)
+
     def get_llm_risks(self) -> list:
         """Deserialisiert llm_risks JSON-String zu Liste."""
         if self.llm_risks:
@@ -752,7 +780,39 @@ def close_trade(session: Session, trade: Trade, exit_price: float, reason: str) 
     trade.status     = reason  # z.B. CLOSED_SL / CLOSED_TP / CLOSED_TRAILING_SL / CLOSED_TIME_EXIT / CLOSED_TIME_EXIT_HARD_CAP / CLOSED_MANUAL
     trade.pnl_usd    = (exit_price - trade.entry_price) * trade.quantity
     trade.pnl_pct    = (exit_price - trade.entry_price) / trade.entry_price * 100
+    # State-Machine-Finalisierung (Aufgabe 2): der Exit ist jetzt bestätigt
+    # abgeschlossen, das Zwischenzustands-Tracking wird nicht mehr gebraucht.
+    trade.status_detail = None
+    trade.pending_client_order_id = None
+    trade.pending_exit_reason = None
     return trade
+
+
+class PendingOrderAttempt(Base):
+    """
+    Idempotenz-Schutz für ENTRY-Orders (Aufgabe 1, 2026-07-30). Für Exit/Stop-
+    Replace lebt dasselbe Tracking direkt auf der Trade-Zeile (siehe
+    Trade.status_detail/pending_client_order_id) – für einen Entry gibt es
+    aber zum Zeitpunkt des Order-Versuchs noch KEINE Trade-Zeile (die wird
+    erst nach bestätigtem Fill angelegt), daher diese eigene, schlanke Tabelle
+    nur für diesen einen Fall.
+
+    Wird VOR jedem Alpaca-Order-Request angelegt (status=PENDING), mit einer
+    vom Bot selbst generierten client_order_id – Alpaca nimmt eine Order mit
+    bereits verwendeter client_order_id garantiert nur einmal an. Schlägt der
+    Request durch Timeout/Netzwerkfehler unklar fehl, kann der nächste
+    place_trade()-Aufruf für denselben Ticker per get_order_by_client_order_id()
+    nachschauen, ob die alte Order trotzdem angenommen wurde, statt blind ein
+    zweites Mal zu kaufen (siehe broker.place_trade).
+    """
+    __tablename__ = "pending_order_attempts"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    created_at      = Column(DateTime, default=datetime.utcnow)
+    resolved_at     = Column(DateTime, nullable=True)
+    ticker          = Column(String(10), nullable=False)
+    client_order_id = Column(String(64), nullable=False, unique=True)
+    status          = Column(String(20), nullable=False, default="PENDING")  # PENDING / FILLED / FAILED
 
 
 def get_saxo_token(session: Session):

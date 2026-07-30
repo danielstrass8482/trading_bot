@@ -4,6 +4,7 @@ Identische Schnittstelle für beide Modi – nur die URL ändert sich.
 """
 
 import os
+import uuid
 from datetime import datetime
 from config import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL,
@@ -13,7 +14,7 @@ from database import (
     get_session, Trade, get_open_trades,
     get_daily_trade_count, get_total_capital_in_trades,
     get_total_pnl, get_daily_pnl, close_trade, BotState,
-    get_alpaca_api_for_user,
+    get_alpaca_api_for_user, PendingOrderAttempt,
 )
 from rule_engine import SignalResult
 from broker_interface import BrokerInterface
@@ -158,6 +159,106 @@ def calculate_quantity(price: float, max_capital: float = None) -> float:
     return round(qty, 6)
 
 
+def _submit_order_idempotent(client, ticker: str, **submit_kwargs):
+    """
+    Idempotenz-Schutz (Aufgabe 1, 2026-07-30): platziert eine Alpaca-Order mit
+    einer selbst generierten client_order_id (NICHT vom Broker vergeben,
+    sondern VOR dem Request erzeugt) – Alpaca garantiert, dass eine Order mit
+    bereits verwendeter client_order_id nur EINMAL angenommen wird.
+
+    Schlägt submit_order() durch Timeout/Netzwerkfehler unklar fehl (kam die
+    Order an oder nicht?), wird NICHT blind als Fehlschlag behandelt: per
+    get_order_by_client_order_id() wird nachgeprüft, ob Alpaca die Order
+    trotzdem angenommen hat. Existiert sie bereits, wird DIESE Order
+    zurückgegeben statt eines zweiten Versuchs – verhindert Doppelkauf/
+    -verkauf bei einem Retry über einen unklaren Fehler hinweg.
+
+    Gibt (order, client_order_id) zurück oder wirft die ursprüngliche
+    Exception weiter, falls die Order nachweislich nie angekommen ist
+    (dann ist ein neuer Versuch mit neuer ID sicher).
+    """
+    client_order_id = str(uuid.uuid4())
+    with get_session() as session:
+        session.add(PendingOrderAttempt(ticker=ticker, client_order_id=client_order_id))
+        session.commit()
+
+    def _resolve(status: str):
+        with get_session() as session:
+            row = session.query(PendingOrderAttempt).filter_by(client_order_id=client_order_id).first()
+            if row:
+                row.status = status
+                row.resolved_at = datetime.utcnow()
+                session.commit()
+
+    try:
+        order = client.submit_order(client_order_id=client_order_id, **submit_kwargs)
+        _resolve("FILLED")
+        return order, client_order_id
+    except Exception as e:
+        print(f"⚠️  {ticker}: Order-Submit unklar fehlgeschlagen ({e}) – prüfe bei Alpaca nach, "
+              f"ob sie trotzdem angenommen wurde, bevor ein zweiter Versuch startet...")
+        try:
+            existing = client.get_order_by_client_order_id(client_order_id)
+            print(f"ℹ️  {ticker}: Order {client_order_id} EXISTIERT bei Alpaca trotz Fehler "
+                  f"(Status: {existing.status}) – kein Doppel-Versuch, nutze diese Order.")
+            _resolve("FILLED")
+            return existing, client_order_id
+        except Exception:
+            print(f"✅ {ticker}: Order {client_order_id} existiert NICHT bei Alpaca – Request ist "
+                  f"nachweislich nie angekommen, ein neuer Versuch ist sicher.")
+            _resolve("FAILED")
+            raise e
+
+
+def _reconcile_pending_entry_attempt(client, ticker: str):
+    """
+    Wird VOR jedem neuen Entry-Versuch für `ticker` aufgerufen (Aufgabe 1):
+    prüft, ob ein vorheriger, durch einen Prozess-Absturz o.ä. unterbrochener
+    Order-Versuch für denselben Ticker noch als PENDING in der DB steht, und
+    klärt ihn zuerst, statt blind einen neuen Kauf zu starten.
+
+    Gibt die existierende Alpaca-Order zurück, falls der alte Versuch
+    tatsächlich durchging (Aufrufer darf dann KEINEN neuen Kauf platzieren),
+    sonst None (alter Versuch war nachweislich fehlgeschlagen oder es gab
+    keinen offenen Versuch – sicher, normal fortzufahren).
+    """
+    with get_session() as session:
+        pending = (
+            session.query(PendingOrderAttempt)
+            .filter_by(ticker=ticker, status="PENDING")
+            .order_by(PendingOrderAttempt.created_at.desc())
+            .first()
+        )
+        if not pending:
+            return None
+        client_order_id = pending.client_order_id
+
+    print(f"🔎 {ticker}: Ein vorheriger Entry-Order-Versuch ({client_order_id}) war noch ungeklärt "
+          f"(PENDING) – prüfe bei Alpaca nach, bevor ein neuer Versuch startet.")
+    try:
+        existing = client.get_order_by_client_order_id(client_order_id)
+    except Exception:
+        print(f"✅ {ticker}: Alter Versuch {client_order_id} existiert NICHT bei Alpaca – "
+              f"nie angekommen, sicher für einen neuen Versuch.")
+        with get_session() as session:
+            row = session.query(PendingOrderAttempt).filter_by(client_order_id=client_order_id).first()
+            if row:
+                row.status = "FAILED"
+                row.resolved_at = datetime.utcnow()
+                session.commit()
+        return None
+
+    print(f"ℹ️  {ticker}: Alter Versuch {client_order_id} EXISTIERT bei Alpaca (Status: {existing.status}) "
+          f"– kein neuer Kauf, alter Versuch wird stattdessen übernommen.")
+    with get_session() as session:
+        row = session.query(PendingOrderAttempt).filter_by(client_order_id=client_order_id).first()
+        if row:
+            row.status = "FILLED"
+            row.resolved_at = datetime.utcnow()
+            session.commit()
+    return existing
+
+
 def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
     """
     Führt Trade aus (Paper oder Live).
@@ -217,31 +318,44 @@ def place_trade(signal: SignalResult, llm_result: dict) -> Trade | None:
         if not client:
             print("❌ Live Trade abgebrochen: Alpaca nicht verfügbar")
             return None
-        try:
-            if is_whole_share:
-                order = client.submit_order(
-                    symbol=signal.ticker,
-                    qty=int(quantity),
-                    side="buy",
-                    type="market",
-                    time_in_force="day",
-                    order_class="bracket",
-                    stop_loss={"stop_price": sl_price},
-                    take_profit={"limit_price": tp_price},
-                )
-                print(f"✅ LIVE Bracket-Order platziert: {int(quantity)}x {signal.ticker} SL: ${sl_price} TP: ${tp_price}")
-            else:
-                order = client.submit_order(
-                    symbol=signal.ticker,
-                    qty=quantity,
-                    side="buy",
-                    type="market",
-                    time_in_force="day",
-                )
-                print(f"✅ LIVE Order platziert: {quantity}x {signal.ticker} (Software-Monitor SL/TP)")
-        except Exception as e:
-            print(f"❌ Alpaca Order fehlgeschlagen: {e}")
-            return None
+
+        # Idempotenz-Schutz (Aufgabe 1, 2026-07-30): bevor ein NEUER Kauf
+        # gestartet wird, erst prüfen ob ein früherer, durch einen Absturz
+        # o.ä. unterbrochener Entry-Versuch für denselben Ticker noch offen
+        # ist – sonst könnte ein Retry nach einem unklaren Timeout versehent-
+        # lich zu einer zweiten echten Position führen.
+        existing_order = _reconcile_pending_entry_attempt(client, signal.ticker)
+        if existing_order is not None:
+            order = existing_order
+            print(f"ℹ️  {signal.ticker}: nutze bereits bestehende Order aus vorherigem Versuch statt neu zu kaufen.")
+        else:
+            try:
+                if is_whole_share:
+                    order, _coid = _submit_order_idempotent(
+                        client, signal.ticker,
+                        symbol=signal.ticker,
+                        qty=int(quantity),
+                        side="buy",
+                        type="market",
+                        time_in_force="day",
+                        order_class="bracket",
+                        stop_loss={"stop_price": sl_price},
+                        take_profit={"limit_price": tp_price},
+                    )
+                    print(f"✅ LIVE Bracket-Order platziert: {int(quantity)}x {signal.ticker} SL: ${sl_price} TP: ${tp_price}")
+                else:
+                    order, _coid = _submit_order_idempotent(
+                        client, signal.ticker,
+                        symbol=signal.ticker,
+                        qty=quantity,
+                        side="buy",
+                        type="market",
+                        time_in_force="day",
+                    )
+                    print(f"✅ LIVE Order platziert: {quantity}x {signal.ticker} (Software-Monitor SL/TP)")
+            except Exception as e:
+                print(f"❌ Alpaca Order fehlgeschlagen: {e}")
+                return None
 
         # Echten Fill-Preis von Alpaca abfragen statt den yfinance-Kurs vom
         # Signalzeitpunkt als entry_price zu übernehmen (siehe DUK-Vorfall
@@ -323,10 +437,10 @@ def count_trading_days(start_date, end_date) -> int:
     return len(pd.bdate_range(start_date, end_date))
 
 
-def _sell_position_at_alpaca(ticker: str, fallback_price: float) -> float | None:
+def _sell_position_at_alpaca(session, trade: Trade, exit_reason: str, fallback_price: float) -> float | None:
     """
-    Verkauft die komplette Alpaca-Position in `ticker` tatsächlich und gibt
-    den echten Fill-Preis zurück.
+    Verkauft die komplette Alpaca-Position in `trade.ticker` tatsächlich und
+    gibt den echten Fill-Preis zurück.
 
     Kritischer Fix (siehe DUK/NVDA-Vorfall 2026-07-27): monitor_open_positions()
     rief bisher direkt close_trade() auf, das NUR die DB aktualisiert und
@@ -335,20 +449,46 @@ def _sell_position_at_alpaca(ticker: str, fallback_price: float) -> float | None
     hielt (kein SL/TP/Trailing mehr, da get_open_trades() nur status='OPEN'
     liefert).
 
+    State Machine + Idempotenz (Aufgabe 1+2, 2026-07-30): setzt trade.status_detail
+    VOR dem eigentlichen Order-Request auf EXIT_REQUESTED (Entscheidung
+    getroffen) und danach auf WAITING_FILL (Order raus, Ausgang unbekannt) –
+    jeweils SOFORT committet, bevor der nächste Schritt versucht wird. Stürzt
+    der Prozess irgendwo dazwischen ab, erkennt der nächste Monitoring-Zyklus
+    über status_detail, dass hier bereits ein Exit läuft, und ruft
+    _reconcile_pending_exit() statt einer neuen Exit-Entscheidung auf – so
+    kann dieselbe Position nie zweimal verkauft werden. Die eigentliche Order
+    nutzt zusätzlich _submit_order_idempotent() (client_order_id), das einen
+    unklaren Timeout von einem echten Fehlschlag unterscheidet.
+
     Gibt None zurück, wenn der Verkauf fehlschlägt – der Trade bleibt dann
-    OPEN und der nächste Monitoring-Zyklus versucht es erneut, statt einen
-    nicht tatsächlich verkauften Trade als geschlossen zu markieren.
-    Ausnahme: existiert die Alpaca-Position gar nicht mehr (z.B. weil eine
-    broker-seitige Bracket-Order sie bei ganzen Aktien bereits geschlossen
-    hat), gilt sie als bereits geschlossen und `fallback_price` (aktueller
-    Kurs) wird zurückgegeben.
+    OPEN (status_detail wird zurückgesetzt) und der nächste Monitoring-Zyklus
+    versucht es erneut, statt einen nicht tatsächlich verkauften Trade als
+    geschlossen zu markieren. Ausnahme: existiert die Alpaca-Position gar
+    nicht mehr (z.B. weil eine broker-seitige Bracket-Order sie bei ganzen
+    Aktien bereits geschlossen hat), gilt sie als bereits geschlossen und
+    `fallback_price` (aktueller Kurs) wird zurückgegeben.
     """
+    ticker = trade.ticker
+
+    def _reset_pending():
+        trade.status_detail = None
+        trade.pending_client_order_id = None
+        trade.pending_exit_reason = None
+        session.commit()
+
+    # Schritt 1: Entscheidung dokumentieren, BEVOR irgendein Broker-Call passiert.
+    trade.status_detail = "EXIT_REQUESTED"
+    trade.pending_exit_reason = exit_reason
+    session.commit()
+
     if TRADING_MODE != "LIVE":
-        return fallback_price  # Paper-Modus: kein echter Broker involviert
+        _reset_pending()  # Paper-Modus: kein echter Broker involviert, State Machine nicht nötig
+        return fallback_price
 
     client = _get_alpaca_client()
     if not client:
         print(f"⚠️  {ticker}: Alpaca-Client nicht verfügbar – Verkauf übersprungen, Trade bleibt OPEN.")
+        _reset_pending()
         return None
 
     try:
@@ -356,20 +496,31 @@ def _sell_position_at_alpaca(ticker: str, fallback_price: float) -> float | None
     except Exception as e:
         if "position does not exist" in str(e).lower() or "404" in str(e):
             print(f"ℹ️  {ticker}: Keine Alpaca-Position mehr vorhanden (vermutlich bereits broker-seitig geschlossen).")
+            _reset_pending()
             return fallback_price
         print(f"⚠️  {ticker}: Alpaca-Position konnte nicht abgefragt werden ({e}) – Trade bleibt OPEN.")
+        _reset_pending()
         return None
 
     qty = abs(float(position.qty))
     if qty <= 0:
+        _reset_pending()
         return fallback_price
 
+    # Schritt 2: Order wird jetzt WIRKLICH abgeschickt – ab hier ist der
+    # Ausgang bis zur Bestätigung unbekannt (Netzwerk-Timeout möglich).
+    trade.status_detail = "WAITING_FILL"
+    session.commit()
+
     try:
-        order = client.submit_order(
-            symbol=ticker, qty=qty, side="sell", type="market", time_in_force="day",
+        order, client_order_id = _submit_order_idempotent(
+            client, ticker, symbol=ticker, qty=qty, side="sell", type="market", time_in_force="day",
         )
+        trade.pending_client_order_id = client_order_id
+        session.commit()
     except Exception as e:
         print(f"⚠️  {ticker}: Verkaufsorder fehlgeschlagen ({e}) – Trade bleibt OPEN.")
+        _reset_pending()
         return None
 
     import time
@@ -383,8 +534,68 @@ def _sell_position_at_alpaca(ticker: str, fallback_price: float) -> float | None
             print(f"✅ {ticker}: Live verkauft @ ${filled_order.filled_avg_price}")
             return float(filled_order.filled_avg_price)
 
-    print(f"⚠️  {ticker}: Verkaufsorder platziert, aber Fill nach 3s nicht bestätigt – Fallback-Kurs (${fallback_price}) für PnL-Berechnung.")
+    print(f"⚠️  {ticker}: Verkaufsorder platziert, aber Fill nach 3s nicht bestätigt – Fallback-Kurs (${fallback_price}) "
+          f"für PnL-Berechnung. status_detail bleibt WAITING_FILL, nächster Zyklus prüft per Reconciliation nach.")
     return fallback_price
+
+
+def _reconcile_pending_exit(session, trade: Trade):
+    """
+    Wird für Positionen aufgerufen, deren status_detail bereits EXIT_REQUESTED
+    oder WAITING_FILL ist (Aufgabe 2) – d.h. ein vorheriger Monitoring-Zyklus
+    hat einen Exit entschieden/abgeschickt, aber der Prozess wurde davor
+    beendet/abgestürzt, bevor close_trade() die Position final schließen
+    konnte. Trifft hier bewusst KEINE neue Exit-Entscheidung (kein erneutes
+    SL/TP/Trailing/Time-Exit-Check) – sonst könnte ein zweiter, unabhängiger
+    Verkauf ausgelöst werden, während der erste ggf. längst gefüllt ist.
+    """
+    ticker = trade.ticker
+
+    if trade.status_detail == "EXIT_REQUESTED" and not trade.pending_client_order_id:
+        # Entscheidung wurde dokumentiert, aber der Order-Request selbst kam
+        # nie zustande (Absturz zwischen den beiden Schritten) – nichts wurde
+        # bei Alpaca ausgelöst, sicher zurückzusetzen und im nächsten Zyklus
+        # normal neu zu entscheiden.
+        print(f"🔎 {ticker}: EXIT_REQUESTED ohne abgeschickte Order – wurde nie an Alpaca gesendet, setze zurück.")
+        trade.status_detail = None
+        trade.pending_exit_reason = None
+        session.commit()
+        return
+
+    client_order_id = trade.pending_client_order_id
+    client = _get_alpaca_client()
+    if not client:
+        print(f"⚠️  {ticker}: Reconciliation übersprungen – Alpaca-Client nicht verfügbar.")
+        return
+
+    print(f"🔎 {ticker}: Position hängt in status_detail={trade.status_detail} (Order {client_order_id}) – "
+          f"prüfe bei Alpaca nach, bevor irgendetwas Neues ausgelöst wird.")
+    try:
+        order = client.get_order_by_client_order_id(client_order_id)
+    except Exception as e:
+        print(f"⚠️  {ticker}: Order {client_order_id} bei Alpaca nicht auffindbar ({e}) – vermutlich nie "
+              f"angekommen, setze zurück für einen frischen Versuch im nächsten Zyklus.")
+        trade.status_detail = None
+        trade.pending_client_order_id = None
+        trade.pending_exit_reason = None
+        session.commit()
+        return
+
+    if order.filled_avg_price:
+        exit_price = float(order.filled_avg_price)
+        print(f"✅ {ticker}: Order {client_order_id} war tatsächlich gefüllt (@ ${exit_price}) – schließe Trade final ab.")
+        close_trade(session, trade, exit_price, trade.pending_exit_reason or "CLOSED_MANUAL")
+        session.commit()
+    elif order.status in ("canceled", "rejected", "expired"):
+        print(f"ℹ️  {ticker}: Order {client_order_id} wurde storniert/abgelehnt (Status: {order.status}) – "
+              f"setze zurück für einen frischen Versuch im nächsten Zyklus.")
+        trade.status_detail = None
+        trade.pending_client_order_id = None
+        trade.pending_exit_reason = None
+        session.commit()
+    else:
+        print(f"⏳ {ticker}: Order {client_order_id} noch nicht final (Status: {order.status}) – warte weiter, "
+              f"keine neue Aktion in diesem Zyklus.")
 
 
 def check_position_consistency():
@@ -498,6 +709,18 @@ def monitor_open_positions():
 
         for trade in open_trades:
             try:
+                # State-Machine-Gate (Aufgabe 2, 2026-07-30): steckt diese
+                # Position bereits mitten in einem Exit-Versuch (z.B. weil der
+                # Prozess zwischen Order-Platzierung und Bestätigung
+                # abgestürzt ist), wird HIER keine neue Exit-Entscheidung
+                # getroffen (kein erneuter SL/TP/Trailing/Time-Exit-Check) –
+                # stattdessen nur der offene Versuch aufgelöst. Verhindert,
+                # dass z.B. Time-Exit und SL im selben oder einem
+                # überlappenden Zyklus beide einen Verkauf auslösen.
+                if trade.status_detail:
+                    _reconcile_pending_exit(session, trade)
+                    continue
+
                 # Aktuellen Preis via yfinance holen
                 import yfinance as yf
                 ticker_data = yf.Ticker(trade.ticker)
@@ -530,7 +753,7 @@ def monitor_open_positions():
                     time_exit_reason = "CLOSED_TIME_EXIT" if days_held >= max_days else None
 
                 if time_exit_reason:
-                    real_exit_price = _sell_position_at_alpaca(trade.ticker, current_price)
+                    real_exit_price = _sell_position_at_alpaca(session, trade, time_exit_reason, current_price)
                     if real_exit_price is None:
                         print(f"⏭️  {trade.ticker}: Time-Exit-Verkauf fehlgeschlagen – bleibt OPEN, nächster Versuch beim nächsten Zyklus.")
                         continue
@@ -543,7 +766,7 @@ def monitor_open_positions():
                 if not trade.trailing_sl_active:
                     # Phase 1: Normaler fester SL/TP
                     if current_price <= trade.stop_loss:
-                        real_exit_price = _sell_position_at_alpaca(trade.ticker, current_price)
+                        real_exit_price = _sell_position_at_alpaca(session, trade, "CLOSED_SL", current_price)
                         if real_exit_price is None:
                             print(f"⏭️  {trade.ticker}: SL-Verkauf fehlgeschlagen – bleibt OPEN, nächster Versuch beim nächsten Zyklus.")
                             continue
@@ -585,7 +808,7 @@ def monitor_open_positions():
 
                     # Trailing SL ausgelöst?
                     if current_price <= trade.trailing_sl_price:
-                        real_exit_price = _sell_position_at_alpaca(trade.ticker, current_price)
+                        real_exit_price = _sell_position_at_alpaca(session, trade, "CLOSED_TRAILING_SL", current_price)
                         if real_exit_price is None:
                             print(f"⏭️  {trade.ticker}: Trailing-SL-Verkauf fehlgeschlagen – bleibt OPEN, nächster Versuch beim nächsten Zyklus.")
                             continue
