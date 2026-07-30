@@ -508,9 +508,10 @@ def run_entry_cycle(slot: EntryTimeSlot):
 
     print(f"🎯 Slot-Budget: {erlaubt} Trade(s) (Cap {slot.max_trades_per_slot}, "
           f"Restbudget {max_trades_today} weitere(r) Trade(s) laut Kapital/Positionen, heute bereits {trades_heute} ausgeführt)")
-    if erlaubt <= 0:
-        print(f"⏭️  Slot {slot.stunde_et}:{slot.minute_et:02d} – kein Budget")
-        return
+    budget_exhausted = erlaubt <= 0
+    if budget_exhausted:
+        print(f"⏭️  Slot {slot.stunde_et}:{slot.minute_et:02d} – kein Budget "
+              f"(Scan läuft trotzdem weiter und wird geloggt, nur der Kauf entfällt)")
 
     # 4. Watchlists scannen
     # Fair-Value-Vorfilter (Stufe 1) VOR dem teuren Marktdaten-Scan anwenden:
@@ -635,10 +636,17 @@ def run_entry_cycle(slot: EntryTimeSlot):
     # Kandidaten, die wegen erreichtem Slot-Kontingent gar nicht mehr geprüft
     # wurden (Schleife oben per break beendet), bekommen fürs Scan-Log trotzdem
     # einen nachvollziehbaren Grund statt eines leeren guardrail_reason.
+    # BUDGET_EXHAUSTED (kein Restbudget/keine freie Position laut
+    # calculate_max_trades_today) wird dabei vom normalen Slot-Cap
+    # unterschieden, damit im Dashboard erkennbar bleibt, ob überhaupt kein
+    # Kapital mehr verfügbar war oder nur dieser einzelne Slot voll ist.
     executed_tickers = {t.ticker for t in executed_trades}
     for signal in approved:
         if signal.ticker not in guardrail_reasons and signal.ticker not in executed_tickers:
-            guardrail_reasons[signal.ticker] = f"Slot-Cap erreicht ({trades_in_slot}/{erlaubt} für diesen Slot)"
+            guardrail_reasons[signal.ticker] = (
+                "BUDGET_EXHAUSTED" if budget_exhausted
+                else f"Slot-Cap erreicht ({trades_in_slot}/{erlaubt} für diesen Slot)"
+            )
 
     # 6. Scan-Ergebnisse loggen (auch nicht ausgeführte Ticker, siehe Feature Scan-Log)
     executed_trades_by_ticker = {t.ticker: t.id for t in executed_trades}
