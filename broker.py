@@ -17,6 +17,7 @@ from database import (
 )
 from rule_engine import SignalResult
 from broker_interface import BrokerInterface
+from notifications import send_email
 
 
 class GuardrailViolation(Exception):
@@ -384,6 +385,59 @@ def _sell_position_at_alpaca(ticker: str, fallback_price: float) -> float | None
 
     print(f"⚠️  {ticker}: Verkaufsorder platziert, aber Fill nach 3s nicht bestätigt – Fallback-Kurs (${fallback_price}) für PnL-Berechnung.")
     return fallback_price
+
+
+def check_position_consistency():
+    """
+    Positions-Konsistenz-Watchdog (Aufgabe 3, 2026-07-30): vergleicht JEDE
+    DB-Position mit status=OPEN gegen die tatsächlich bei Alpaca offenen
+    Positionen (GET /v2/positions via client.list_positions()) – unabhängig
+    vom sonstigen SL/TP-Software-Monitoring in monitor_open_positions().
+    Bewusst eine eigenständige Funktion (nicht mit monitor_open_positions()
+    vermischt), analog zu check_stop_order_health() im Saxo-Bot, aber
+    allgemeiner: hier geht es um reine Positions-EXISTENZ, nicht um
+    Stop-Order-Schutz (das Alpaca-Pendant zu Stop-Order-Schutz ist ohnehin
+    broker-seitig irrelevant, da Alpaca-Trades rein software-überwacht sind).
+
+    Fehlt eine DB-OPEN-Position bei Alpaca (z.B. durch einen nicht sauber
+    verarbeiteten Exit, eine manuelle Aktion im Alpaca-Dashboard, oder eine
+    Broker-seitige Zwangsliquidation): Alarm-Mail, da das auf eine Daten-
+    inkonsistenz zwischen Bot-DB und Broker-Wahrheit hindeutet, die sonst
+    unbemerkt bliebe (der Bot würde weiter versuchen, eine Position zu
+    "verwalten", die es beim Broker gar nicht mehr gibt).
+    """
+    with get_session() as session:
+        open_trades = get_open_trades(session)
+    if not open_trades:
+        return
+
+    client = _get_alpaca_client()
+    if not client:
+        print("⚠️  Positions-Konsistenz-Check: Alpaca-Client nicht verfügbar, übersprungen.")
+        return
+
+    try:
+        live_positions = client.list_positions()
+    except Exception as e:
+        print(f"⚠️  Positions-Konsistenz-Check: Alpaca-Positionsabfrage fehlgeschlagen: {e} – Check übersprungen.")
+        return
+
+    live_tickers = {p.symbol for p in live_positions}
+    missing = [t for t in open_trades if t.ticker not in live_tickers]
+
+    if missing:
+        tickers_str = ", ".join(f"{t.ticker} (Trade #{t.id})" for t in missing)
+        msg = (
+            f"{len(missing)} DB-Position(en) als OPEN markiert, aber bei Alpaca nicht mehr auffindbar: "
+            f"{tickers_str}.\n\n"
+            "Mögliche Ursache: nicht sauber verarbeiteter Exit, manuelle Aktion im Alpaca-Dashboard, "
+            "oder Broker-seitige Zwangsliquidation. Bitte manuell prüfen – der Bot verwaltet diese "
+            "Position(en) in der DB weiter als offen, obwohl sie beim Broker nicht mehr existieren."
+        )
+        print(f"🚨 Positions-Konsistenz-Watchdog (Alpaca): {msg}")
+        send_email(subject="🚨 Positions-Konsistenz-Warnung (Alpaca)", body=msg)
+    else:
+        print(f"✅ Positions-Konsistenz-Check (Alpaca): alle {len(open_trades)} offene(n) DB-Position(en) bestätigt.")
 
 
 def monitor_open_positions():

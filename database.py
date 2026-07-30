@@ -231,6 +231,48 @@ class BotState(Base):
             session.add(BotState(key=key, value=str(value)))
 
 
+class BotHeartbeat(Base):
+    """
+    Heartbeat-Tabelle für den eigenständigen Watchdog (Aufgabe 1, 2026-07-30,
+    siehe watchdog.py). Eine Zeile pro bot_name ("alpaca"/"saxo") – wird bei
+    JEDEM abgeschlossenen Entry- oder Monitoring-Zyklus überschrieben (kein
+    Verlauf, nur der letzte Stand zählt). Liegt in derselben Postgres-DB, die
+    sich trading_bot und trading_bot_saxo ohnehin teilen (siehe beider
+    config.DATABASE_URL) – DIESELBE Tabellendefinition existiert bewusst
+    identisch auch in trading_bot_saxo/database.py (analog zum bereits
+    etablierten Muster getrennter, aber strukturgleicher Kopien wie
+    llm_analyst.py/saxo_client.py), damit jeder Bot-Prozess sie unabhängig
+    vom jeweils anderen anlegen kann (init_db() via create_all ist idempotent).
+
+    last_alert_at: verhindert Mail-Spam durch den Watchdog bei einem
+    länger andauernden Ausfall – der Watchdog schickt nur eine Erst-Alarm-Mail
+    und danach höchstens alle ALERT_RESEND_MINUTES erneut, siehe watchdog.py.
+    """
+    __tablename__ = "bot_heartbeat"
+
+    bot_name       = Column(String(30), primary_key=True)
+    cycle_type     = Column(String(20), nullable=False)
+    # nullable, weil watchdog.py hier eine Zeile mit last_cycle_at=None anlegt,
+    # solange ein Bot noch NIE einen Heartbeat geschrieben hat (siehe dort) –
+    # ein Platzhalter-Zeitstempel würde einen echten Ausfall nach der ersten
+    # Alarm-Mail fälschlich als "gerade eben gelaufen" erscheinen lassen.
+    last_cycle_at  = Column(DateTime, nullable=True)
+    last_alert_at  = Column(DateTime, nullable=True)
+
+    @staticmethod
+    def touch(session: Session, bot_name: str, cycle_type: str):
+        """Setzt last_cycle_at auf jetzt und löscht einen ggf. aktiven Alarm-
+        Status (last_alert_at) – ein frischer Heartbeat gilt als Erholung."""
+        row = session.query(BotHeartbeat).filter_by(bot_name=bot_name).first()
+        now = datetime.utcnow()
+        if row:
+            row.cycle_type = cycle_type
+            row.last_cycle_at = now
+            row.last_alert_at = None
+        else:
+            session.add(BotHeartbeat(bot_name=bot_name, cycle_type=cycle_type, last_cycle_at=now))
+
+
 class BotConfig(Base):
     """
     Konfigurierbare Bot-Parameter (Guardrails etc.) als Key-Value-Speicher.

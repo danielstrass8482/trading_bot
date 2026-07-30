@@ -7,10 +7,6 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime
 import math
-import smtplib
-import base64
-from email.mime.text import MIMEText
-from email.utils import formatdate, make_msgid
 import pytz
 from sqlalchemy import text
 
@@ -18,80 +14,24 @@ from config import (
     LONG_WATCHLIST, ACTIVE_SHORT_INSTRUMENTS, VOLATILE_WATCHLIST,
     PROFIT_ALERT_TARGET, MAX_CAPITAL_TOTAL, TRADING_MODE,
     validate_config, get_live_config,
-    ALERT_EMAIL, SMTP_HOST, SMTP_PORT, SMTP_FALLBACK_PORT,
-    SMTP_USER, SMTP_PASSWORD, SMTP_TIMEOUT
 )
 from database import (
     init_db, get_session, save_daily_snapshot, BotState, ScanLog,
     EntryTimeSlot, get_active_entry_time_slots, get_daily_trade_count,
-    get_open_trades, FairValueCache,
+    get_open_trades, FairValueCache, BotHeartbeat,
     save_position_snapshot, get_previous_position_snapshot,
 )
+from notifications import send_email
 from rule_engine import scan_watchlist_parallel, check_vix, get_market_regime, get_benchmark_performance
 from llm_analyst import analyze_with_llm, get_market_brief
-from broker import place_trade, monitor_open_positions, get_portfolio_value, get_bot_performance, check_guardrails, GuardrailViolation
+from broker import (
+    place_trade, monitor_open_positions, get_portfolio_value, get_bot_performance,
+    check_guardrails, check_position_consistency, GuardrailViolation,
+)
 from backlook import run_backlook
 from fair_value import update_fair_value_cache, get_undervalued_tickers
 from saxo_client import get_valid_access_token
 from post_exit_tracking import update_pending_tracking
-
-
-def _smtp_login_utf8(server, user, password):
-    """
-    AUTH LOGIN von Hand, da smtplib.auth()/login() den Base64-Payload intern
-    mit .encode("ascii") kodiert und damit bei Nicht-ASCII-Zeichen (Umlaute)
-    im Passwort mit UnicodeEncodeError abstuerzt.
-    """
-    server.ehlo()
-    code, resp = server.docmd("AUTH", "LOGIN")
-    if code != 334:
-        raise smtplib.SMTPAuthenticationError(code, resp)
-    code, resp = server.docmd(base64.b64encode(user.encode("utf-8")).decode("ascii"))
-    if code != 334:
-        raise smtplib.SMTPAuthenticationError(code, resp)
-    code, resp = server.docmd(base64.b64encode(password.encode("utf-8")).decode("ascii"))
-    if code not in (235, 503):
-        raise smtplib.SMTPAuthenticationError(code, resp)
-
-def send_email(subject: str, body: str):
-    """
-    Verschickt eine E-Mail via smtplib (Standardbibliothek, kein externes Package).
-    Fallback: Ohne ALERT_EMAIL oder SMTP-Zugangsdaten wird nur in die Logs
-    geschrieben – der Bot darf dadurch nie abstürzen.
-
-    Railway blockiert ausgehenden Port 587 (STARTTLS). Primär wird daher
-    Port 465 (SMTPS/SSL) verwendet. Falls auch dieser Port blockiert wird
-    (Timeout), greift ein Fallback auf SMTP_FALLBACK_PORT (Standard: 2525),
-    der von Railway nicht blockiert wird. SMTP_HOST ist konfigurierbar,
-    sodass später auf einen eigenen Mailserver umgestellt werden kann.
-    """
-    if not ALERT_EMAIL or not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
-        print(f"📧 [E-Mail nicht konfiguriert – nur Log] {subject}\n{body}")
-        return
-
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = SMTP_USER
-    msg["To"] = ALERT_EMAIL
-    msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid()
-
-    try:
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
-            _smtp_login_utf8(server, SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(SMTP_USER, [ALERT_EMAIL], msg.as_string())
-        print(f"📧 E-Mail versendet: {subject} (Port {SMTP_PORT})")
-    except (TimeoutError, OSError) as e:
-        print(f"⚠️  SMTP Port {SMTP_PORT} nicht erreichbar ({e}) – Fallback auf Port {SMTP_FALLBACK_PORT}")
-        try:
-            with smtplib.SMTP(SMTP_HOST, SMTP_FALLBACK_PORT, timeout=SMTP_TIMEOUT) as server:
-                _smtp_login_utf8(server, SMTP_USER, SMTP_PASSWORD)
-                server.sendmail(SMTP_USER, [ALERT_EMAIL], msg.as_string())
-            print(f"📧 E-Mail versendet: {subject} (Port {SMTP_FALLBACK_PORT})")
-        except Exception as fallback_e:
-            print(f"⚠️  E-Mail-Versand fehlgeschlagen (Fallback Port {SMTP_FALLBACK_PORT}): {fallback_e}")
-    except Exception as e:
-        print(f"⚠️  E-Mail-Versand fehlgeschlagen: {e}")
 
 
 def _get_current_price_for_snapshot(ticker: str, fallback: float) -> float:
@@ -658,6 +598,13 @@ def run_entry_cycle(slot: EntryTimeSlot):
         save_daily_snapshot(session, portfolio_value)
         session.commit()
 
+    # 8. Heartbeat (Aufgabe 1, 2026-07-30, siehe database.BotHeartbeat) – der
+    # externe Watchdog erkennt daran, dass dieser Zyklus tatsächlich
+    # durchgelaufen ist, unabhängig davon ob dabei Trades ausgeführt wurden.
+    with get_session() as session:
+        BotHeartbeat.touch(session, "alpaca", "entry")
+        session.commit()
+
     print(f"\n{'='*60}")
     print(f"✅ Entry-Zyklus abgeschlossen. Trades in diesem Slot: {len(executed_trades)}")
     print(f"{'='*60}\n")
@@ -710,8 +657,14 @@ def init_fair_value_if_empty():
 def run_monitoring_cycle():
     """
     Leichtgewichtiger Zyklus: Nur SL/TP überwachen (alle 30 Min während Handelszeit).
+    Seit 2026-07-30 zusätzlich: Positions-Konsistenz-Watchdog (Aufgabe 3,
+    eigenständige Funktion in broker.py, siehe dort) und Heartbeat (Aufgabe 1).
     """
     monitor_open_positions()
+    check_position_consistency()
+    with get_session() as session:
+        BotHeartbeat.touch(session, "alpaca", "monitoring")
+        session.commit()
 
 
 def saxo_token_refresh_job():
