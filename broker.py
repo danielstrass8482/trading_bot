@@ -5,6 +5,7 @@ Identische Schnittstelle für beide Modi – nur die URL ändert sich.
 
 import os
 import uuid
+import pytz
 from datetime import datetime
 from config import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL,
@@ -15,6 +16,7 @@ from database import (
     get_daily_trade_count, get_total_capital_in_trades,
     get_total_pnl, get_daily_pnl, close_trade, BotState,
     get_alpaca_api_for_user, PendingOrderAttempt,
+    get_active_entry_time_slots,
 )
 from rule_engine import SignalResult
 from broker_interface import BrokerInterface
@@ -534,9 +536,20 @@ def _sell_position_at_alpaca(session, trade: Trade, exit_reason: str, fallback_p
             print(f"✅ {ticker}: Live verkauft @ ${filled_order.filled_avg_price}")
             return float(filled_order.filled_avg_price)
 
-    print(f"⚠️  {ticker}: Verkaufsorder platziert, aber Fill nach 3s nicht bestätigt – Fallback-Kurs (${fallback_price}) "
-          f"für PnL-Berechnung. status_detail bleibt WAITING_FILL, nächster Zyklus prüft per Reconciliation nach.")
-    return fallback_price
+    # Kein Fallback-Kurs mehr (Incident 2026-07-30: UNH/AMZN/PSQ wurden mit
+    # diesem Platzhalterkurs fälschlich als CLOSED_TIME_EXIT geschlossen,
+    # während die Order bei Alpaca noch unfilled war – z.B. weil außerhalb
+    # der Handelszeiten platziert). status_detail bleibt bewusst auf
+    # WAITING_FILL (pending_client_order_id/pending_exit_reason sind bereits
+    # gesetzt) – KEIN close_trade() hier. Der nächste Monitoring-Zyklus
+    # erkennt über status_detail, dass diese Position noch aussteht, und
+    # ruft _reconcile_pending_exit() auf, das erst bei nachweislich
+    # bestätigtem Fill (order.filled_avg_price) close_trade() mit dem
+    # ECHTEN Preis aufruft.
+    print(f"⏳ {ticker}: Verkaufsorder platziert (Order {client_order_id}), aber innerhalb von 3s nicht gefüllt "
+          f"– kein Fallback-Kurs, Trade bleibt in status_detail=WAITING_FILL. Nächster Zyklus prüft per "
+          f"Reconciliation nach, ob die Order inzwischen gefüllt wurde.")
+    return None
 
 
 def _reconcile_pending_exit(session, trade: Trade):
@@ -616,11 +629,20 @@ def check_position_consistency():
     inkonsistenz zwischen Bot-DB und Broker-Wahrheit hindeutet, die sonst
     unbemerkt bliebe (der Bot würde weiter versuchen, eine Position zu
     "verwalten", die es beim Broker gar nicht mehr gibt).
+
+    Rückrichtung (Aufgabe 3, 2026-07-30, Incident UNH/AMZN/PSQ): prüft
+    zusätzlich JEDE bei Alpaca tatsächlich offene Position gegen den
+    zuletzt angelegten DB-Trade für denselben Ticker – ist dessen Status
+    NICHT OPEN, hält der Broker eine Position, die laut DB gar nicht (mehr)
+    existieren dürfte. Genau dieses Muster trat beim Incident auf: der
+    3s-Fill-Timeout in _sell_position_at_alpaca() übernahm vor dem Fix einen
+    Platzhalterkurs, obwohl die Verkaufsorder bei Alpaca noch unfilled war –
+    ohne diesen Check wäre das nur durch zufälliges manuelles Nachschauen
+    aufgefallen. Ein 2-Minuten-Puffer ab closed_at vermeidet False Positives
+    durch normale Settlement-Verzögerung zwischen Fill-Bestätigung und
+    Alpacas list_positions()-Antwort.
     """
-    with get_session() as session:
-        open_trades = get_open_trades(session)
-    if not open_trades:
-        return
+    from datetime import timedelta
 
     client = _get_alpaca_client()
     if not client:
@@ -633,22 +655,90 @@ def check_position_consistency():
         print(f"⚠️  Positions-Konsistenz-Check: Alpaca-Positionsabfrage fehlgeschlagen: {e} – Check übersprungen.")
         return
 
-    live_tickers = {p.symbol for p in live_positions}
-    missing = [t for t in open_trades if t.ticker not in live_tickers]
+    problems = []
 
-    if missing:
-        tickers_str = ", ".join(f"{t.ticker} (Trade #{t.id})" for t in missing)
-        msg = (
-            f"{len(missing)} DB-Position(en) als OPEN markiert, aber bei Alpaca nicht mehr auffindbar: "
-            f"{tickers_str}.\n\n"
-            "Mögliche Ursache: nicht sauber verarbeiteter Exit, manuelle Aktion im Alpaca-Dashboard, "
-            "oder Broker-seitige Zwangsliquidation. Bitte manuell prüfen – der Bot verwaltet diese "
-            "Position(en) in der DB weiter als offen, obwohl sie beim Broker nicht mehr existieren."
-        )
+    with get_session() as session:
+        open_trades = get_open_trades(session)
+        live_tickers = {p.symbol for p in live_positions}
+        missing = [t for t in open_trades if t.ticker not in live_tickers]
+        if missing:
+            tickers_str = ", ".join(f"{t.ticker} (Trade #{t.id})" for t in missing)
+            problems.append(
+                f"{len(missing)} DB-Position(en) als OPEN markiert, aber bei Alpaca nicht mehr auffindbar: "
+                f"{tickers_str}.\n"
+                "Mögliche Ursache: nicht sauber verarbeiteter Exit, manuelle Aktion im Alpaca-Dashboard, "
+                "oder Broker-seitige Zwangsliquidation. Der Bot verwaltet diese Position(en) in der DB "
+                "weiter als offen, obwohl sie beim Broker nicht mehr existieren."
+            )
+
+        stale_cutoff = datetime.utcnow() - timedelta(minutes=2)
+        phantom = []
+        for pos in live_positions:
+            ticker = pos.symbol
+            latest_trade = (
+                session.query(Trade)
+                .filter_by(ticker=ticker, broker="alpaca")
+                .order_by(Trade.id.desc())
+                .first()
+            )
+            if latest_trade is None or latest_trade.status == "OPEN":
+                continue
+            if latest_trade.closed_at and latest_trade.closed_at > stale_cutoff:
+                continue  # frisch geschlossen – vermutlich nur Settlement-Verzögerung
+            phantom.append(latest_trade)
+        if phantom:
+            tickers_str = ", ".join(f"{t.ticker} (Trade #{t.id}, Status: {t.status})" for t in phantom)
+            problems.append(
+                f"{len(phantom)} Position(en) bei Alpaca noch offen, obwohl der zuletzt zugehörige "
+                f"DB-Trade als geschlossen markiert ist: {tickers_str}.\n"
+                "Mögliche Ursache: Exit-Order wurde bei Broker platziert, aber nie tatsächlich gefüllt "
+                "(z.B. außerhalb der Handelszeiten), während die DB bereits einen Platzhalterkurs als "
+                "Fill übernommen hat. Bitte manuell prüfen und ggf. Order-Status bei Alpaca nachschlagen."
+            )
+
+    if problems:
+        msg = "\n\n".join(problems)
         print(f"🚨 Positions-Konsistenz-Watchdog (Alpaca): {msg}")
         send_email(subject="🚨 Positions-Konsistenz-Warnung (Alpaca)", body=msg)
     else:
-        print(f"✅ Positions-Konsistenz-Check (Alpaca): alle {len(open_trades)} offene(n) DB-Position(en) bestätigt.")
+        print(f"✅ Positions-Konsistenz-Check (Alpaca): alle {len(open_trades)} offene(n) DB-Position(en) "
+              f"und {len(live_positions)} Alpaca-Live-Position(en) konsistent.")
+
+
+def _time_exit_currently_allowed(session) -> bool:
+    """
+    Guard für Time-Exit-Verkäufe (Aufgabe 2026-07-30, Incident UNH/AMZN/PSQ):
+    days_held >= max_days sagt nichts darüber aus, ob der Markt gerade offen
+    ist – monitor_open_positions() kann auch außerhalb der Handelszeiten
+    laufen (z.B. manueller Testlauf). Eine dann via _sell_position_at_alpaca()
+    platzierte Market-Order wird von Alpaca zwar angenommen, bleibt aber bis
+    Markteröffnung ungefüllt; ohne diesen Guard hätte close_trade() (vor dem
+    Fix in _sell_position_at_alpaca()) einen Platzhalterkurs als echten Fill
+    übernommen. Zusätzlich zu is_open ein Puffer bis zum ersten aktiven
+    Entry-Zeitslot (typischerweise 09:45 ET) – analog zum Eröffnungs-
+    Volatilitäts-Puffer, den Entries bereits nutzen –, damit ein Time-Exit
+    nicht direkt in der volatilen ersten Handelsminute feuert. SL/TP/Trailing
+    sind von diesem Guard NICHT betroffen und bleiben sofort-reagierend.
+    """
+    client = _get_alpaca_client()
+    if not client:
+        return False
+    try:
+        clock = client.get_clock()
+    except Exception as e:
+        print(f"⚠️  Time-Exit-Guard: Alpaca-Clock nicht abrufbar ({e}) – Time-Exit für diesen Zyklus ausgesetzt.")
+        return False
+    if not clock.is_open:
+        return False
+
+    slots = get_active_entry_time_slots(session)
+    if slots:
+        buffer_hour, buffer_minute = slots[0].stunde_et, slots[0].minute_et
+    else:
+        buffer_hour, buffer_minute = 9, 45  # Fallback, falls keine Slots konfiguriert
+
+    now_et = datetime.now(pytz.timezone("America/New_York"))
+    return (now_et.hour, now_et.minute) >= (buffer_hour, buffer_minute)
 
 
 def monitor_open_positions():
@@ -707,6 +797,11 @@ def monitor_open_positions():
 
         print(f"👁️  Monitoring {len(open_trades)} offene Position(en)...")
 
+        # Einmal pro Zyklus geprüft (nicht pro Trade) – Guard siehe
+        # _time_exit_currently_allowed(). Betrifft NUR Time-Exit, SL/TP/
+        # Trailing unten bleiben unverändert sofort-reagierend.
+        time_exit_allowed = _time_exit_currently_allowed(session)
+
         for trade in open_trades:
             try:
                 # State-Machine-Gate (Aufgabe 2, 2026-07-30): steckt diese
@@ -747,15 +842,15 @@ def monitor_open_positions():
                 days_held = count_trading_days(trade.created_at.date(), datetime.now().date())
                 if trade.trailing_sl_active:
                     time_exit_reason = None
-                    if days_held >= max_days * max_days_trailing_multiplier:
+                    if time_exit_allowed and days_held >= max_days * max_days_trailing_multiplier:
                         time_exit_reason = "CLOSED_TIME_EXIT_HARD_CAP"
                 else:
-                    time_exit_reason = "CLOSED_TIME_EXIT" if days_held >= max_days else None
+                    time_exit_reason = "CLOSED_TIME_EXIT" if (time_exit_allowed and days_held >= max_days) else None
 
                 if time_exit_reason:
                     real_exit_price = _sell_position_at_alpaca(session, trade, time_exit_reason, current_price)
                     if real_exit_price is None:
-                        print(f"⏭️  {trade.ticker}: Time-Exit-Verkauf fehlgeschlagen – bleibt OPEN, nächster Versuch beim nächsten Zyklus.")
+                        print(f"⏭️  {trade.ticker}: Time-Exit-Verkauf nicht final abgeschlossen (fehlgeschlagen ODER noch unfilled) – bleibt OPEN, nächster Zyklus prüft nach.")
                         continue
                     close_trade(session, trade, real_exit_price, time_exit_reason)
                     start_tracking_if_applicable(session, trade)
@@ -768,7 +863,7 @@ def monitor_open_positions():
                     if current_price <= trade.stop_loss:
                         real_exit_price = _sell_position_at_alpaca(session, trade, "CLOSED_SL", current_price)
                         if real_exit_price is None:
-                            print(f"⏭️  {trade.ticker}: SL-Verkauf fehlgeschlagen – bleibt OPEN, nächster Versuch beim nächsten Zyklus.")
+                            print(f"⏭️  {trade.ticker}: SL-Verkauf nicht final abgeschlossen (fehlgeschlagen ODER noch unfilled) – bleibt OPEN, nächster Zyklus prüft nach.")
                             continue
                         close_trade(session, trade, real_exit_price, "CLOSED_SL")
                         print(f"🔴 SL ausgelöst: {trade.ticker} @ ${real_exit_price} (PnL: ${trade.pnl_usd:.2f})")
@@ -810,7 +905,7 @@ def monitor_open_positions():
                     if current_price <= trade.trailing_sl_price:
                         real_exit_price = _sell_position_at_alpaca(session, trade, "CLOSED_TRAILING_SL", current_price)
                         if real_exit_price is None:
-                            print(f"⏭️  {trade.ticker}: Trailing-SL-Verkauf fehlgeschlagen – bleibt OPEN, nächster Versuch beim nächsten Zyklus.")
+                            print(f"⏭️  {trade.ticker}: Trailing-SL-Verkauf nicht final abgeschlossen (fehlgeschlagen ODER noch unfilled) – bleibt OPEN, nächster Zyklus prüft nach.")
                             continue
                         close_trade(session, trade, real_exit_price, "CLOSED_TRAILING_SL")
                         print(f"🟢 Trailing SL ausgelöst: {trade.ticker} @ ${real_exit_price} (PnL: ${trade.pnl_usd:.2f})")
