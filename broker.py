@@ -59,16 +59,29 @@ def _get_alpaca_client(user_id: int = None):
     """
     Erstellt Alpaca-Client. Mit user_id (Feature 8 Multi-Tenant) wird zuerst
     versucht, die pro Nutzer in pos_users hinterlegten Keys zu verwenden
-    (siehe database.get_alpaca_api_for_user) – ohne user_id oder wenn der
-    Nutzer keine eigenen Keys verbunden hat, Fallback auf die globalen
-    .env-Keys (Beta-Phase: Daniel als einziger aktiver Trader, kein call site
-    übergibt aktuell eine user_id – Verhalten bleibt also unverändert).
-    Gibt None zurück wenn kein API-Key konfiguriert.
+    (siehe database.get_alpaca_api_for_user). Ohne user_id ODER für
+    user_id == DEFAULT_USER_ID (Daniel, der nie eigene Keys über den
+    Connect-Flow hinterlegt hat) Fallback auf die globalen .env-Keys.
+
+    KRITISCHER SICHERHEITSFIX 2026-07-31: Für JEDEN ANDEREN user_id ohne
+    eigene verbundene Keys wird jetzt None zurückgegeben statt (wie vorher)
+    stillschweigend auf die globalen .env-Keys zurückzufallen – das waren
+    Daniels echte Live-Kontodaten! Die ursprüngliche Docstring-Annahme "kein
+    call site übergibt aktuell eine user_id" stimmte, als main.py/broker.py
+    multi-tenant-fähig gemacht wurden (713e497) – dort iteriert
+    get_connected_alpaca_users() ohnehin nur bereits verbundene Nutzer, der
+    Fallback griff nie fälschlich. Seit dem trading_api.py-Sicherheitsfix
+    (a19605f) reicht die API aber JEDE eingeloggte user_id durch, auch die
+    eines Nutzers ohne eigene Keys (Account B, siehe Sicherheitsvorfall) –
+    genau dafür war der globale Fallback nie gedacht und leakte Daniels
+    Kontostand/Positionswert/unrealisierten G&V in dessen Übersicht.
     """
     if user_id is not None:
         client = get_alpaca_api_for_user(user_id)
         if client:
             return client
+        if user_id != DEFAULT_USER_ID:
+            return None
     try:
         import alpaca_trade_api as tradeapi
         return tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL)
