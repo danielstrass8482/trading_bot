@@ -69,6 +69,22 @@ def capture_daily_position_snapshot():
     positions = []
     with get_session() as session:
         for trade in get_open_trades(session):
+            # Fix 2026-07-31: entry_price ist None, solange die Kauf-Order
+            # noch WAITING_FILL ist (siehe broker.place_trade/
+            # _reconcile_pending_entry_fill) - PnL lässt sich dafür noch nicht
+            # berechnen, DailyPositionSnapshot-Spalten sind dafür bereits
+            # nullable. Position bleibt trotzdem im Snapshot sichtbar.
+            if trade.entry_price is None:
+                positions.append({
+                    "ticker": trade.ticker,
+                    "trade_id": trade.id,
+                    "quantity": trade.quantity,
+                    "entry_price": None,
+                    "price": None,
+                    "unrealized_pnl": None,
+                    "unrealized_pnl_pct": None,
+                })
+                continue
             current_price = _get_current_price_for_snapshot(trade.ticker, trade.entry_price)
             positions.append({
                 "ticker": trade.ticker,
@@ -187,6 +203,15 @@ Slot {slot.slot_et} ET (gescannt: {slot.gescannt}, über Schwellwert: {slot.uebe
         slot_trades = trades_by_slot.get(slot.slot_et)
         if slot_trades:
             for t in slot_trades:
+                # Fix 2026-07-31: entry_price ist None, solange die Kauf-Order
+                # noch WAITING_FILL ist (siehe broker.place_trade) - SL/TP-%
+                # lassen sich dafür noch nicht berechnen.
+                if t.entry_price is None:
+                    body += (
+                        f"  {t.ticker}: Kauf-Order noch nicht gefüllt (wartet auf Fill-Bestätigung) | "
+                        f"Kapital reserviert ${t.capital_used:.2f} | Menge {t.quantity:.4f}\n"
+                    )
+                    continue
                 sl_pct = t.sl_pct * 100 if t.sl_pct is not None else (t.entry_price - t.stop_loss) / t.entry_price * 100
                 tp_pct = t.tp_pct * 100 if t.tp_pct is not None else (t.take_profit - t.entry_price) / t.entry_price * 100
                 body += (
@@ -204,11 +229,18 @@ Slot {slot.slot_et} ET (gescannt: {slot.gescannt}, über Schwellwert: {slot.uebe
     if open_trades:
         prev_positions = prev_snapshot["positions_by_trade_id"] if prev_snapshot else {}
         for t in open_trades:
+            # Fix 2026-07-31: entry_price ist None, solange die Kauf-Order
+            # noch WAITING_FILL ist (siehe broker.place_trade) - PnL lässt
+            # sich dafür noch nicht berechnen.
+            if t.entry_price is None:
+                body += f"  {t.ticker} (Kauf-Order noch nicht gefüllt): wartet auf Fill-Bestätigung\n"
+                continue
+
             current_price = _get_current_price_for_snapshot(t.ticker, t.entry_price)
             pnl_pct_heute = (current_price - t.entry_price) / t.entry_price * 100
 
             prev_pos = prev_positions.get(t.id)
-            if prev_pos is not None:
+            if prev_pos is not None and prev_pos.unrealized_pnl_pct is not None:
                 delta_heute = pnl_pct_heute - prev_pos.unrealized_pnl_pct
                 body += (
                     f"  {t.ticker}: Vorabend ${prev_pos.price:.2f} (uPnL {prev_pos.unrealized_pnl_pct:+.2f}%) "

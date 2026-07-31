@@ -147,6 +147,7 @@ def status_badge(status):
         "CLOSED_TRAILING_SL": ("TRAIL ✓",   "badge-tp"),
         "CLOSED_TIME_EXIT":  ("TIME-EXIT",  "badge-open"),
         "CLOSED_MANUAL":     ("MANUAL",     "badge-open"),
+        "FAILED_ENTRY":      ("KAUF FEHLGESCHLAGEN", "badge-sl"),
     }
     label, cls = mapping.get(status, (status, "badge-open"))
     return f'<span class="badge {cls}">{label}</span>'
@@ -296,6 +297,21 @@ with tab1:
             st.markdown('<p style="color:#6b7280; font-size:0.9rem">Keine offenen Positionen.</p>', unsafe_allow_html=True)
         else:
             for t in open_trades:
+                # Fix 2026-07-31: entry_price ist None, solange die Kauf-Order
+                # noch WAITING_FILL ist (siehe broker.place_trade) - PnL lässt
+                # sich dafür noch nicht berechnen.
+                if t.entry_price is None:
+                    st.markdown(f"""
+                    <div style="margin-bottom:0.9rem">
+                        <div><strong>{t.ticker}</strong> {mode_badge(t.mode)}</div>
+                        <div style="color:#9ca3af; font-size:0.85rem; margin-top:0.15rem">
+                            Kauf-Order wartet auf Fill-Bestätigung ·
+                            SL: <code>${t.stop_loss:.2f}</code> ·
+                            TP: <code>${t.take_profit:.2f}</code>
+                        </div>
+                    </div>""", unsafe_allow_html=True)
+                    continue
+
                 try:
                     current_price = float(yf.Ticker(t.ticker).fast_info.get("lastPrice", t.entry_price))
                 except Exception:
@@ -350,7 +366,8 @@ with tab2:
                     st.markdown(f"**Status:** {status_badge(t.status)}", unsafe_allow_html=True)
                     st.markdown(f"**Modus:** {mode_badge(t.mode)}", unsafe_allow_html=True)
                 with col2:
-                    st.markdown(f"**Entry:** `${t.entry_price:.2f}`")
+                    entry_label = f"${t.entry_price:.2f}" if t.entry_price is not None else "wartet auf Fill"
+                    st.markdown(f"**Entry:** `{entry_label}`")
                     st.markdown(f"**Stop Loss:** `${t.stop_loss:.2f}`")
                     st.markdown(f"**Take Profit:** `${t.take_profit:.2f}`")
                     st.markdown(f"**Menge:** `{t.quantity}`")

@@ -119,7 +119,13 @@ class Trade(Base):
     ticker         = Column(String(10), nullable=False)
     direction      = Column(String(10), nullable=False)   # 'LONG' (auch für Inverse ETFs)
     instrument_type = Column(String(20), nullable=False)  # 'STOCK' oder 'INVERSE_ETF'
-    entry_price    = Column(Float, nullable=False)
+    # Nullable seit Fix 2026-07-31 (Kauf-Fill-Pendant zu exit_price, das schon
+    # immer nullable war): None solange status_detail="WAITING_FILL" auf der
+    # Entry-Seite steht (Kauf-Order abgeschickt, aber innerhalb des Polls in
+    # place_trade() nicht gefüllt) - KEIN geratener Preis wird je als "der"
+    # Einstiegspreis übernommen. _reconcile_pending_entry_fill() (broker.py)
+    # trägt ihn nach, sobald der echte Fill-Preis feststeht.
+    entry_price    = Column(Float, nullable=True)
     stop_loss      = Column(Float, nullable=False)
     take_profit    = Column(Float, nullable=False)
     quantity       = Column(Float, nullable=False)
@@ -129,7 +135,7 @@ class Trade(Base):
     llm_summary    = Column(Text, nullable=True)
     llm_risks      = Column(Text, nullable=True)           # JSON-Array als String
     score_breakdown = Column(Text, nullable=True)          # JSON-Objekt: Kriterium -> {score, max, value}
-    status         = Column(String(20), default="OPEN")   # OPEN / CLOSED_SL / CLOSED_TP / CLOSED_TRAILING_SL / CLOSED_TIME_EXIT / CLOSED_TIME_EXIT_HARD_CAP / CLOSED_MANUAL
+    status         = Column(String(20), default="OPEN")   # OPEN / CLOSED_SL / CLOSED_TP / CLOSED_TRAILING_SL / CLOSED_TIME_EXIT / CLOSED_TIME_EXIT_HARD_CAP / CLOSED_MANUAL / FAILED_ENTRY (Kauf-Order nie gefüllt, siehe broker._reconcile_pending_entry_fill, Fix 2026-07-31)
     exit_price     = Column(Float, nullable=True)
     closed_at      = Column(DateTime, nullable=True)
     pnl_usd        = Column(Float, nullable=True)
@@ -173,30 +179,38 @@ class Trade(Base):
 
     # ── State Machine für Exit-Übergänge (Aufgabe 2, 2026-07-30) ──────────
     # Additiv neben `status` (das weiterhin nur den TERMINALEN Zustand trägt:
-    # OPEN oder ein CLOSED_*-Grund) – status_detail beschreibt den Zwischen-
-    # zustand WÄHREND status noch "OPEN" ist, solange ein Exit in Arbeit ist:
-    #   None -> EXIT_REQUESTED -> WAITING_FILL -> (close_trade() setzt
-    #   status auf CLOSED_* und status_detail zurück auf None)
-    # monitor_open_positions() darf für eine Position NUR dann eine NEUE
+    # OPEN oder ein CLOSED_*/FAILED_ENTRY-Grund) – status_detail beschreibt
+    # den Zwischenzustand WÄHREND status noch "OPEN" ist, solange ein Exit
+    # ODER (Fix 2026-07-31) ein Entry in Arbeit ist:
+    #   Exit:  None -> EXIT_REQUESTED -> WAITING_FILL -> (close_trade() setzt
+    #          status auf CLOSED_* und status_detail zurück auf None)
+    #   Entry: None -> WAITING_FILL -> (_reconcile_pending_entry_fill() trägt
+    #          entry_price/capital_used nach und setzt status_detail auf None
+    #          zurück, ODER schließt als FAILED_ENTRY falls die Order nie fillte)
+    # Beide Seiten nutzen denselben Wert "WAITING_FILL" – Diskriminator ist
+    # pending_exit_reason: nur auf der Exit-Seite gesetzt (siehe unten), auf
+    # der Entry-Seite bleibt es None. monitor_open_positions() prüft das VOR
+    # jedem Zugriff auf trade.entry_price (siehe dort), um zu entscheiden, ob
+    # _reconcile_pending_entry_fill() oder _reconcile_pending_exit() zuständig
+    # ist. monitor_open_positions() darf für eine Position NUR dann eine NEUE
     # Exit-Entscheidung (SL/TP/Trailing/Time-Exit) treffen, wenn status_detail
-    # None ist – das verhindert, dass z.B. TP-Erkennung und Time-Exit im
-    # selben oder einem überlappenden Zyklus beide einen Verkauf auslösen
-    # (Doppelorder-Risiko). Liegt status_detail bereits auf EXIT_REQUESTED/
-    # WAITING_FILL (z.B. weil der Prozess zwischen Entscheidung und Bestätigung
-    # abgestürzt ist), wird stattdessen zuerst per _reconcile_pending_exit()
-    # geklärt, was aus dem vorherigen Versuch wurde.
+    # None ist – das verhindert sowohl einen Doppelverkauf (TP-Erkennung und
+    # Time-Exit im selben Zyklus) als auch eine SL/TP-Prüfung gegen einen noch
+    # unbestätigten (None) entry_price auf der Entry-Seite.
     status_detail        = Column(String(20), nullable=True)
     # Eigene, vom Bot generierte Order-ID (Aufgabe 1, siehe broker._submit_order_idempotent)
-    # für den AKTUELL laufenden Exit-Versuch dieser Position – Alpaca nimmt
-    # eine Order mit derselben client_order_id garantiert nur einmal an, ein
-    # verunglückter Retry nach Timeout kann darüber sicher nachgeprüft werden
-    # statt blind ein zweites Mal zu verkaufen.
+    # für den AKTUELL laufenden Kauf- ODER Verkaufs-Versuch dieser Position –
+    # Alpaca nimmt eine Order mit derselben client_order_id garantiert nur
+    # einmal an, ein verunglückter Retry nach Timeout kann darüber sicher
+    # nachgeprüft werden statt blind ein zweites Mal zu kaufen/verkaufen.
     pending_client_order_id = Column(String(64), nullable=True)
     # Welcher Exit-Grund wurde entschieden, BEVOR die Order abgeschickt wurde
     # (CLOSED_SL/CLOSED_TP/CLOSED_TRAILING_SL/CLOSED_TIME_EXIT/...) – wird von
     # close_trade() als `reason` verwendet, sobald der Fill bestätigt ist,
     # damit der ursprüngliche Auslöser auch nach einem Prozess-Neustart
-    # zwischen Entscheidung und Bestätigung erhalten bleibt.
+    # zwischen Entscheidung und Bestätigung erhalten bleibt. Bleibt None auf
+    # der Entry-Seite (Fix 2026-07-31) – dient dort als Diskriminator gegen
+    # das Exit-Pendant (siehe status_detail-Docstring oben).
     pending_exit_reason     = Column(String(30), nullable=True)
 
     def get_llm_risks(self) -> list:
@@ -635,6 +649,7 @@ def init_db():
     _migrate_trades_sector_column()
     _migrate_trades_user_id_column()
     _migrate_pending_order_attempts_user_id_column()
+    _migrate_trades_entry_price_nullable()
     _migrate_trades_time_exit_grace_columns()
     _seed_saxo_token_from_env()
     # Initiale Bot-State-Werte setzen falls nicht vorhanden
@@ -844,6 +859,21 @@ def _migrate_trades_time_exit_grace_columns():
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS time_exit_grace_deadline DATE"))
         conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS time_exit_grace_used BOOLEAN DEFAULT FALSE"))
+
+
+def _migrate_trades_entry_price_nullable():
+    """
+    entry_price war bisher NOT NULL – Fix 2026-07-31 (Kauf-Fill-Pendant zu
+    _sell_position_at_alpaca()/exit_price, das schon immer nullable war):
+    place_trade() legt einen Trade jetzt mit entry_price=None an, solange die
+    Kauf-Order noch WAITING_FILL ist (siehe Trade.entry_price/status_detail-
+    Docstrings), statt einen geratenen Signal-Kurs als Platzhalter zu
+    übernehmen. DROP NOT NULL ist auf Postgres idempotent (kein Fehler, falls
+    die Spalte bereits nullable ist – z.B. bei jedem weiteren Bot-Neustart).
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE trades ALTER COLUMN entry_price DROP NOT NULL"))
 
 
 def _seed_saxo_token_from_env():

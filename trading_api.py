@@ -107,7 +107,7 @@ def get_overview():
                    entry_price, stop_loss, take_profit,
                    quantity, capital_used, rule_score,
                    trailing_sl_active, trailing_sl_price,
-                   created_at, mode, broker
+                   created_at, mode, broker, status_detail
             FROM trades WHERE status = 'OPEN'
             ORDER BY created_at DESC
         """)).fetchall()
@@ -164,13 +164,22 @@ def get_overview():
     open_trades_out = []
     for t in open_trades:
         row = dict(t._mapping)
-        try:
-            current_price = float(yf.Ticker(row["ticker"]).fast_info.get("lastPrice", row["entry_price"]))
-        except Exception:
-            current_price = row["entry_price"]
-        row["current_price"] = current_price
-        row["unrealized_pnl"] = round((current_price - row["entry_price"]) * row["quantity"], 2)
-        row["unrealized_pnl_pct"] = round((current_price - row["entry_price"]) / row["entry_price"] * 100, 2) if row["entry_price"] else 0
+        # Fix 2026-07-31: entry_price ist None, solange die Kauf-Order noch
+        # WAITING_FILL ist (siehe broker.place_trade) - unrealized_pnl lässt
+        # sich dafür noch nicht berechnen, Frontend zeigt stattdessen "wartet
+        # auf Fill" an (siehe status_detail, ebenfalls in row enthalten).
+        if row["entry_price"] is None:
+            row["current_price"] = None
+            row["unrealized_pnl"] = None
+            row["unrealized_pnl_pct"] = None
+        else:
+            try:
+                current_price = float(yf.Ticker(row["ticker"]).fast_info.get("lastPrice", row["entry_price"]))
+            except Exception:
+                current_price = row["entry_price"]
+            row["current_price"] = current_price
+            row["unrealized_pnl"] = round((current_price - row["entry_price"]) * row["quantity"], 2)
+            row["unrealized_pnl_pct"] = round((current_price - row["entry_price"]) / row["entry_price"] * 100, 2) if row["entry_price"] else 0
 
         days_held = count_trading_days(row["created_at"].date(), datetime.now().date())
         limit = (
@@ -265,17 +274,19 @@ def get_trade_history(limit: int = 50):
                 entry_price, exit_price,
                 stop_loss, take_profit,
                 capital_used, pnl_usd, pnl_pct,
-                rule_score, status,
+                rule_score, status, status_detail,
                 broker, mode, sector,
                 created_at, closed_at,
                 llm_sentiment, llm_summary, llm_risks, score_breakdown,
                 CASE
+                    WHEN status = 'OPEN' AND status_detail = 'WAITING_FILL' THEN 'Kauf wartet auf Fill'
                     WHEN status = 'OPEN' THEN 'Offen'
                     WHEN status = 'CLOSED_SL' THEN 'Stop Loss'
                     WHEN status = 'CLOSED_TP' THEN 'Take Profit'
                     WHEN status = 'CLOSED_TRAILING_SL' THEN 'Trailing Stop'
                     WHEN status = 'CLOSED_TIME_EXIT' THEN 'Time Exit (5 Tage)'
                     WHEN status = 'CLOSED_MANUAL' THEN 'Manuell'
+                    WHEN status = 'FAILED_ENTRY' THEN 'Kauf nie gefüllt'
                     ELSE status
                 END as exit_grund
             FROM trades
@@ -289,7 +300,7 @@ def get_trade_history(limit: int = 50):
             row = dict(r._mapping)
             row["llm_risks"] = _parse_json_field(row.get("llm_risks"), default=[])
             row["score_breakdown"] = _parse_json_field(row.get("score_breakdown"), default={})
-            if row["status"] == "OPEN":
+            if row["status"] == "OPEN" and row["entry_price"] is not None:
                 try:
                     current_price = float(yf.Ticker(row["ticker"]).fast_info.get("lastPrice", row["entry_price"]))
                 except Exception:
@@ -301,6 +312,9 @@ def get_trade_history(limit: int = 50):
                     if row["entry_price"] else 0
                 )
             else:
+                # entry_price is None (Fix 2026-07-31): Kauf-Order noch
+                # WAITING_FILL, siehe broker.place_trade - kein current_price/
+                # unrealized_pnl berechenbar, bis der echte Fill nachgetragen ist.
                 row["current_price"] = None
                 row["unrealized_pnl"] = None
                 row["unrealized_pnl_pct"] = None

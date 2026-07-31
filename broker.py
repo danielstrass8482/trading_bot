@@ -380,10 +380,15 @@ def place_trade(signal: SignalResult, llm_result: dict, user_id: int = DEFAULT_U
     sl_price = signal.stop_loss
     tp_price = signal.take_profit
 
-    # entry_price wird per Default vom Signalzeitpunkt übernommen (PAPER-Modus,
-    # oder LIVE-Fallback falls die Order nicht rechtzeitig gefüllt wird) –
-    # im LIVE-Modus unten durch den tatsächlichen Alpaca-Fill-Preis ersetzt.
+    # entry_price wird per Default vom Signalzeitpunkt übernommen (PAPER-Modus) –
+    # im LIVE-Modus unten durch den tatsächlichen Alpaca-Fill-Preis ersetzt,
+    # ODER (Fix 2026-07-31, Kauf-Fill-Pendant zu _sell_position_at_alpaca(),
+    # siehe dort/DUK-Vorfall 2026-07-27) auf None gesetzt, falls die Order
+    # nicht innerhalb des Polls gefüllt wurde – KEIN geratener Preis mehr wird
+    # je als "der" Einstiegspreis übernommen, siehe unten.
     entry_price = signal.current_price
+    entry_status_detail = None
+    entry_pending_client_order_id = None
 
     # ── LIVE TRADING via Alpaca ─────────────────────────────────────
     # TRADING_MODE bleibt global (steuert nur OB überhaupt echte API-Calls
@@ -408,11 +413,12 @@ def place_trade(signal: SignalResult, llm_result: dict, user_id: int = DEFAULT_U
         existing_order = _reconcile_pending_entry_attempt(client, signal.ticker, user_id)
         if existing_order is not None:
             order = existing_order
+            client_order_id = existing_order.client_order_id
             print(f"ℹ️  {signal.ticker}: nutze bereits bestehende Order aus vorherigem Versuch statt neu zu kaufen.")
         else:
             try:
                 if is_whole_share:
-                    order, _coid = _submit_order_idempotent(
+                    order, client_order_id = _submit_order_idempotent(
                         client, signal.ticker, user_id,
                         symbol=signal.ticker,
                         qty=int(quantity),
@@ -425,7 +431,7 @@ def place_trade(signal: SignalResult, llm_result: dict, user_id: int = DEFAULT_U
                     )
                     print(f"✅ LIVE Bracket-Order platziert: {int(quantity)}x {signal.ticker} SL: ${sl_price} TP: ${tp_price}")
                 else:
-                    order, _coid = _submit_order_idempotent(
+                    order, client_order_id = _submit_order_idempotent(
                         client, signal.ticker, user_id,
                         symbol=signal.ticker,
                         qty=quantity,
@@ -447,6 +453,7 @@ def place_trade(signal: SignalResult, llm_result: dict, user_id: int = DEFAULT_U
         # Market-Orders auf liquide Aktien füllen praktisch sofort, kurzes
         # Polling reicht.
         import time
+        filled = False
         for _ in range(3):
             time.sleep(1)
             try:
@@ -456,12 +463,25 @@ def place_trade(signal: SignalResult, llm_result: dict, user_id: int = DEFAULT_U
                 break
             if filled_order.filled_avg_price:
                 entry_price = float(filled_order.filled_avg_price)
+                filled = True
+                print(f"ℹ️  {signal.ticker}: Entry-Preis aus Alpaca-Fill: ${entry_price} (Signal-Kurs war ${signal.current_price})")
                 break
-        else:
-            print(f"⚠️  {signal.ticker}: Order nach 3s noch nicht gefüllt – Signal-Kurs (${signal.current_price}) als entry_price-Fallback.")
-
-        if entry_price != signal.current_price:
-            print(f"ℹ️  {signal.ticker}: Entry-Preis aus Alpaca-Fill: ${entry_price} (Signal-Kurs war ${signal.current_price})")
+        if not filled:
+            # Kein Fallback-Kurs mehr (Fix 2026-07-31, analog zu
+            # _sell_position_at_alpaca()/Incident 2026-07-30 UNH/AMZN/PSQ,
+            # hier auf die Entry-Seite übertragen): entry_price bleibt auf
+            # dem Signal-Kurs NUR als grobe Kapital-Reservierungs-Schätzung
+            # (siehe capital_used unten) – status_detail=WAITING_FILL markiert
+            # ihn explizit als NICHT bestätigt, damit SL/TP/Trailing (die auf
+            # trade.entry_price rechnen) ihn nicht fälschlich als echten Fill
+            # behandeln. _reconcile_pending_entry_fill() (broker.py) trägt den
+            # echten Fill-Preis nach, sobald die Order tatsächlich gefüllt ist.
+            entry_price = None
+            entry_status_detail = "WAITING_FILL"
+            entry_pending_client_order_id = client_order_id
+            print(f"⏳ {signal.ticker}: Order {client_order_id} nach 3s noch nicht gefüllt – KEIN Preis-Fallback, "
+                  f"Trade wird mit status_detail=WAITING_FILL angelegt. Nächster Monitoring-Zyklus prüft per "
+                  f"Reconciliation nach und trägt den echten Fill-Preis nach.")
 
     # ── PAPER TRADING (Simulation) ──────────────────────────────────
     else:
@@ -473,8 +493,12 @@ def place_trade(signal: SignalResult, llm_result: dict, user_id: int = DEFAULT_U
     # capital_used anhand des tatsächlichen entry_price statt des vorläufigen
     # Signal-Kurses – sonst würde z.B. bei DUK weiterhin $50 "capital_used"
     # geloggt, obwohl real nur ~$20 investiert wurden (Menge wurde ja mit dem
-    # falschen Signal-Kurs berechnet).
-    capital_used = round(quantity * entry_price, 2)
+    # falschen Signal-Kurs berechnet). entry_price ist None, solange der Kauf
+    # noch WAITING_FILL ist (siehe oben) – capital_used ist dann bewusst nur
+    # eine grobe, auf dem Signal-Kurs basierende Schätzung für die Guardrail-
+    # Kapitalreservierung; _reconcile_pending_entry_fill() ersetzt sie durch
+    # den exakten Wert, sobald der echte Fill-Preis feststeht.
+    capital_used = round(quantity * (entry_price if entry_price is not None else signal.current_price), 2)
 
     # ── In Datenbank loggen (beide Modi) ───────────────────────────
     import json as _json
@@ -495,6 +519,8 @@ def place_trade(signal: SignalResult, llm_result: dict, user_id: int = DEFAULT_U
         llm_summary     = llm_result.get("summary"),
         llm_risks       = _json.dumps(llm_result.get("risks", []), ensure_ascii=False),
         status          = "OPEN",
+        status_detail   = entry_status_detail,
+        pending_client_order_id = entry_pending_client_order_id,
         mode            = get_trade_mode_for_user(user_id),
         broker          = active_broker,
         sector          = signal.sector,
@@ -508,6 +534,112 @@ def place_trade(signal: SignalResult, llm_result: dict, user_id: int = DEFAULT_U
         session.refresh(trade)
         print(f"💾 Trade #{trade.id} in DB gespeichert")
         return trade
+
+
+def _reconcile_pending_entry_fill(session, trade: Trade):
+    """
+    Kauf-Fill-Pendant zu _reconcile_pending_exit() (Fix 2026-07-31, gleiche
+    Fehlerklasse wie der DUK-Vorfall 2026-07-27 / UNH-AMZN-PSQ-Incident
+    2026-07-30, hier auf die Entry-Seite übertragen). Wird von
+    monitor_open_positions() für Trades aufgerufen, deren status_detail
+    bereits "WAITING_FILL" ist UND deren pending_exit_reason None ist – dieser
+    zweite Teil ist der Diskriminator gegen das Exit-Pendant, das denselben
+    status_detail-Wert nutzt, aber immer einen pending_exit_reason gesetzt hat
+    (siehe Trade.status_detail-Docstring in database.py). Trifft KEINE neue
+    Kauf-Entscheidung (die trifft ausschließlich run_entry_cycle für neue
+    Kandidaten) – klärt ausschließlich, was aus DIESER bereits abgeschickten
+    Order geworden ist.
+
+    place_trade() legt einen solchen Trade mit entry_price=None an, wenn die
+    Kauf-Order innerhalb des 3s-Polls nicht gefüllt war – KEIN geratener Preis
+    fließt dadurch je als "der" Einstiegspreis in SL/TP/Trailing/PnL ein.
+    Diese Funktion trägt entry_price/capital_used JETZT ERST mit dem echten
+    Fill-Preis nach, sobald er feststeht; ab dann läuft der Trade regulär wie
+    jeder sofort gefüllte.
+    """
+    ticker = trade.ticker
+    user_id = trade.user_id if trade.user_id is not None else DEFAULT_USER_ID
+    client_order_id = trade.pending_client_order_id
+
+    client = _get_alpaca_client(user_id)
+    if not client:
+        print(f"⚠️  {ticker}: Kauf-Fill-Reconciliation (Trade #{trade.id}) übersprungen – "
+              f"Alpaca-Client nicht verfügbar.")
+        return
+
+    try:
+        order = client.get_order_by_client_order_id(client_order_id)
+    except Exception as e:
+        # Anders als beim Exit-Pendant NICHT zurücksetzen: für einen Exit kann
+        # der nächste Zyklus einen frischen Verkaufsversuch starten, wenn der
+        # alte nachweislich nie ankam - für einen Entry gibt es keine
+        # äquivalente automatische Retry-Kauf-Logik, die diesen Trade sonst
+        # ersetzen würde. Bleibt daher in WAITING_FILL, bis entweder ein
+        # nachfolgender Zyklus die Order doch findet, oder der
+        # Staleness-Alarm unten manuelles Eingreifen anstößt.
+        print(f"⚠️  {ticker}: Kauf-Order {client_order_id} (Trade #{trade.id}) bei Alpaca nicht "
+              f"auffindbar ({e}) – bleibt in status_detail=WAITING_FILL, nächster Zyklus prüft erneut nach.")
+        return
+
+    if order.filled_avg_price:
+        entry_price = float(order.filled_avg_price)
+        trade.entry_price = entry_price
+        trade.capital_used = round(trade.quantity * entry_price, 2)
+        trade.status_detail = None
+        trade.pending_client_order_id = None
+        session.commit()
+        print(f"✅ {ticker}: Kauf-Order {client_order_id} war tatsächlich gefüllt (@ ${entry_price}) – "
+              f"Trade #{trade.id} ab jetzt regulär überwacht (SL ${trade.stop_loss}, TP ${trade.take_profit}).")
+        return
+
+    if order.status in ("canceled", "rejected", "expired"):
+        print(f"ℹ️  {ticker}: Kauf-Order {client_order_id} (Trade #{trade.id}) wurde storniert/abgelehnt/"
+              f"abgelaufen (Status: {order.status}) – war nie real gekauft, wird als FAILED_ENTRY "
+              f"geschlossen (kein Kapital bleibt dafür reserviert).")
+        trade.status = "FAILED_ENTRY"
+        trade.status_detail = None
+        trade.pending_client_order_id = None
+        trade.closed_at = datetime.utcnow()
+        session.commit()
+        send_email(
+            subject=f"⚠️ Trading Bot – Kauf-Order nie gefüllt ({ticker})",
+            body=(
+                f"Trade #{trade.id} ({ticker}, Nutzer {user_id}): Kauf-Order {client_order_id} wurde "
+                f"storniert/abgelehnt/abgelaufen (Status: {order.status}), bevor sie gefüllt wurde.\n\n"
+                f"Der Trade wurde als FAILED_ENTRY markiert, kein Kapital bleibt dafür reserviert."
+            )
+        )
+        return
+
+    # Order existiert weiterhin, ist aber weder gefüllt noch final (z.B.
+    # weiterhin "accepted"/"new", weil der Markt seit Order-Aufgabe noch nicht
+    # offen war) – keine Aktion außer ggf. einem Staleness-Alarm. Sendet bei
+    # jedem weiteren Zyklus erneut, solange der Zustand anhält (keine
+    # Dedupe-Logik, analog zu check_position_consistency()).
+    #
+    # BEWUSST NICHT count_trading_days() (zählt INKLUSIVE - der Anlage-Tag
+    # selbst zählt dort schon als Tag 1, siehe dessen Docstring/Verwendung
+    # beim Time-Exit) - das würde hier sofort am Anlage-Tag selbst alarmieren,
+    # nicht erst "bis Handelsschluss desselben Tages nicht gefüllt". Stattdessen
+    # simpler ET-Kalendertag-Vergleich: erst wenn der ET-Kalendertag seit der
+    # Order-Anlage weitergerückt ist, ist deren Handelsschluss sicher vorbei.
+    et_tz = pytz.timezone("America/New_York")
+    created_et_date = trade.created_at.replace(tzinfo=pytz.UTC).astimezone(et_tz).date()
+    now_et_date = datetime.now(et_tz).date()
+    if now_et_date > created_et_date:
+        print(f"🚨 {ticker}: Kauf-Order {client_order_id} (Trade #{trade.id}) seit {trade.created_at.date()} "
+              f"weiterhin nicht final (Status: {order.status}) – mindestens ein Handelstag ohne Fill vergangen.")
+        send_email(
+            subject=f"🚨 Trading Bot – Kauf-Order seit über einem Handelstag nicht gefüllt ({ticker})",
+            body=(
+                f"Trade #{trade.id} ({ticker}, Nutzer {user_id}): Kauf-Order {client_order_id}, "
+                f"angelegt am {trade.created_at}, ist bei Alpaca weiterhin im Status '{order.status}' "
+                f"(weder gefüllt noch storniert/abgelehnt/abgelaufen). Bitte manuell bei Alpaca prüfen."
+            )
+        )
+    else:
+        print(f"⏳ {ticker}: Kauf-Order {client_order_id} (Trade #{trade.id}) noch nicht final "
+              f"(Status: {order.status}) – warte weiter, keine neue Aktion in diesem Zyklus.")
 
 
 def count_trading_days(start_date, end_date) -> int:
@@ -768,7 +900,16 @@ def check_position_consistency(user_id: int = DEFAULT_USER_ID):
     with get_session() as session:
         open_trades = get_open_trades(session, user_id)
         live_tickers = {p.symbol for p in live_positions}
-        missing = [t for t in open_trades if t.ticker not in live_tickers]
+        # Trades, deren Kauf-Order noch WAITING_FILL ist (Fix 2026-07-31, siehe
+        # place_trade()/_reconcile_pending_entry_fill()), haben per Definition
+        # noch KEINE Alpaca-Position - würden hier sonst fälschlich als
+        # "verschwundene Position" alarmiert, obwohl der Kauf schlicht noch
+        # nicht gefüllt ist.
+        missing = [
+            t for t in open_trades
+            if t.ticker not in live_tickers
+            and not (t.status_detail == "WAITING_FILL" and t.pending_exit_reason is None)
+        ]
         if missing:
             tickers_str = ", ".join(f"{t.ticker} (Trade #{t.id})" for t in missing)
             problems.append(
@@ -943,14 +1084,20 @@ def monitor_open_positions(user_id: int = DEFAULT_USER_ID):
 
         for trade in open_trades:
             try:
-                # State-Machine-Gate (Aufgabe 2, 2026-07-30): steckt diese
-                # Position bereits mitten in einem Exit-Versuch (z.B. weil der
+                # State-Machine-Gate (Aufgabe 2, 2026-07-30, erweitert Fix
+                # 2026-07-31 um die Entry-Seite): steckt diese Position bereits
+                # mitten in einem Kauf- ODER Verkaufs-Versuch (z.B. weil der
                 # Prozess zwischen Order-Platzierung und Bestätigung
-                # abgestürzt ist), wird HIER keine neue Exit-Entscheidung
-                # getroffen (kein erneuter SL/TP/Trailing/Time-Exit-Check) –
-                # stattdessen nur der offene Versuch aufgelöst. Verhindert,
-                # dass z.B. Time-Exit und SL im selben oder einem
-                # überlappenden Zyklus beide einen Verkauf auslösen.
+                # abgestürzt ist, oder die Kauf-Order beim Anlegen des Trades
+                # noch nicht gefüllt war, siehe place_trade()), wird HIER keine
+                # neue Exit-Entscheidung getroffen (kein SL/TP/Trailing/Time-
+                # Exit-Check gegen einen unbestätigten entry_price) – stattdessen
+                # nur der jeweils offene Versuch aufgelöst. WAITING_FILL wird auf
+                # beiden Seiten genutzt; pending_exit_reason (nur auf der Exit-
+                # Seite gesetzt) unterscheidet, welches Pendant zuständig ist.
+                if trade.status_detail == "WAITING_FILL" and trade.pending_exit_reason is None:
+                    _reconcile_pending_entry_fill(session, trade)
+                    continue
                 if trade.status_detail:
                     _reconcile_pending_exit(session, trade)
                     continue
