@@ -408,6 +408,12 @@ _LIVE_CONFIG_SPEC = {
     "ATR_MAX_SL_PCT":          (float, 0.08),
     "MAX_HOLDING_DAYS":        (int,   5),
     "MAX_HOLDING_DAYS_TRAILING_MULTIPLIER": (int, 2),  # harte Obergrenze bei aktivem Trailing-SL = MAX_HOLDING_DAYS * dieser Wert
+    # Schutzfrist für Gewinner ohne aktiviertes Trailing (2026-07-31, siehe
+    # broker.monitor_open_positions): Anzahl Handelstage, die eine bei
+    # MAX_HOLDING_DAYS im Plus stehende Position (aber noch ohne Trailing-SL)
+    # zusätzlich Zeit bekommt, bevor sie doch hart verkauft wird - siehe
+    # dortige Dokumentation zur Break-Even-Stop-Logik.
+    "TIME_EXIT_GRACE_DAYS":    (int,   3),
     "VOLATILE_SEGMENT_PCT":    (float, 0.33),
     "VOLATILE_ATR_THRESHOLD":  (float, 0.025),
     "EARNINGS_BUFFER_DAYS":    (int,   EARNINGS_BUFFER_DAYS),

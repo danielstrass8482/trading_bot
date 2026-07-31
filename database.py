@@ -141,6 +141,21 @@ class Trade(Base):
     trailing_sl_active         = Column(Boolean, default=False)  # True sobald TP erreicht & Trailing SL statt Verkauf aktiviert
     trailing_sl_price          = Column(Float, nullable=True)    # aktueller Trailing-SL-Preis (nur wenn trailing_sl_active)
     highest_price_since_entry  = Column(Float, nullable=True)    # höchster beobachteter Kurs seit Entry (Basis für Trailing SL)
+    # Schutzfrist für Gewinner ohne aktiviertes Trailing (2026-07-31, siehe
+    # broker.monitor_open_positions): wird bei Erreichen von MAX_HOLDING_DAYS
+    # gesetzt, falls die Position im Plus steht, aber die Trailing-
+    # Aktivierungsschwelle noch nicht erreicht hat - statt eines sofortigen
+    # harten Time-Exit-Verkaufs bekommt sie bis zu diesem Datum (heute +
+    # TIME_EXIT_GRACE_DAYS Handelstage, siehe broker.add_trading_days) einen
+    # Break-Even-Stop (trade.stop_loss = entry_price). None = keine Schutzfrist
+    # (weder gewährt noch nötig).
+    time_exit_grace_deadline   = Column(Date, nullable=True)
+    # True sobald die Schutzfrist EINMAL gewährt wurde - verhindert eine
+    # zweite Verlängerung für dieselbe Position, und dient gleichzeitig als
+    # Kennzeichnung im Backlook/post_exit_tracking, ob ein späterer
+    # CLOSED_TIME_EXIT ein regulärer (False) oder ein nach abgelaufener
+    # Schutzfrist ausgelöster (True) Time-Exit war.
+    time_exit_grace_used       = Column(Boolean, default=False)
     broker                     = Column(String(20), default="alpaca")  # "alpaca" / "ibkr" (siehe broker.place_trade)
     # yfinance-Sektor zum Entry-Zeitpunkt (siehe rule_engine.SignalResult.sector) –
     # NULL bei Inverse ETFs und bei älteren Trades vor Einführung dieser Spalte
@@ -618,6 +633,7 @@ def init_db():
     _migrate_trades_sector_column()
     _migrate_trades_user_id_column()
     _migrate_pending_order_attempts_user_id_column()
+    _migrate_trades_time_exit_grace_columns()
     _seed_saxo_token_from_env()
     # Initiale Bot-State-Werte setzen falls nicht vorhanden
     with get_session() as session:
@@ -814,6 +830,18 @@ def _migrate_pending_order_attempts_user_id_column():
         conn.execute(text(
             "UPDATE pending_order_attempts SET user_id = :default_user_id WHERE user_id IS NULL"
         ), {"default_user_id": DEFAULT_USER_ID})
+
+
+def _migrate_trades_time_exit_grace_columns():
+    """
+    time_exit_grace_deadline/time_exit_grace_used kamen nachträglich zur
+    trades-Tabelle dazu (Schutzfrist-Feature 2026-07-31, siehe
+    broker.monitor_open_positions) – idempotentes ADD COLUMN IF NOT EXISTS.
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS time_exit_grace_deadline DATE"))
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS time_exit_grace_used BOOLEAN DEFAULT FALSE"))
 
 
 def _seed_saxo_token_from_env():

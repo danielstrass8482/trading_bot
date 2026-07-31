@@ -6,7 +6,7 @@ Identische Schnittstelle für beide Modi – nur die URL ändert sich.
 import os
 import uuid
 import pytz
-from datetime import datetime
+from datetime import datetime, timedelta
 from config import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL,
     TRADING_MODE, get_live_config, DEFAULT_USER_ID,
@@ -520,6 +520,18 @@ def count_trading_days(start_date, end_date) -> int:
     return len(pd.bdate_range(start_date, end_date))
 
 
+def add_trading_days(start_date, n: int):
+    """
+    Addiert n Handelstage (Mo-Fr) zu start_date (Umkehrung von
+    count_trading_days) – Feiertage bewusst nicht berücksichtigt, gleiche
+    Näherung wie dort. Für die Time-Exit-Schutzfrist (2026-07-31, siehe
+    monitor_open_positions): das Ergebnis-Datum ist der Tag, ab dem die
+    Schutzfrist als abgelaufen gilt.
+    """
+    import pandas as pd
+    return (pd.bdate_range(start=start_date + timedelta(days=1), periods=n)[-1]).date()
+
+
 def _sell_position_at_alpaca(session, trade: Trade, exit_reason: str, fallback_price: float) -> float | None:
     """
     Verkauft die komplette Alpaca-Position in `trade.ticker` tatsächlich und
@@ -855,12 +867,24 @@ def monitor_open_positions(user_id: int = DEFAULT_USER_ID):
     in database.py) – nur WELCHE Positionen/welcher Broker-Client betroffen
     sind, ist pro Nutzer getrennt.
     - Time-based Exit: Ohne aktiven Trailing-SL wird die Position nach
-      MAX_HOLDING_DAYS Handelstagen geschlossen (CLOSED_TIME_EXIT). Mit
-      aktivem Trailing-SL wird der Time-Exit ausgesetzt (der Trade läuft
+      MAX_HOLDING_DAYS Handelstagen geschlossen (CLOSED_TIME_EXIT) – AUSSER
+      (Schutzfrist-Feature, 2026-07-31) sie steht zu diesem Zeitpunkt im Plus:
+      dann bekommt sie statt des sofortigen harten Verkaufs einen Break-Even-
+      Stop (trade.stop_loss = entry_price) und bis zu TIME_EXIT_GRACE_DAYS
+      weitere Handelstage Zeit, entweder die Trailing-Aktivierungsschwelle
+      noch zu erreichen (dann übernimmt das normale Trailing-Verhalten
+      vollständig, inkl. dessen eigenem Hard-Cap) oder den Break-Even-Stop
+      auszulösen (normaler CLOSED_SL-Exit, kein Verlust ggü. Entry) – läuft
+      die Schutzfrist dagegen ab, ohne dass eines von beidem passiert ist,
+      wird hart verkauft (weiterhin CLOSED_TIME_EXIT, aber
+      trade.time_exit_grace_used=True markiert diesen Fall als "nach
+      abgelaufener Schutzfrist" für Backlook/post_exit_tracking). Nur EINMAL
+      pro Position gewährt (time_exit_grace_used-Flag). Mit aktivem
+      Trailing-SL wird der reguläre Time-Exit ausgesetzt (der Trade läuft
       bereits profitabel mit eigenem adaptiven Schutz) – als Sicherheitsnetz
       greift stattdessen eine harte Obergrenze bei MAX_HOLDING_DAYS *
       MAX_HOLDING_DAYS_TRAILING_MULTIPLIER Handelstagen (CLOSED_TIME_EXIT_
-      HARD_CAP). Beide Time-Exit-Varianten legen einen post_exit_tracking-
+      HARD_CAP). Alle Time-Exit-Varianten legen einen post_exit_tracking-
       Eintrag an (siehe post_exit_tracking.py), der den Kursverlauf danach
       beobachtet, um die Schwellenwerte selbst zu evaluieren (Backlook).
     - Solange kein Trailing SL aktiv ist: normaler fester Stop Loss. Trailing
@@ -883,6 +907,7 @@ def monitor_open_positions(user_id: int = DEFAULT_USER_ID):
     config = get_live_config()
     max_days = int(config.get("MAX_HOLDING_DAYS", 5))
     max_days_trailing_multiplier = int(config.get("MAX_HOLDING_DAYS_TRAILING_MULTIPLIER", 2))
+    grace_days = int(config.get("TIME_EXIT_GRACE_DAYS", 3))
     atr_multiplier_sl = config.get("ATR_MULTIPLIER_SL", 1.5)
     min_sl_pct = config.get("ATR_MIN_SL_PCT", 0.01)
     max_sl_pct = config.get("ATR_MAX_SL_PCT", 0.08)
@@ -955,8 +980,39 @@ def monitor_open_positions(user_id: int = DEFAULT_USER_ID):
                     time_exit_reason = None
                     if time_exit_allowed and days_held >= max_days * max_days_trailing_multiplier:
                         time_exit_reason = "CLOSED_TIME_EXIT_HARD_CAP"
+                elif trade.time_exit_grace_used:
+                    # Schutzfrist wurde in einem früheren Zyklus bereits
+                    # gewährt (Fix 2026-07-31) - der reguläre MAX_HOLDING_DAYS-
+                    # Trigger unten ist für diese Position hinfällig, jetzt
+                    # zählt nur noch, ob die Schutzfrist selbst abgelaufen ist
+                    # (Trailing wäre sonst schon oben abgefangen worden).
+                    if time_exit_allowed and datetime.now().date() >= trade.time_exit_grace_deadline:
+                        time_exit_reason = "CLOSED_TIME_EXIT"
+                        print(f"⏰ {trade.ticker}: Schutzfrist abgelaufen ({trade.time_exit_grace_deadline}) "
+                              f"ohne Trailing-Aktivierung – harter Verkauf nach Schutzfrist.")
+                    else:
+                        time_exit_reason = None
+                elif time_exit_allowed and days_held >= max_days:
+                    # Regulärer Time-Exit-Trigger erreicht - Schutzfrist-
+                    # Unterscheidung (Fix 2026-07-31): nur Gewinner ohne
+                    # Trailing-Aktivierung bekommen statt des sofortigen
+                    # harten Verkaufs einen Break-Even-Stop + Aufschub.
+                    unrealized_pnl = (current_price - trade.entry_price) * trade.quantity
+                    if unrealized_pnl > 0:
+                        trade.time_exit_grace_deadline = add_trading_days(datetime.now().date(), grace_days)
+                        trade.time_exit_grace_used = True
+                        trade.stop_loss = trade.entry_price
+                        time_exit_reason = None
+                        print(f"🛡️  {trade.ticker}: Time-Exit fällig (Tag {days_held}), aber im Plus "
+                              f"(${unrealized_pnl:.2f}) und Trailing noch nicht aktiv – Schutzfrist bis "
+                              f"{trade.time_exit_grace_deadline} gewährt, Stop-Loss auf Break-Even "
+                              f"(${trade.entry_price}) nachgezogen.")
+                    else:
+                        # Break-Even oder Verlust: unverändertes Verhalten,
+                        # sofortiger harter Verkauf wie vor diesem Fix.
+                        time_exit_reason = "CLOSED_TIME_EXIT"
                 else:
-                    time_exit_reason = "CLOSED_TIME_EXIT" if (time_exit_allowed and days_held >= max_days) else None
+                    time_exit_reason = None
 
                 if time_exit_reason:
                     real_exit_price = _sell_position_at_alpaca(session, trade, time_exit_reason, current_price)
@@ -965,7 +1021,18 @@ def monitor_open_positions(user_id: int = DEFAULT_USER_ID):
                         continue
                     close_trade(session, trade, real_exit_price, time_exit_reason)
                     start_tracking_if_applicable(session, trade)
-                    label = "Time-Exit (harte Obergrenze bei aktivem Trailing-SL)" if time_exit_reason == "CLOSED_TIME_EXIT_HARD_CAP" else "Time-Exit"
+                    if time_exit_reason == "CLOSED_TIME_EXIT_HARD_CAP":
+                        label = "Time-Exit (harte Obergrenze bei aktivem Trailing-SL)"
+                    elif trade.time_exit_grace_used:
+                        # Fix 2026-07-31: unterscheidet im Log klar einen
+                        # regulären Time-Exit (Gewinn <= 0, sofort bei
+                        # MAX_HOLDING_DAYS) von einem nach abgelaufener
+                        # Schutzfrist (siehe trade.time_exit_grace_used/
+                        # -deadline, auch für Backlook/post_exit_tracking
+                        # unterscheidbar).
+                        label = "Time-Exit (nach abgelaufener Schutzfrist)"
+                    else:
+                        label = "Time-Exit (regulär)"
                     print(f"⏰ {trade.ticker}: {label} nach {days_held} Handelstagen (PnL: ${trade.pnl_usd:.2f})")
                     continue
 
