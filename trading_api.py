@@ -24,9 +24,10 @@ from typing import Optional
 
 from database import (
     get_session, get_daily_trade_count, set_bot_config,
-    get_learning_proposals, set_learning_proposals,
+    get_learning_proposals, set_learning_proposals, get_user_live_config,
+    get_trade_mode_for_user,
 )
-from config import get_live_config, TRADING_MODE
+from config import get_live_config, DEFAULT_USER_ID
 from broker import get_portfolio_value, get_alpaca_account_snapshot, count_trading_days
 from rule_engine import get_market_regime
 import yfinance as yf
@@ -37,11 +38,19 @@ if not JWT_SECRET_KEY:
 JWT_ALGORITHM = "HS256"
 
 
-def require_auth(request: Request, token: Optional[str] = Cookie(default=None, alias="token")):
+def get_current_user_id(request: Request, token: Optional[str] = Cookie(default=None, alias="token")) -> int:
     """
-    Prüft dasselbe JWT-Cookie wie portfolio_os (siehe get_current_user dort) –
-    nur Signatur + Ablaufzeit, kein DB-Lookup (dieser Service kennt pos_users
-    nicht). Bearer-Header als Fallback wie im Portfolio-OS-Pendant.
+    KRITISCHER SICHERHEITSFIX 2026-07-31: Prüft dasselbe JWT-Cookie wie
+    portfolio_os (siehe get_current_user dort), liest aber jetzt zusätzlich
+    den "sub"-Claim (user_id, siehe portfolio_os/api.py create_access_token
+    -> {"sub": str(user.id)}) aus und gibt ihn zurück. Vorher wurde das
+    decodierte Payload komplett verworfen (nur Signatur/Ablaufzeit geprüft) –
+    dadurch bekam JEDER eingeloggte Nutzer unabhängig von seiner Identität
+    dieselben, ungefilterten globalen Daten (Daniels Live-Kapital/
+    Positionen/Handelshistorie, siehe Diagnose vom 2026-07-31). Jeder
+    Endpoint unten scopt seine Queries jetzt auf diese user_id statt
+    implizit auf DEFAULT_USER_ID/die globale Tabelle zuzugreifen.
+    Bearer-Header als Fallback wie im Portfolio-OS-Pendant.
     """
     if not token:
         auth_header = request.headers.get("Authorization", "")
@@ -50,9 +59,33 @@ def require_auth(request: Request, token: Optional[str] = Cookie(default=None, a
     if not token:
         raise HTTPException(status_code=401, detail="Nicht autorisiert")
     try:
-        jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
     except JWTError:
         raise HTTPException(status_code=401, detail="Nicht autorisiert")
+    raw_sub = payload.get("sub")
+    if raw_sub is None:
+        raise HTTPException(status_code=401, detail="Nicht autorisiert")
+    try:
+        return int(raw_sub)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Nicht autorisiert")
+
+
+def require_owner(user_id: int) -> None:
+    """
+    Einige Endpoints betreffen ABSICHTLICH globale, nicht pro-Nutzer
+    existierende Ressourcen: bot_config, entry_time_slots, learning_proposals
+    und die tägliche portfolio_value-Historie (daily_log) sind Daniels eigenes
+    Bot-Kontrollpanel (siehe UserBotConfig-Docstring in database.py – bewusst
+    NUR 5 Guardrail-Keys sind pro Nutzer in user_bot_config, alles andere
+    bleibt global). Für andere Nutzer gibt es aktuell kein eigenes
+    Einstellungen-UI/-Backend dafür (nicht Teil des Multi-Tenant-Auftrags) –
+    ein 403 hier ist daher korrekt, keine Regression: vorher bekamen andere
+    Nutzer an dieser Stelle fälschlich Daniels Werte zu sehen bzw. konnten sie
+    sogar überschreiben (siehe Sicherheitsvorfall 2026-07-31).
+    """
+    if user_id != DEFAULT_USER_ID:
+        raise HTTPException(status_code=403, detail="Nicht verfügbar für diesen Account")
 
 
 app = FastAPI(title="Trading Bot API")
@@ -72,7 +105,13 @@ app.add_middleware(
 # Alle Business-Endpoints hängen an diesem Router statt direkt an `app` –
 # gleiches Muster wie portfolio_os/api.py (protected-Router mit
 # Router-weiter Auth-Dependency). Nur /api/health bleibt öffentlich.
-protected = APIRouter(dependencies=[Depends(require_auth)])
+# get_current_user_id() ist hier als reine Enforcement-Dependency verdrahtet
+# (garantiert 401 für jeden zukünftigen Endpoint, auch falls dessen Autor
+# vergisst, den user_id-Parameter unten explizit zu deklarieren) – FastAPI
+# cached die Dependency pro Request, ein zusätzliches user_id: int =
+# Depends(get_current_user_id) an einzelnen Endpoints unten löst sie NICHT
+# doppelt aus, sondern liefert nur den bereits ermittelten Wert.
+protected = APIRouter(dependencies=[Depends(get_current_user_id)])
 
 
 @app.get("/api/health")
@@ -99,8 +138,13 @@ async def saxo_callback(code: str = None, error: str = None):
 
 
 @protected.get("/api/overview")
-def get_overview():
-    config = get_live_config()
+def get_overview(user_id: int = Depends(get_current_user_id)):
+    # get_user_live_config() statt get_live_config(): liefert Daniels globale
+    # bot_config 1:1 für DEFAULT_USER_ID, für jeden anderen Nutzer aber dessen
+    # EIGENE Guardrails aus user_bot_config (siehe database.py) – vorher
+    # bekam jeder eingeloggte Nutzer Daniels max_trades_per_day/
+    # max_open_positions angezeigt (Sicherheitsvorfall 2026-07-31).
+    config = get_user_live_config(user_id)
     with get_session() as session:
         open_trades = session.execute(text("""
             SELECT ticker, direction, instrument_type,
@@ -108,25 +152,28 @@ def get_overview():
                    quantity, capital_used, rule_score,
                    trailing_sl_active, trailing_sl_price,
                    created_at, mode, broker, status_detail
-            FROM trades WHERE status = 'OPEN'
+            FROM trades WHERE status = 'OPEN' AND user_id = :user_id
             ORDER BY created_at DESC
-        """)).fetchall()
+        """), {"user_id": user_id}).fetchall()
 
-        # Realisierter P&L
+        # Realisierter P&L – NUR dieses Nutzers eigene geschlossene Trades
+        # (Fix 2026-07-31: vorher ungefiltert über ALLE Nutzer/Daniels Konto).
         realized_pnl = float(
             session.execute(text("""
                 SELECT COALESCE(SUM(pnl_usd), 0)
                 FROM trades
-                WHERE status IN (
+                WHERE user_id = :user_id AND status IN (
                     'CLOSED_SL','CLOSED_TP',
                     'CLOSED_TRAILING_SL','CLOSED_TIME_EXIT',
                     'CLOSED_MANUAL')
-            """)).scalar() or 0)
+            """), {"user_id": user_id}).scalar() or 0)
 
         # Tages-Trades – über den existierenden Helper statt eigener Raw-SQL,
         # damit die Definition ("heute erstellte Trades, OPEN + CLOSED")
-        # exakt mit main.py/dashboard.py übereinstimmt.
-        daily_trades = get_daily_trade_count(session)
+        # exakt mit main.py/dashboard.py übereinstimmt. user_id durchreichen
+        # (Fix 2026-07-31: Helper unterstützt es längst, wurde hier aber nie
+        # übergeben – zählte bisher Daniels Trades für jeden Nutzer mit).
+        daily_trades = get_daily_trade_count(session, user_id)
 
     # Cash/Marktwert/unrealisierter G&V kommen direkt von Alpaca (Broker-
     # Wahrheit, siehe get_alpaca_account_snapshot) statt wie bisher nur den
@@ -135,8 +182,13 @@ def get_overview():
     # Uebersicht.tsx). Fallback auf get_portfolio_value() falls Alpaca gerade
     # nicht erreichbar ist (z.B. Wartungsfenster) – lieber ein etwas
     # ungenauerer Wert als ein kompletter Ausfall der Übersicht.
-    alpaca_account = get_alpaca_account_snapshot()
-    portfolio_value = alpaca_account["equity"] if alpaca_account else get_portfolio_value()
+    # Fix 2026-07-31: beide OHNE user_id fielen auf die globalen .env-Keys
+    # zurück = IMMER Daniels echtes Live-Konto, unabhängig davon wer
+    # eingeloggt war (siehe get_alpaca_account_snapshot/get_portfolio_value
+    # in broker.py – unterstützen user_id längst, wurden hier aber nie damit
+    # aufgerufen).
+    alpaca_account = get_alpaca_account_snapshot(user_id)
+    portfolio_value = alpaca_account["equity"] if alpaca_account else get_portfolio_value(user_id)
     cash = alpaca_account["cash"] if alpaca_account else None
     long_market_value = alpaca_account["long_market_value"] if alpaca_account else None
     unrealized_pnl_total = alpaca_account["unrealized_pl"] if alpaca_account else None
@@ -203,12 +255,27 @@ def get_overview():
         "max_open_positions": int(config.get("MAX_OPEN_POSITIONS", 5)),
         "vix": vix,
         "market_regime": market_regime,
-        "trading_mode": TRADING_MODE,
+        # get_trade_mode_for_user() statt des globalen TRADING_MODE-Konstante
+        # (Fix 2026-07-31): ein per Connect-Flow im Paper-Modus verbundener
+        # Nutzer soll "PAPER" sehen, nicht Daniels globales LIVE (siehe
+        # database.get_trade_mode_for_user-Docstring).
+        "trading_mode": get_trade_mode_for_user(user_id),
     }
 
 
 @protected.get("/api/performance")
-def get_performance():
+def get_performance(user_id: int = Depends(get_current_user_id)):
+    """
+    Owner-only (Fix 2026-07-31): daily_log (Portfolio-Wert-Historie fürs
+    Chart) hat KEINE user_id-Spalte und wurde nie fürs Multi-Tenant-Feature
+    migriert – log_date ist sogar UNIQUE (ein Snapshot pro Kalendertag
+    global), es gibt also strukturell keine Möglichkeit, sie auf einen
+    einzelnen Nutzer zu scopen. Da der Inhalt trotzdem Daniels reale
+    Portfolio-Werte/P&L sind (genau die Art Daten aus dem Sicherheitsvorfall),
+    ist ein 403 für alle außer DEFAULT_USER_ID hier die einzig korrekte
+    Lösung statt sie fälschlich mit anderen Nutzern zu teilen.
+    """
+    require_owner(user_id)
     with get_session() as session:
         snapshots = session.execute(text("""
             SELECT log_date, portfolio_value, daily_pnl,
@@ -227,11 +294,11 @@ def get_performance():
                 ROUND(MAX(pnl_usd)::numeric, 2) as best_trade,
                 ROUND(MIN(pnl_usd)::numeric, 2) as worst_trade
             FROM trades
-            WHERE status IN (
+            WHERE user_id = :user_id AND status IN (
                 'CLOSED_SL','CLOSED_TP',
                 'CLOSED_TRAILING_SL','CLOSED_TIME_EXIT',
                 'CLOSED_MANUAL')
-        """)).fetchone()
+        """), {"user_id": user_id}).fetchone()
 
         return {
             "snapshots": [dict(s._mapping) for s in snapshots],
@@ -252,14 +319,16 @@ def _parse_json_field(raw, default):
 
 
 @protected.get("/api/trades/history")
-def get_trade_history(limit: int = 50):
+def get_trade_history(limit: int = 50, user_id: int = Depends(get_current_user_id)):
     """
-    Alle Positionen (offen + geschlossen) für die Handelshistorie-Ansicht.
-    Bis 2026-07-28 wurden hier nur geschlossene Trades zurückgegeben (WHERE
-    status NOT IN ('OPEN', ...)) – offene Positionen fehlten trotz längst
-    bekanntem Kaufdatum/-preis komplett. Sortierung jetzt nach created_at
-    (Kaufzeitpunkt) statt closed_at, damit gerade gekaufte offene Positionen
-    sofort oben erscheinen, unabhängig vom Status.
+    Alle Positionen (offen + geschlossen) für die Handelshistorie-Ansicht,
+    NUR des eingeloggten Nutzers (Fix 2026-07-31 – vorher komplett
+    ungefiltert, jeder Nutzer sah ALLE Trades aller Nutzer/Daniels
+    Live-Konto). Bis 2026-07-28 wurden hier nur geschlossene Trades
+    zurückgegeben (WHERE status NOT IN ('OPEN', ...)) – offene Positionen
+    fehlten trotz längst bekanntem Kaufdatum/-preis komplett. Sortierung
+    jetzt nach created_at (Kaufzeitpunkt) statt closed_at, damit gerade
+    gekaufte offene Positionen sofort oben erscheinen, unabhängig vom Status.
 
     pnl_usd/pnl_pct bleiben unverändert NULL für OPEN-Trades (das ist die
     Definition "realisierter P&L", siehe database.get_total_pnl/get_daily_pnl
@@ -290,10 +359,10 @@ def get_trade_history(limit: int = 50):
                     ELSE status
                 END as exit_grund
             FROM trades
-            WHERE status != 'PENDING'
+            WHERE status != 'PENDING' AND user_id = :user_id
             ORDER BY created_at DESC
             LIMIT :limit
-        """), {"limit": limit}).fetchall()
+        """), {"limit": limit, "user_id": user_id}).fetchall()
 
         result = []
         for r in rows:
@@ -324,9 +393,13 @@ def get_trade_history(limit: int = 50):
 
 
 @protected.get("/api/benchmark")
-def get_benchmark(days: int = 30):
+def get_benchmark(days: int = 30, user_id: int = Depends(get_current_user_id)):
     """30-Tage Bot-vs-Markt-Vergleich (siehe rule_engine/broker, Feature
-    Benchmark-Vergleich vom 2026-07-25)."""
+    Benchmark-Vergleich vom 2026-07-25). Owner-only (Fix 2026-07-31): nutzt
+    get_bot_performance(), das wie /api/performance auf daily_log basiert
+    (keine user_id-Spalte, strukturell nicht pro Nutzer scopebar, siehe
+    Kommentar dort) und Daniels reale Portfolio-Performance zurückgibt."""
+    require_owner(user_id)
     from rule_engine import get_benchmark_performance
     from broker import get_bot_performance
     return {
@@ -337,6 +410,16 @@ def get_benchmark(days: int = 30):
 
 @protected.get("/api/scan-log")
 def get_scan_log(limit: int = 500, ticker: Optional[str] = None):
+    """
+    Bewusst NICHT auf user_id gescopt (Security-Review 2026-07-31): der
+    Signal-Scan läuft zentral EINMAL pro Ticker/Slot für die gesamte
+    Watchlist – scan_log enthält keine Kapital-/Positions-/Kontodaten
+    irgendeines Nutzers, nur öffentlich am Markt beobachtbare Indikatoren
+    (RSI/SMA/Volumen/Score) plus ob der GLOBALE Bot bei diesem Scan gekauft
+    hat. Für jeden Nutzer identisch und nicht sensibel – im Unterschied zu
+    /api/overview, /api/trades/history etc. war das nie Teil der Sicherheits-
+    lücke, daher hier absichtlich keine Änderung.
+    """
     query = """
         SELECT
             id,
@@ -392,7 +475,9 @@ def get_scan_log(limit: int = 500, ticker: Optional[str] = None):
 @protected.get("/api/scan-log/stats")
 def get_scan_log_stats():
     """Welche Filter haben in den letzten 30 Tagen wie oft geblockt (siehe
-    Filter-Statistik im Scan-Historie-Tab)."""
+    Filter-Statistik im Scan-Historie-Tab). Bewusst nicht user_id-gescopt,
+    gleicher Grund wie /api/scan-log oben (zentraler, nutzerunabhängiger
+    Signal-Scan – keine Konto-/Positionsdaten)."""
     with get_session() as session:
         rows = session.execute(text("""
             SELECT
@@ -414,7 +499,10 @@ def get_scan_log_stats():
 
 
 @protected.get("/api/bot-config")
-def get_bot_config_all():
+def get_bot_config_all(user_id: int = Depends(get_current_user_id)):
+    """Owner-only (Fix 2026-07-31, siehe require_owner-Docstring) – bot_config
+    ist Daniels globales Bot-Kontrollpanel, kein Multi-Tenant-Konzept."""
+    require_owner(user_id)
     with get_session() as session:
         rows = session.execute(text("""
             SELECT key, value, beschreibung
@@ -424,7 +512,13 @@ def get_bot_config_all():
 
 
 @protected.put("/api/bot-config/{key}")
-def update_bot_config(key: str, body: dict):
+def update_bot_config(key: str, body: dict, user_id: int = Depends(get_current_user_id)):
+    """Owner-only (Fix 2026-07-31): vorher konnte JEDER eingeloggte Nutzer
+    Daniels Live-Guardrails überschreiben (siehe require_owner-Docstring).
+    Autorisierung basiert ausschließlich auf der aus dem JWT gelesenen
+    user_id – key/body kommen zwar vom Client, adressieren aber ohnehin nur
+    die eine globale bot_config-Zeile, nie einen anderen Nutzer."""
+    require_owner(user_id)
     with get_session() as session:
         set_bot_config(session, key, body.get("value"))
         session.commit()
@@ -460,11 +554,13 @@ BOT_CONFIG_PRESETS = {
 
 
 @protected.post("/api/bot-config/preset")
-def apply_bot_config_preset(body: dict):
+def apply_bot_config_preset(body: dict, user_id: int = Depends(get_current_user_id)):
     """Identisches Preset-System wie portfolio_os (POST /api/bot-config/preset,
     siehe Onboarding-Feature vom 2026-07-25) – hier direkt gegen die
     gemeinsame DB statt über den trading_bot_connector (dieser Service läuft
-    ja im selben Repo/venv wie trading_bot)."""
+    ja im selben Repo/venv wie trading_bot). Owner-only (Fix 2026-07-31, siehe
+    require_owner-Docstring)."""
+    require_owner(user_id)
     preset = body.get("preset")
     if preset not in BOT_CONFIG_PRESETS:
         raise HTTPException(400, "Unbekanntes Preset")
@@ -476,13 +572,16 @@ def apply_bot_config_preset(body: dict):
 
 
 @protected.get("/api/learning-proposals")
-def get_pending_learning_proposals():
+def get_pending_learning_proposals(user_id: int = Depends(get_current_user_id)):
     """Offene (status='pending') KI-Lernvorschläge aus dem wöchentlichen
     Lernzyklus (siehe backlook.py: analyze_optimal_threshold/analyze_ticker_performance).
     Jeder Eintrag bekommt seinen Index in der ungefilterten Gesamtliste zurück
     (statt des Index in dieser gefilterten Antwort) – accept/reject adressieren
     darüber den richtigen Eintrag, auch wenn dazwischen bereits andere
-    Vorschläge akzeptiert/abgelehnt wurden."""
+    Vorschläge akzeptiert/abgelehnt wurden. Owner-only (Fix 2026-07-31, siehe
+    require_owner-Docstring) – betrifft ausschließlich Daniels globale
+    bot_config (MIN_SIGNAL_SCORE etc.)."""
+    require_owner(user_id)
     with get_session() as session:
         all_proposals = get_learning_proposals(session)
         return [
@@ -493,7 +592,10 @@ def get_pending_learning_proposals():
 
 
 @protected.post("/api/learning-proposals/accept")
-def accept_learning_proposal(body: dict):
+def accept_learning_proposal(body: dict, user_id: int = Depends(get_current_user_id)):
+    """Owner-only (Fix 2026-07-31, siehe require_owner-Docstring) – setzt
+    ggf. MIN_SIGNAL_SCORE in Daniels globaler bot_config."""
+    require_owner(user_id)
     idx = body.get("index")
     with get_session() as session:
         proposals = get_learning_proposals(session)
@@ -509,7 +611,9 @@ def accept_learning_proposal(body: dict):
 
 
 @protected.post("/api/learning-proposals/reject")
-def reject_learning_proposal(body: dict):
+def reject_learning_proposal(body: dict, user_id: int = Depends(get_current_user_id)):
+    """Owner-only (Fix 2026-07-31, siehe require_owner-Docstring)."""
+    require_owner(user_id)
     idx = body.get("index")
     with get_session() as session:
         proposals = get_learning_proposals(session)
@@ -522,7 +626,10 @@ def reject_learning_proposal(body: dict):
 
 
 @protected.get("/api/entry-slots")
-def get_entry_slots():
+def get_entry_slots(user_id: int = Depends(get_current_user_id)):
+    """Owner-only (Fix 2026-07-31, siehe require_owner-Docstring) –
+    entry_time_slots ist Daniels globaler Zeitplan, kein Multi-Tenant-Konzept."""
+    require_owner(user_id)
     with get_session() as session:
         rows = session.execute(text("""
             SELECT id, stunde_et, minute_et, gewichtung,
@@ -535,8 +642,10 @@ def get_entry_slots():
 
 
 @protected.put("/api/entry-slots/{slot_id}")
-def update_entry_slot(slot_id: int, body: dict):
-    """Aktiv-Toggle / Gewichtung ändern (siehe Einstellungen-Tab)."""
+def update_entry_slot(slot_id: int, body: dict, user_id: int = Depends(get_current_user_id)):
+    """Aktiv-Toggle / Gewichtung ändern (siehe Einstellungen-Tab). Owner-only
+    (Fix 2026-07-31, siehe require_owner-Docstring)."""
+    require_owner(user_id)
     fields = []
     params = {"id": slot_id}
     if "aktiv" in body:
@@ -557,13 +666,18 @@ def update_entry_slot(slot_id: int, body: dict):
 
 
 @protected.get("/api/settings/entry-learning-mode")
-def get_entry_learning_mode():
+def get_entry_learning_mode(user_id: int = Depends(get_current_user_id)):
+    """Owner-only (Fix 2026-07-31, siehe require_owner-Docstring) –
+    ENTRY_LEARNING_MODE ist ein globaler bot_config-Key."""
+    require_owner(user_id)
     config = get_live_config()
     return {"lernmodus": str(config.get("ENTRY_LEARNING_MODE", "false")).lower() == "true"}
 
 
 @protected.put("/api/settings/entry-learning-mode")
-def update_entry_learning_mode(body: dict):
+def update_entry_learning_mode(body: dict, user_id: int = Depends(get_current_user_id)):
+    """Owner-only (Fix 2026-07-31, siehe require_owner-Docstring)."""
+    require_owner(user_id)
     with get_session() as session:
         set_bot_config(session, "ENTRY_LEARNING_MODE", "true" if body.get("lernmodus") else "false")
         session.commit()
