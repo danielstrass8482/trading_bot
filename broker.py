@@ -869,12 +869,15 @@ def monitor_open_positions(user_id: int = DEFAULT_USER_ID):
     - Time-based Exit: Ohne aktiven Trailing-SL wird die Position nach
       MAX_HOLDING_DAYS Handelstagen geschlossen (CLOSED_TIME_EXIT) – AUSSER
       (Schutzfrist-Feature, 2026-07-31) sie steht zu diesem Zeitpunkt im Plus:
-      dann bekommt sie statt des sofortigen harten Verkaufs einen Break-Even-
-      Stop (trade.stop_loss = entry_price) und bis zu TIME_EXIT_GRACE_DAYS
+      dann bekommt sie statt des sofortigen harten Verkaufs einen nachgezogenen
+      Stop auf hälftige Gewinnsicherung (trade.stop_loss = entry_price +
+      halber bisheriger Kursgewinn, Korrektur 2026-07-31 - ursprünglich
+      Break-Even, siehe Commit c6a0df1) und bis zu TIME_EXIT_GRACE_DAYS
       weitere Handelstage Zeit, entweder die Trailing-Aktivierungsschwelle
       noch zu erreichen (dann übernimmt das normale Trailing-Verhalten
-      vollständig, inkl. dessen eigenem Hard-Cap) oder den Break-Even-Stop
-      auszulösen (normaler CLOSED_SL-Exit, kein Verlust ggü. Entry) – läuft
+      vollständig, inkl. dessen eigenem Hard-Cap) oder den nachgezogenen Stop
+      auszulösen (normaler CLOSED_SL-Exit, hälftiger Gewinn ggü. Entry bleibt
+      gesichert) – läuft
       die Schutzfrist dagegen ab, ohne dass eines von beidem passiert ist,
       wird hart verkauft (weiterhin CLOSED_TIME_EXIT, aber
       trade.time_exit_grace_used=True markiert diesen Fall als "nach
@@ -996,17 +999,25 @@ def monitor_open_positions(user_id: int = DEFAULT_USER_ID):
                     # Regulärer Time-Exit-Trigger erreicht - Schutzfrist-
                     # Unterscheidung (Fix 2026-07-31): nur Gewinner ohne
                     # Trailing-Aktivierung bekommen statt des sofortigen
-                    # harten Verkaufs einen Break-Even-Stop + Aufschub.
+                    # harten Verkaufs einen nachgezogenen Stop (hälftige
+                    # Gewinnsicherung, Korrektur 2026-07-31 - ursprünglich
+                    # Break-Even, siehe c6a0df1) + Aufschub.
                     unrealized_pnl = (current_price - trade.entry_price) * trade.quantity
                     if unrealized_pnl > 0:
+                        # Hälftige Gewinnsicherung statt Break-Even: die
+                        # Haelfte des bisher erreichten Kursgewinns bleibt bei
+                        # einem Stop-Treffer gesichert, statt Gewinn komplett
+                        # gegen Null abzugeben. Bei z.B. +4% liegt der neue
+                        # Stop bei ca. +2% ueber Entry, nicht bei 0%.
+                        half_gain_stop = round(trade.entry_price + (current_price - trade.entry_price) / 2, 2)
                         trade.time_exit_grace_deadline = add_trading_days(datetime.now().date(), grace_days)
                         trade.time_exit_grace_used = True
-                        trade.stop_loss = trade.entry_price
+                        trade.stop_loss = half_gain_stop
                         time_exit_reason = None
                         print(f"🛡️  {trade.ticker}: Time-Exit fällig (Tag {days_held}), aber im Plus "
                               f"(${unrealized_pnl:.2f}) und Trailing noch nicht aktiv – Schutzfrist bis "
-                              f"{trade.time_exit_grace_deadline} gewährt, Stop-Loss auf Break-Even "
-                              f"(${trade.entry_price}) nachgezogen.")
+                              f"{trade.time_exit_grace_deadline} gewährt, Stop-Loss auf hälftige "
+                              f"Gewinnsicherung (${half_gain_stop}, Entry war ${trade.entry_price}) nachgezogen.")
                     else:
                         # Break-Even oder Verlust: unverändertes Verhalten,
                         # sofortiger harter Verkauf wie vor diesem Fix.

@@ -147,7 +147,9 @@ class Trade(Base):
     # Aktivierungsschwelle noch nicht erreicht hat - statt eines sofortigen
     # harten Time-Exit-Verkaufs bekommt sie bis zu diesem Datum (heute +
     # TIME_EXIT_GRACE_DAYS Handelstage, siehe broker.add_trading_days) einen
-    # Break-Even-Stop (trade.stop_loss = entry_price). None = keine Schutzfrist
+    # nachgezogenen Stop auf hälftige Gewinnsicherung (trade.stop_loss =
+    # entry_price + halber bisheriger Kursgewinn, Korrektur 2026-07-31 -
+    # ursprünglich Break-Even, siehe Commit c6a0df1). None = keine Schutzfrist
     # (weder gewährt noch nötig).
     time_exit_grace_deadline   = Column(Date, nullable=True)
     # True sobald die Schutzfrist EINMAL gewährt wurde - verhindert eine
