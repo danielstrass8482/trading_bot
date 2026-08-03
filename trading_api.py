@@ -25,10 +25,14 @@ from typing import Optional
 from database import (
     get_session, get_daily_trade_count, set_bot_config,
     get_learning_proposals, set_learning_proposals, get_user_live_config,
-    get_trade_mode_for_user,
+    get_trade_mode_for_user, set_capital_allocations,
 )
 from config import get_live_config, DEFAULT_USER_ID
-from broker import get_portfolio_value, get_alpaca_account_snapshot, count_trading_days
+from broker import (
+    get_effective_max_capital_total_bot, get_or_seed_capital_allocations,
+    CAPITAL_ALLOCATION_CATEGORIES,
+    get_portfolio_value, get_alpaca_account_snapshot, count_trading_days,
+)
 from rule_engine import get_market_regime
 import yfinance as yf
 
@@ -151,7 +155,7 @@ def get_overview(user_id: int = Depends(get_current_user_id)):
                    entry_price, stop_loss, take_profit,
                    quantity, capital_used, rule_score,
                    trailing_sl_active, trailing_sl_price,
-                   created_at, mode, broker, status_detail
+                   created_at, mode, broker, status_detail, sector
             FROM trades WHERE status = 'OPEN' AND user_id = :user_id
             ORDER BY created_at DESC
         """), {"user_id": user_id}).fetchall()
@@ -522,6 +526,50 @@ def update_bot_config(key: str, body: dict, user_id: int = Depends(get_current_u
     with get_session() as session:
         set_bot_config(session, key, body.get("value"))
         session.commit()
+    return {"ok": True}
+
+
+@protected.get("/api/capital-allocations")
+def get_capital_allocations_endpoint(user_id: int = Depends(get_current_user_id)):
+    """
+    Prozent-Aufteilung von Daniels echtem Gesamtkapital (Aufgabe "Kapital-
+    Einstellungen Prozent-Umbau") – Owner-only wie /api/bot-config (kein
+    Multi-Tenant-Konzept für dieses Feature). Liefert zusätzlich das
+    bereits berechnete effective_max_capital_total_bot (Gesamtkapital ×
+    Bot-Anteil), damit das Frontend nicht selbst nachrechnen muss.
+    """
+    require_owner(user_id)
+    real_snapshot = get_alpaca_account_snapshot(user_id)
+    real_total = real_snapshot["equity"] if real_snapshot else None
+    allocations = get_or_seed_capital_allocations(real_total)
+    return {
+        "allocations": allocations,
+        "effective_max_capital_total_bot": get_effective_max_capital_total_bot(user_id),
+        "real_total_capital": real_total,
+    }
+
+
+@protected.put("/api/capital-allocations")
+def update_capital_allocations(body: dict, user_id: int = Depends(get_current_user_id)):
+    """Owner-only. Erwartet {"allocations": {"bot": X, "active_trading": Y}} –
+    alle bekannten Kategorien (CAPITAL_ALLOCATION_CATEGORIES), Summe=100."""
+    require_owner(user_id)
+    allocations = body.get("allocations")
+    if not isinstance(allocations, dict) or not allocations:
+        raise HTTPException(status_code=400, detail="allocations fehlt")
+    unknown = set(allocations.keys()) - set(CAPITAL_ALLOCATION_CATEGORIES)
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unbekannte Kategorie(n): {unknown}")
+    try:
+        values = [float(v) for v in allocations.values()]
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Prozentwerte müssen Zahlen sein")
+    if any(v < 0 for v in values):
+        raise HTTPException(status_code=400, detail="Prozentwerte dürfen nicht negativ sein")
+    if abs(sum(values) - 100) > 0.5:
+        raise HTTPException(status_code=400, detail=f"Summe muss 100 ergeben (ist {sum(values):.1f})")
+    with get_session() as session:
+        set_capital_allocations(session, {k: float(v) for k, v in allocations.items()})
     return {"ok": True}
 
 

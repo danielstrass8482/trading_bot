@@ -28,7 +28,7 @@ from llm_analyst import analyze_with_llm, get_market_brief
 from broker import (
     place_trade, monitor_open_positions, get_portfolio_value, get_bot_performance,
     check_guardrails, check_position_consistency, GuardrailViolation,
-    get_alpaca_account_snapshot,
+    get_alpaca_account_snapshot, get_effective_max_capital_total_bot,
 )
 from backlook import run_backlook
 from fair_value import update_fair_value_cache, get_undervalued_tickers
@@ -377,7 +377,11 @@ def calculate_max_trades_today(user_id: int = DEFAULT_USER_ID) -> int:
     unabhängig davon für alle anderen Nutzer normal weiter.
     """
     config = get_user_live_config(user_id)
-    max_capital_total = float(config.get("MAX_CAPITAL_TOTAL", 475))
+    # Aufgabe "Kapital-Einstellungen Prozent-Umbau": für DEFAULT_USER_ID
+    # (Daniel) ersetzt der Prozent-Anteil vom echten Gesamtkapital den alten
+    # statischen Wert (siehe broker.get_effective_max_capital_total_bot),
+    # andere Nutzer behalten unverändert ihr eigenes UserBotConfig.
+    max_capital_total = get_effective_max_capital_total_bot(user_id)
     max_per_trade = float(config.get("MAX_CAPITAL_PER_TRADE", 50))
     max_open = int(config.get("MAX_OPEN_POSITIONS", 5))
 

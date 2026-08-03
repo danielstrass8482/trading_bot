@@ -9,7 +9,7 @@ import pytz
 from datetime import datetime, timedelta
 from config import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL,
-    TRADING_MODE, get_live_config, DEFAULT_USER_ID,
+    TRADING_MODE, get_live_config, DEFAULT_USER_ID, MAX_CAPITAL_TOTAL,
 )
 from database import (
     get_session, Trade, get_open_trades,
@@ -17,7 +17,8 @@ from database import (
     get_total_pnl, get_daily_pnl, close_trade, BotState,
     get_alpaca_api_for_user, PendingOrderAttempt,
     get_active_entry_time_slots, get_user_live_config,
-    get_trade_mode_for_user,
+    get_trade_mode_for_user, get_bot_config,
+    get_capital_allocations, set_capital_allocations,
 )
 from rule_engine import SignalResult
 from broker_interface import BrokerInterface
@@ -121,6 +122,65 @@ def get_alpaca_account_snapshot(user_id: int = None) -> dict | None:
     }
 
 
+CAPITAL_ALLOCATION_CATEGORIES = ["bot", "active_trading"]
+
+
+def get_or_seed_capital_allocations(real_total_capital: float | None) -> dict:
+    """
+    Liest die Prozent-Aufteilung des Gesamtkapitals (Aufgabe "Kapital-
+    Einstellungen Prozent-Umbau"); beim allerersten Aufruf (Tabelle noch
+    leer) wird sie EINMALIG aus dem alten statischen MAX_CAPITAL_TOTAL-Wert
+    hergeleitet (Migrations-Punkt 6): bot_pct = altes MAX_CAPITAL_TOTAL /
+    echtes Gesamtkapital × 100, Rest an "active_trading". Ist real_total_
+    capital gerade nicht bekannt (Alpaca nicht erreichbar), wird
+    Fail-safe mit bot_pct=100 geseedet (kompletter Umbau erst beim nächsten
+    erfolgreichen Aufruf mit echtem Kapital – verhindert einen falschen,
+    zu niedrigen Startwert allein wegen eines vorübergehenden API-Ausfalls).
+    """
+    with get_session() as session:
+        existing = get_capital_allocations(session)
+        if existing:
+            return existing
+        legacy_max_capital_total = float(get_bot_config(session, "MAX_CAPITAL_TOTAL") or MAX_CAPITAL_TOTAL)
+        if real_total_capital and real_total_capital > 0:
+            bot_pct = max(0.0, min(100.0, round(legacy_max_capital_total / real_total_capital * 100, 1)))
+        else:
+            bot_pct = 100.0
+        allocations = {"bot": bot_pct, "active_trading": round(100 - bot_pct, 1)}
+        set_capital_allocations(session, allocations)
+        return allocations
+
+
+def get_effective_max_capital_total_bot(user_id: int = DEFAULT_USER_ID) -> float:
+    """
+    Ersetzt die alte statische MAX_CAPITAL_TOTAL-Grenze in den Guardrails
+    (Aufgabe "Kapital-Einstellungen Prozent-Umbau") – NUR für DEFAULT_USER_ID
+    (Daniel): effective = echtes Gesamtkapital (cash + gebundenes Kapital,
+    siehe get_alpaca_account_snapshot "equity") × Bot-Anteil-Prozent (siehe
+    CapitalAllocation, Kategorie "bot"). Andere verbundene Nutzer haben für
+    dieses Feature aktuell kein eigenes Einstellungen-UI (siehe require_owner
+    in trading_api.py) und behalten deshalb unverändert ihr eigenes
+    UserBotConfig.MAX_CAPITAL_TOTAL als absoluten, weiterhin manuell
+    konfigurierten Wert.
+
+    Broker gerade nicht erreichbar (real_snapshot is None): Fail-safe-
+    Fallback auf den (weiterhin in bot_config gepflegten) MAX_CAPITAL_TOTAL-
+    Wert, statt 0 zurückzugeben – 0 würde jeden Trade blockieren und wäre
+    strenger als der bisherige Fail-safe-Pfad dieser Guardrails.
+    """
+    if user_id != DEFAULT_USER_ID:
+        return float(get_user_live_config(user_id).get("MAX_CAPITAL_TOTAL", 100))
+
+    real_snapshot = get_alpaca_account_snapshot(user_id)
+    real_total = real_snapshot["equity"] if real_snapshot else None
+    allocations = get_or_seed_capital_allocations(real_total)
+    bot_pct = allocations.get("bot", 100.0)
+
+    if real_total is None:
+        return float(get_live_config().get("MAX_CAPITAL_TOTAL", MAX_CAPITAL_TOTAL))
+    return round(real_total * bot_pct / 100, 2)
+
+
 def _user_pause_key(user_id: int) -> str:
     """
     DEFAULT_USER_ID nutzt bewusst den EXISTIERENDEN globalen "bot_paused"-Key
@@ -169,7 +229,7 @@ def check_guardrails(signal: SignalResult, user_id: int = DEFAULT_USER_ID) -> No
 
         # 5. Tägliches Verlustlimit
         daily_pnl = get_daily_pnl(session, user_id)
-        daily_loss_limit = cfg["MAX_CAPITAL_TOTAL"] * cfg["DAILY_LOSS_LIMIT_PCT"]
+        daily_loss_limit = get_effective_max_capital_total_bot(user_id) * cfg["DAILY_LOSS_LIMIT_PCT"]
         if daily_pnl < 0 and abs(daily_pnl) >= daily_loss_limit:
             BotState.set(session, _user_pause_key(user_id), "true")
             session.commit()
@@ -194,10 +254,17 @@ def check_guardrails(signal: SignalResult, user_id: int = DEFAULT_USER_ID) -> No
         if real_snapshot is not None:
             invested = get_total_capital_in_trades(session, user_id)
             real_total_capital = real_snapshot["cash"] + invested
-            if cfg["MAX_CAPITAL_TOTAL"] > real_total_capital:
+            # Für DEFAULT_USER_ID strukturell nicht mehr erreichbar (Aufgabe
+            # "Kapital-Einstellungen Prozent-Umbau"): get_effective_max_
+            # capital_total_bot() ist als Prozentsatz DES echten Kapitals
+            # definiert, kann es also nie übersteigen. Bleibt für andere
+            # Nutzer (weiterhin absolutes UserBotConfig.MAX_CAPITAL_TOTAL)
+            # unverändert wirksam.
+            effective_max_capital_total = get_effective_max_capital_total_bot(user_id)
+            if effective_max_capital_total > real_total_capital:
                 raise GuardrailViolation(
                     f"Nutzer {user_id}: konfiguriertes Limit übersteigt echtes Kapital "
-                    f"(konfiguriert: ${cfg['MAX_CAPITAL_TOTAL']:.2f}, echt: ${real_total_capital:.2f}), "
+                    f"(konfiguriert: ${effective_max_capital_total:.2f}, echt: ${real_total_capital:.2f}), "
                     f"Kandidat übersprungen"
                 )
 

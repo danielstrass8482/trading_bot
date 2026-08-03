@@ -388,6 +388,47 @@ DEFAULT_CONFIG = {
 }
 
 
+class CapitalAllocation(Base):
+    """
+    Prozent-Aufteilung von Daniels echtem Gesamtkapital (Aufgabe "Kapital-
+    Einstellungen Prozent-Umbau") – ersetzt die alte statische MAX_CAPITAL_
+    TOTAL-Grenze (bleibt als DB-Wert/Fallback bestehen, siehe get_portfolio_
+    value()/Profit-Alert, wird aber nicht mehr als Guardrail-Obergrenze
+    genutzt). GENERISCH über `category` statt fest benannter Spalten (z.B.
+    "bot"/"active_trading"), damit eine dritte Kategorie später per simplem
+    INSERT dazukommt statt einer Schema-Migration. Summe aller Zeilen muss
+    100 ergeben (von der API validiert, nicht vom Schema erzwungen). Bewusst
+    GLOBAL wie bot_config (nicht user_bot_config) – dieses Feature hat wie
+    bot_config kein Multi-Tenant-UI (siehe require_owner in trading_api.py),
+    andere Nutzer behalten ihr eigenes UserBotConfig.MAX_CAPITAL_TOTAL
+    unverändert als absoluten Wert (siehe broker.get_effective_max_capital_
+    total_bot).
+    """
+    __tablename__ = "capital_allocations"
+
+    category   = Column(String(30), primary_key=True)
+    percentage = Column(Float, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+def get_capital_allocations(session: Session) -> dict:
+    return {r.category: r.percentage for r in session.query(CapitalAllocation).all()}
+
+
+def set_capital_allocations(session: Session, allocations: dict):
+    """Ersetzt ALLE übergebenen Kategorien atomar (Zwei-Segment-Slider
+    liefert immer den kompletten neuen Satz). Summen-Validierung (=100)
+    liegt bewusst beim Aufrufer (trading_api.py), nicht hier – diese
+    Funktion ist ein reiner Persistenz-Helper."""
+    for category, pct in allocations.items():
+        row = session.query(CapitalAllocation).filter_by(category=category).first()
+        if row:
+            row.percentage = pct
+        else:
+            session.add(CapitalAllocation(category=category, percentage=pct))
+    session.commit()
+
+
 class UserBotConfig(Base):
     """
     Pro-Nutzer-Guardrails für den Multi-Tenant-Handelsloop (2026-07-30, siehe
