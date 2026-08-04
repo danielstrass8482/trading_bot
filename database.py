@@ -605,15 +605,29 @@ class FairValueCache(Base):
 
 
 class DailyLog(Base):
-    """Tägliche Zusammenfassung für Performance-Chart."""
+    """
+    Tägliche Zusammenfassung für Performance-Chart. Bis 2026-08-04 war
+    log_date GLOBAL eindeutig (ein Snapshot/Tag für alle Nutzer, log_date
+    unique=True) – Multi-Tenant-Performance/-Benchmark (Fix 2026-08-04,
+    siehe trading_api.get_performance/get_benchmark, vorher require_owner()
+    weil strukturell nicht scopebar) braucht stattdessen EINEN Snapshot PRO
+    NUTZER PRO TAG, daher user_id ergänzt und die Eindeutigkeit auf
+    (log_date, user_id) verschoben (siehe __table_args__ und
+    _migrate_daily_log_user_id_column).
+    """
     __tablename__ = "daily_log"
 
     id             = Column(Integer, primary_key=True, autoincrement=True)
-    log_date       = Column(Date, default=date.today, unique=True)
+    log_date       = Column(Date, default=date.today)
+    user_id        = Column(Integer, nullable=False, default=DEFAULT_USER_ID)
     portfolio_value = Column(Float, nullable=False)
     daily_pnl      = Column(Float, default=0.0)
     trades_count   = Column(Integer, default=0)
     open_positions = Column(Integer, default=0)
+
+    __table_args__ = (
+        UniqueConstraint('log_date', 'user_id', name='uq_daily_log_date_user'),
+    )
 
 
 class DailyPositionSnapshot(Base):
@@ -699,6 +713,7 @@ def init_db():
     _migrate_trades_entry_price_nullable()
     _migrate_trades_time_exit_grace_columns()
     _migrate_trades_status_column_width()
+    _migrate_daily_log_user_id_column()
     _seed_saxo_token_from_env()
     # Initiale Bot-State-Werte setzen falls nicht vorhanden
     with get_session() as session:
@@ -924,6 +939,43 @@ def _migrate_trades_status_column_width():
     from sqlalchemy import text
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE trades ALTER COLUMN status TYPE VARCHAR(30)"))
+
+
+def _migrate_daily_log_user_id_column():
+    """
+    daily_log hatte bisher keine user_id-Spalte und log_date war GLOBAL
+    eindeutig (ein Snapshot/Tag für ALLE Nutzer, siehe alte
+    UniqueConstraint(log_date)) – Multi-Tenant-Performance/-Benchmark (Fix
+    2026-08-04, siehe trading_api.get_performance/get_benchmark, vorher
+    require_owner() weil strukturell nicht pro Nutzer scopebar) braucht
+    stattdessen einen Snapshot PRO NUTZER PRO TAG.
+
+    Additive, non-destruktive Migration: Spalte ergänzen, bestehende Zeilen
+    (ausschließlich Daniels eigene Snapshots bisher) auf DEFAULT_USER_ID
+    zurückschreiben, NOT NULL setzen, dann die alte Ein-Spalten-UNIQUE
+    (daily_log_log_date_key, empirisch verifiziert – Postgres' Default-Name
+    für ein inline unique=True) gegen eine zusammengesetzte UNIQUE(log_date,
+    user_id) ersetzen (siehe DailyLog.__table_args__). Die Constraint-
+    Erstellung läuft in einem DO-Block mit pg_constraint-Existenzcheck, da
+    Postgres kein `ADD CONSTRAINT IF NOT EXISTS` kennt (im Gegensatz zu
+    `ADD COLUMN IF NOT EXISTS`).
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE daily_log ADD COLUMN IF NOT EXISTS user_id INTEGER"))
+        conn.execute(text("UPDATE daily_log SET user_id = :uid WHERE user_id IS NULL"), {"uid": DEFAULT_USER_ID})
+        conn.execute(text("ALTER TABLE daily_log ALTER COLUMN user_id SET NOT NULL"))
+        conn.execute(text("ALTER TABLE daily_log DROP CONSTRAINT IF EXISTS daily_log_log_date_key"))
+        conn.execute(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'uq_daily_log_date_user'
+                ) THEN
+                    ALTER TABLE daily_log ADD CONSTRAINT uq_daily_log_date_user UNIQUE (log_date, user_id);
+                END IF;
+            END $$;
+        """))
 
 
 def _migrate_trades_entry_price_nullable():
@@ -1152,6 +1204,22 @@ def set_bot_config(session: Session, key: str, value):
         session.add(BotConfig(key=key, value=str(value)))
 
 
+def set_user_bot_config(session: Session, user_id: int, key: str, value):
+    """
+    Schreibt/aktualisiert einen Pro-Nutzer-Guardrail-Wert in user_bot_config
+    (Multi-Tenant-Bot-Config-API, Fix 2026-08-04, siehe UserBotConfig-
+    Docstring). Der Aufrufer (trading_api.update_bot_config) validiert VORHER,
+    dass `key` einer der 5 in DEFAULT_USER_CONFIG definierten Guardrail-Keys
+    ist – diese Funktion selbst prüft das nicht, analog zu set_bot_config()
+    oben, das ebenfalls keine Schlüssel-Validierung übernimmt."""
+    row = session.query(UserBotConfig).filter_by(user_id=user_id, key=key).first()
+    if row:
+        row.value = str(value)
+        row.updated_at = datetime.utcnow()
+    else:
+        session.add(UserBotConfig(user_id=user_id, key=key, value=str(value)))
+
+
 def get_active_weights(session: Session) -> dict:
     """
     Gibt die aktuell aktiven Score-Gewichtungen zurück.
@@ -1276,18 +1344,24 @@ def apply_entry_time_proposal(session: Session, vorschlaege: list[dict]):
                 ))
 
 
-def save_daily_snapshot(session: Session, portfolio_value: float):
-    """Speichert oder aktualisiert den täglichen Portfolio-Snapshot."""
+def save_daily_snapshot(session: Session, user_id: int, portfolio_value: float):
+    """
+    Speichert oder aktualisiert den täglichen Portfolio-Snapshot EINES
+    Nutzers (Multi-Tenant, Fix 2026-08-04 – vorher ein einziger globaler
+    Snapshot/Tag, siehe DailyLog-Docstring). Aufrufer (main.run_entry_cycle)
+    ruft dies jetzt für jeden verbundenen Nutzer einzeln auf.
+    """
     today = date.today()
-    existing = session.query(DailyLog).filter_by(log_date=today).first()
+    existing = session.query(DailyLog).filter_by(log_date=today, user_id=user_id).first()
     if existing:
         existing.portfolio_value = portfolio_value
     else:
         session.add(DailyLog(
             log_date=today,
+            user_id=user_id,
             portfolio_value=portfolio_value,
-            trades_count=get_daily_trade_count(session),
-            open_positions=len(get_open_trades(session))
+            trades_count=get_daily_trade_count(session, user_id),
+            open_positions=len(get_open_trades(session, user_id))
         ))
 
 

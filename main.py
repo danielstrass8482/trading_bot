@@ -743,10 +743,22 @@ def run_entry_cycle(slot: EntryTimeSlot):
     slot_label = f"{slot.stunde_et:02d}:{slot.minute_et:02d}"
     log_scan_results(signals, slot_label, executed_trades_by_ticker, guardrail_reasons)
 
-    # 7. Tages-Snapshot speichern
-    with get_session() as session:
-        save_daily_snapshot(session, portfolio_value)
-        session.commit()
+    # 7. Tages-Snapshot speichern – EIN Snapshot PRO verbundenem Nutzer (Fix
+    # 2026-08-04, Multi-Tenant-Performance/-Benchmark, siehe database.DailyLog/
+    # save_daily_snapshot-Docstring; vorher nur Daniels globaler Snapshot).
+    # Daniels bereits oben berechneter portfolio_value wird wiederverwendet
+    # (kein doppelter Alpaca-Call), für alle anderen verbundenen Nutzer wird
+    # er separat abgerufen. Jeder Nutzer in eigener try/except-Grenze
+    # (AUFGABE-4-Prinzip, siehe oben) – ein Fehler bei einem Nutzer darf die
+    # Snapshots der anderen nicht verhindern.
+    for uid in connected_user_ids:
+        try:
+            user_portfolio_value = portfolio_value if uid == DEFAULT_USER_ID else get_portfolio_value(uid)
+            with get_session() as session:
+                save_daily_snapshot(session, uid, user_portfolio_value)
+                session.commit()
+        except Exception as e:
+            print(f"🚨 Nutzer {uid}: Tages-Snapshot fehlgeschlagen ({e}) – andere Nutzer nicht betroffen.")
 
     # 8. Heartbeat (Aufgabe 1, 2026-07-30, siehe database.BotHeartbeat) – der
     # externe Watchdog erkennt daran, dass dieser Zyklus tatsächlich

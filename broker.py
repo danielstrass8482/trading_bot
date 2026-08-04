@@ -1357,13 +1357,16 @@ def get_portfolio_value(user_id: int = DEFAULT_USER_ID) -> float:
         return round(max_capital_total + realized_pnl + unrealized_pnl, 2)
 
 
-def get_bot_performance(days: int = 30) -> float | None:
+def get_bot_performance(days: int = 30, user_id: int = DEFAULT_USER_ID) -> float | None:
     """
-    Prozentuale Bot-Performance über die letzten `days` Tage – Vergleichsbasis
-    für rule_engine.get_benchmark_performance() (S&P 500 / Nasdaq). Nutzt den
-    ältesten daily_log-Snapshot innerhalb des Zeitraums als Startwert; None
-    falls noch kein Snapshot in diesem Zeitraum existiert (z.B. Bot läuft
-    noch keine `days` Tage).
+    Prozentuale Bot-Performance über die letzten `days` Tage EINES Nutzers
+    (Fix 2026-08-04: daily_log hat jetzt eine user_id-Spalte, siehe
+    database.DailyLog-Docstring – vorher implizit nur Daniels globaler
+    Snapshot) – Vergleichsbasis für rule_engine.get_benchmark_performance()
+    (S&P 500 / Nasdaq, bewusst weiterhin global/marktweit, keine
+    Nutzerbindung). Nutzt den ältesten daily_log-Snapshot DIESES Nutzers
+    innerhalb des Zeitraums als Startwert; None falls noch kein Snapshot in
+    diesem Zeitraum existiert (z.B. Nutzer erst seit kurzem verbunden).
     """
     from datetime import date, timedelta
     from database import DailyLog
@@ -1371,11 +1374,11 @@ def get_bot_performance(days: int = 30) -> float | None:
     cutoff = date.today() - timedelta(days=days)
     with get_session() as session:
         start_snapshot = session.query(DailyLog).filter(
-            DailyLog.log_date >= cutoff
+            DailyLog.log_date >= cutoff, DailyLog.user_id == user_id
         ).order_by(DailyLog.log_date.asc()).first()
 
     if not start_snapshot or start_snapshot.portfolio_value <= 0:
         return None
 
-    current_value = get_portfolio_value()
+    current_value = get_portfolio_value(user_id)
     return round((current_value - start_snapshot.portfolio_value) / start_snapshot.portfolio_value * 100, 2)

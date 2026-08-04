@@ -26,6 +26,7 @@ from database import (
     get_session, get_daily_trade_count, set_bot_config,
     get_learning_proposals, set_learning_proposals, get_user_live_config,
     get_trade_mode_for_user, set_capital_allocations,
+    set_user_bot_config, DEFAULT_USER_CONFIG,
 )
 from config import get_live_config, DEFAULT_USER_ID
 from broker import (
@@ -270,24 +271,22 @@ def get_overview(user_id: int = Depends(get_current_user_id)):
 @protected.get("/api/performance")
 def get_performance(user_id: int = Depends(get_current_user_id)):
     """
-    Owner-only (Fix 2026-07-31): daily_log (Portfolio-Wert-Historie fürs
-    Chart) hat KEINE user_id-Spalte und wurde nie fürs Multi-Tenant-Feature
-    migriert – log_date ist sogar UNIQUE (ein Snapshot pro Kalendertag
-    global), es gibt also strukturell keine Möglichkeit, sie auf einen
-    einzelnen Nutzer zu scopen. Da der Inhalt trotzdem Daniels reale
-    Portfolio-Werte/P&L sind (genau die Art Daten aus dem Sicherheitsvorfall),
-    ist ein 403 für alle außer DEFAULT_USER_ID hier die einzig korrekte
-    Lösung statt sie fälschlich mit anderen Nutzern zu teilen.
+    Echte Pro-Nutzer-Isolation (Fix 2026-08-04) – daily_log hat jetzt eine
+    user_id-Spalte (siehe database.DailyLog-Docstring/
+    _migrate_daily_log_user_id_column). Vorher (Fix 2026-07-31) war dieser
+    Endpoint für alle außer DEFAULT_USER_ID mit 403 gesperrt, weil log_date
+    global eindeutig war (ein Snapshot/Tag für alle Nutzer) – jeder Nutzer
+    sieht jetzt ausschließlich seine eigenen Snapshots/Stats.
     """
-    require_owner(user_id)
     with get_session() as session:
         snapshots = session.execute(text("""
             SELECT log_date, portfolio_value, daily_pnl,
                    trades_count
             FROM daily_log
+            WHERE user_id = :user_id
             ORDER BY log_date ASC
             LIMIT 90
-        """)).fetchall()
+        """), {"user_id": user_id}).fetchall()
 
         stats = session.execute(text("""
             SELECT
@@ -399,15 +398,16 @@ def get_trade_history(limit: int = 50, user_id: int = Depends(get_current_user_i
 @protected.get("/api/benchmark")
 def get_benchmark(days: int = 30, user_id: int = Depends(get_current_user_id)):
     """30-Tage Bot-vs-Markt-Vergleich (siehe rule_engine/broker, Feature
-    Benchmark-Vergleich vom 2026-07-25). Owner-only (Fix 2026-07-31): nutzt
-    get_bot_performance(), das wie /api/performance auf daily_log basiert
-    (keine user_id-Spalte, strukturell nicht pro Nutzer scopebar, siehe
-    Kommentar dort) und Daniels reale Portfolio-Performance zurückgibt."""
-    require_owner(user_id)
+    Benchmark-Vergleich vom 2026-07-25). Echte Pro-Nutzer-Isolation (Fix
+    2026-08-04): get_bot_performance() ist jetzt user_id-scoped (siehe
+    /api/performance-Fix, database.DailyLog hat eine user_id-Spalte) – jeder
+    Nutzer sieht seine EIGENE Bot-Performance. Die Markt-Benchmarks (S&P 500/
+    Nasdaq, get_benchmark_performance) bleiben bewusst global/marktweit,
+    keine Nutzerbindung nötig oder sinnvoll."""
     from rule_engine import get_benchmark_performance
     from broker import get_bot_performance
     return {
-        "bot": get_bot_performance(days=days),
+        "bot": get_bot_performance(days=days, user_id=user_id),
         "benchmarks": get_benchmark_performance(days=days),
     }
 
@@ -502,29 +502,71 @@ def get_scan_log_stats():
         return [dict(r._mapping) for r in rows]
 
 
+# Deutsche Beschreibungstexte für die 5 Pro-Nutzer-Guardrail-Keys (Fix
+# 2026-08-04) – identisch zu den entsprechenden Einträgen in
+# database.DEFAULT_CONFIG (Daniels globale bot_config), damit ein Nicht-
+# Owner dieselbe Beschriftung sieht wie Daniel für denselben Guardrail.
+USER_GUARDRAIL_DESCRIPTIONS = {
+    "MAX_CAPITAL_TOTAL":       "Gesamtkapital in USD",
+    "MAX_CAPITAL_PER_TRADE":   "Max. Einsatz pro Trade",
+    "MAX_OPEN_POSITIONS":      "Max. offene Positionen",
+    "MAX_TRADES_PER_DAY":      "Max. Trades pro Tag",
+    "DAILY_LOSS_LIMIT_PCT":    "Tagesverlust-Limit %",
+}
+
+
 @protected.get("/api/bot-config")
 def get_bot_config_all(user_id: int = Depends(get_current_user_id)):
-    """Owner-only (Fix 2026-07-31, siehe require_owner-Docstring) – bot_config
-    ist Daniels globales Bot-Kontrollpanel, kein Multi-Tenant-Konzept."""
-    require_owner(user_id)
-    with get_session() as session:
-        rows = session.execute(text("""
-            SELECT key, value, beschreibung
-            FROM bot_config ORDER BY key
-        """)).fetchall()
-        return [dict(r._mapping) for r in rows]
+    """
+    Echte Pro-Nutzer-Isolation (Fix 2026-08-04): Daniel (DEFAULT_USER_ID)
+    sieht weiterhin unverändert sein komplettes globales Kontrollpanel
+    (alle ~40 bot_config-Keys). Andere Nutzer sehen NUR ihre eigenen 5
+    Guardrail-Keys aus user_bot_config (siehe UserBotConfig-Docstring in
+    database.py – lazy geseedet mit konservativen Defaults über
+    get_user_live_config). Die übrigen bot_config-Keys (SL/TP%, ATR-
+    Parameter, Time-Exit-Schwellen etc.) bleiben bewusst global und für
+    Nicht-Owner unsichtbar/nicht editierbar, da sie den gemeinsamen
+    Signal-Scan betreffen (ein SL/TP-Preis pro Ticker für alle Nutzer, siehe
+    UserBotConfig-Docstring) – kein 403 mehr für die 5 echten Guardrails,
+    aber auch kein Zugriff auf Daniels übrige globale Konfiguration.
+    """
+    if user_id == DEFAULT_USER_ID:
+        with get_session() as session:
+            rows = session.execute(text("""
+                SELECT key, value, beschreibung
+                FROM bot_config ORDER BY key
+            """)).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    cfg = get_user_live_config(user_id)
+    return [
+        {"key": key, "value": str(cfg.get(key, default)), "beschreibung": USER_GUARDRAIL_DESCRIPTIONS[key]}
+        for key, (_cast, default) in DEFAULT_USER_CONFIG.items()
+    ]
 
 
 @protected.put("/api/bot-config/{key}")
 def update_bot_config(key: str, body: dict, user_id: int = Depends(get_current_user_id)):
-    """Owner-only (Fix 2026-07-31): vorher konnte JEDER eingeloggte Nutzer
-    Daniels Live-Guardrails überschreiben (siehe require_owner-Docstring).
-    Autorisierung basiert ausschließlich auf der aus dem JWT gelesenen
-    user_id – key/body kommen zwar vom Client, adressieren aber ohnehin nur
-    die eine globale bot_config-Zeile, nie einen anderen Nutzer."""
-    require_owner(user_id)
+    """
+    Echte Pro-Nutzer-Isolation (Fix 2026-08-04): Daniel (DEFAULT_USER_ID)
+    schreibt weiterhin unverändert in die globale bot_config-Zeile. Andere
+    Nutzer dürfen NUR die 5 Guardrail-Keys aus DEFAULT_USER_CONFIG setzen
+    (die einzigen, die pro Nutzer in user_bot_config überhaupt existieren,
+    siehe get_bot_config_all oben) – jeder andere Key bleibt mit 403
+    gesperrt, da er eine globale, geteilte Einstellung adressiert und ein
+    Schreibzugriff dort exakt die Sicherheitslücke aus dem a19605f-Vorfall
+    (2026-07-31) wiederherstellen würde.
+    """
+    if user_id == DEFAULT_USER_ID:
+        with get_session() as session:
+            set_bot_config(session, key, body.get("value"))
+            session.commit()
+        return {"ok": True}
+
+    if key not in DEFAULT_USER_CONFIG:
+        raise HTTPException(status_code=403, detail="Dieser Parameter ist nicht pro Nutzer einstellbar")
     with get_session() as session:
-        set_bot_config(session, key, body.get("value"))
+        set_user_bot_config(session, user_id, key, body.get("value"))
         session.commit()
     return {"ok": True}
 
