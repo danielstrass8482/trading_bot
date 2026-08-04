@@ -13,7 +13,7 @@ from config import (
 )
 from database import (
     get_session, Trade, get_open_trades,
-    get_daily_trade_count, get_total_capital_in_trades,
+    get_daily_trade_count,
     get_total_pnl, get_daily_pnl, close_trade, BotState,
     get_alpaca_api_for_user, PendingOrderAttempt,
     get_active_entry_time_slots, get_user_live_config,
@@ -250,16 +250,45 @@ def check_guardrails(signal: SignalResult, user_id: int = DEFAULT_USER_ID) -> No
         # NIE einen Trade auslösen – KEINE Exception, die andere Nutzer
         # beeinträchtigt (GuardrailViolation wird vom Aufrufer immer lokal pro
         # Kandidat/Nutzer gefangen, siehe main.run_entry_cycle).
+        #
+        # KRITISCHER BUGFIX 2026-08-04: real_total_capital verglich bisher
+        # cash + invested(COST-BASIS, get_total_capital_in_trades – Summe der
+        # ursprünglichen capital_used-Werte bei Entry) gegen
+        # effective_max_capital_total_bot, das für DEFAULT_USER_ID aber als
+        # equity(= cash + MARKTWERT offener Positionen) × bot_pct definiert
+        # ist (siehe get_effective_max_capital_total_bot). Cost-Basis und
+        # Marktwert fallen bei jedem unrealisierten Gewinn/Verlust auseinander
+        # – die Differenz entsprach exakt dem unrealisierten P&L. Bei JEDEM
+        # Tag mit positivem unrealisiertem Ergebnis (der Normalfall bei einem
+        # funktionierenden Bot) feuerte dieser Guard dadurch für JEDEN
+        # Kandidaten unabhängig vom Score, weil effective_max_capital_total_bot
+        # in dem Fall zwangsläufig über die cost-basis-Vergleichsgröße hinaus
+        # wuchs – live beobachtet am 2026-08-04: 33/33 Kandidaten über
+        # Score 65 wurden trotz freier Slots blockiert (unrealisierter Gewinn
+        # +$9.31, effective 477.32 vs. altes real_total_capital 468.01).
+        # Der Kommentar unten ("kann es also nie übersteigen") beschreibt die
+        # eigentlich beabsichtigte Invariante korrekt – sie gilt nur, wenn
+        # BEIDE Seiten auf derselben Bemessungsgrundlage stehen (equity).
+        # Fix: real_total_capital ist jetzt direkt real_snapshot["equity"]
+        # (bereits vom selben Snapshot-Call verfügbar, kein Cost-Basis-Zugriff
+        # mehr nötig) – Cash MUSS darin enthalten bleiben, sonst würde die
+        # Prüfung genau den Fall nicht mehr erkennen, den sie verhindern soll
+        # (ein Nutzer mit $0 investiert aber unrealistisch hohem konfigurierten
+        # Limit würde sonst nie anschlagen). Die separate, weiterhin cost-
+        # basis-basierte Budget-Verbrauchsrechnung in
+        # main.calculate_max_trades_today() ist von diesem Fix unberührt –
+        # sie beantwortet eine andere Frage (wie viel vom Budget ist für neue
+        # Trades noch übrig) und war nie Teil dieses Bugs.
         real_snapshot = get_alpaca_account_snapshot(user_id)
         if real_snapshot is not None:
-            invested = get_total_capital_in_trades(session, user_id)
-            real_total_capital = real_snapshot["cash"] + invested
+            real_total_capital = real_snapshot["equity"]
             # Für DEFAULT_USER_ID strukturell nicht mehr erreichbar (Aufgabe
             # "Kapital-Einstellungen Prozent-Umbau"): get_effective_max_
             # capital_total_bot() ist als Prozentsatz DES echten Kapitals
-            # definiert, kann es also nie übersteigen. Bleibt für andere
-            # Nutzer (weiterhin absolutes UserBotConfig.MAX_CAPITAL_TOTAL)
-            # unverändert wirksam.
+            # (equity) definiert, kann es also nie übersteigen. Bleibt für
+            # andere Nutzer (weiterhin absolutes UserBotConfig.MAX_CAPITAL_
+            # TOTAL, nicht von deren eigener equity abgeleitet) unverändert
+            # wirksam.
             effective_max_capital_total = get_effective_max_capital_total_bot(user_id)
             if effective_max_capital_total > real_total_capital:
                 raise GuardrailViolation(
