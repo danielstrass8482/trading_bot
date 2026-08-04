@@ -135,7 +135,13 @@ class Trade(Base):
     llm_summary    = Column(Text, nullable=True)
     llm_risks      = Column(Text, nullable=True)           # JSON-Array als String
     score_breakdown = Column(Text, nullable=True)          # JSON-Objekt: Kriterium -> {score, max, value}
-    status         = Column(String(20), default="OPEN")   # OPEN / CLOSED_SL / CLOSED_TP / CLOSED_TRAILING_SL / CLOSED_TIME_EXIT / CLOSED_TIME_EXIT_HARD_CAP / CLOSED_MANUAL / FAILED_ENTRY (Kauf-Order nie gefüllt, siehe broker._reconcile_pending_entry_fill, Fix 2026-07-31)
+    # String(30) statt String(20) (Fix 2026-08-04, analog trading_bot_saxo::SaxoTrade.status): "CLOSED_
+    # TIME_EXIT_HARD_CAP" hat 26 Zeichen, String(20) hätte bei jedem Hard-Cap-Exit mit
+    # StringDataRightTruncation gecrasht – im Saxo-Bot beim Testen des dortigen Pendants entdeckt und dort
+    # bereits gefixt, hier NACHTRÄGLICH als derselbe latente Bug identifiziert (bislang unbemerkt, da noch
+    # kein Alpaca-Trade tatsächlich per Hard-Cap geschlossen wurde). Additive Migration weitet die bereits
+    # bestehende Spalte, siehe _migrate_trades_status_column_width().
+    status         = Column(String(30), default="OPEN")   # OPEN / CLOSED_SL / CLOSED_TP / CLOSED_TRAILING_SL / CLOSED_TIME_EXIT / CLOSED_TIME_EXIT_HARD_CAP / CLOSED_MANUAL / FAILED_ENTRY (Kauf-Order nie gefüllt, siehe broker._reconcile_pending_entry_fill, Fix 2026-07-31)
     exit_price     = Column(Float, nullable=True)
     closed_at      = Column(DateTime, nullable=True)
     pnl_usd        = Column(Float, nullable=True)
@@ -692,6 +698,7 @@ def init_db():
     _migrate_pending_order_attempts_user_id_column()
     _migrate_trades_entry_price_nullable()
     _migrate_trades_time_exit_grace_columns()
+    _migrate_trades_status_column_width()
     _seed_saxo_token_from_env()
     # Initiale Bot-State-Werte setzen falls nicht vorhanden
     with get_session() as session:
@@ -900,6 +907,23 @@ def _migrate_trades_time_exit_grace_columns():
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS time_exit_grace_deadline DATE"))
         conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS time_exit_grace_used BOOLEAN DEFAULT FALSE"))
+
+
+def _migrate_trades_status_column_width():
+    """
+    status war bisher VARCHAR(20) – reichte für alle kürzeren CLOSED_*-Werte,
+    aber NICHT für "CLOSED_TIME_EXIT_HARD_CAP" (26 Zeichen, längster aktuell
+    verwendeter Status-String, siehe Trade.status-Docstring) – ohne diese
+    Migration würde der erste Hard-Cap-Exit mit StringDataRightTruncation
+    crashen (Fix 2026-08-04, im Saxo-Bot-Pendant beim Testen entdeckt und
+    dort bereits gefixt; hier betrifft es aktuell laufende Trailing-SL-
+    Positionen, die potenziell in denselben Hard-Cap-Exit laufen können).
+    Reines Verbreitern einer bestehenden Spalte ist non-destruktiv (keine
+    Daten betroffen), daher ohne Sonderfall idempotent per ALTER COLUMN TYPE.
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE trades ALTER COLUMN status TYPE VARCHAR(30)"))
 
 
 def _migrate_trades_entry_price_nullable():
