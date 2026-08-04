@@ -29,6 +29,7 @@ from broker import (
     place_trade, monitor_open_positions, get_portfolio_value, get_bot_performance,
     check_guardrails, check_position_consistency, GuardrailViolation,
     get_alpaca_account_snapshot, get_effective_max_capital_total_bot,
+    get_effective_max_capital_total_bot_costbasis,
 )
 from backlook import run_backlook
 from fair_value import update_fair_value_cache, get_undervalued_tickers
@@ -375,23 +376,49 @@ def calculate_max_trades_today(user_id: int = DEFAULT_USER_ID) -> int:
     ein daraus resultierendes erlaubt=0 in einen sauberen Skip für GENAU diesen
     Nutzer (kein Guardrail-Exception-Pfad nötig, siehe dortige Doku) und handelt
     unabhängig davon für alle anderen Nutzer normal weiter.
+
+    KRITISCHER BUGFIX 2026-08-04 (zweite Iteration, siehe broker.
+    get_effective_max_capital_total_bot_costbasis-Docstring für die volle
+    Begründung): max_capital_total kam bisher aus get_effective_max_capital_
+    total_bot() (equity-basiert, Cash + MARKTWERT offener Positionen),
+    während `invested` direkt darunter cost-basis-basiert ist
+    (get_total_capital_in_trades) – bei unrealisiertem Gewinn/Verlust liefen
+    beide Größen auseinander, wodurch available_capital je nach Vorzeichen
+    über- oder unterschätzt wurde (hier: überschätzt, da der harte real_cash-
+    Clamp direkt danach das praktisch abgefangen hat – anders als beim
+    strukturell selben Bug im AUFGABE-4-Check in check_guardrails(), der
+    dadurch komplett blockierte). Fix: max_capital_total kommt jetzt aus
+    get_effective_max_capital_total_bot_costbasis() (cash + invested statt
+    equity) – dieselbe Bemessungsgrundlage wie `invested` direkt darunter,
+    real_snapshot dafür VOR statt nach der available_capital-Berechnung
+    abgerufen (wird jetzt zweimal gebraucht: einmal für max_capital_total,
+    einmal für den bestehenden real_cash-Clamp).
     """
     config = get_user_live_config(user_id)
-    # Aufgabe "Kapital-Einstellungen Prozent-Umbau": für DEFAULT_USER_ID
-    # (Daniel) ersetzt der Prozent-Anteil vom echten Gesamtkapital den alten
-    # statischen Wert (siehe broker.get_effective_max_capital_total_bot),
-    # andere Nutzer behalten unverändert ihr eigenes UserBotConfig.
-    max_capital_total = get_effective_max_capital_total_bot(user_id)
     max_per_trade = float(config.get("MAX_CAPITAL_PER_TRADE", 50))
     max_open = int(config.get("MAX_OPEN_POSITIONS", 5))
 
     with get_session() as session:
         invested = get_total_capital_in_trades(session, user_id)
-        available_capital = max_capital_total - invested
-
         current_open = len(get_open_trades(session, user_id))
 
     real_snapshot = get_alpaca_account_snapshot(user_id)
+    if real_snapshot is not None:
+        # Aufgabe "Kapital-Einstellungen Prozent-Umbau": für DEFAULT_USER_ID
+        # (Daniel) ersetzt der Prozent-Anteil vom echten (cost-basis-
+        # bemessenen) Gesamtkapital den alten statischen Wert, andere Nutzer
+        # behalten unverändert ihr eigenes UserBotConfig.
+        max_capital_total = get_effective_max_capital_total_bot_costbasis(user_id, real_snapshot, invested)
+    else:
+        # Fail-safe (unverändert wie schon immer): Alpaca gerade nicht
+        # erreichbar -> rein konfigurationsbasiert weiterrechnen (equity-
+        # basierte Variante als bester bekannter Fallback-Wert), statt den
+        # Handel für alle Nutzer auszusetzen nur weil ein einzelner Status-
+        # Abruf fehlschlug.
+        max_capital_total = get_effective_max_capital_total_bot(user_id)
+
+    available_capital = max_capital_total - invested
+
     if real_snapshot is not None:
         real_cash = real_snapshot["cash"]
         if real_cash < available_capital:
@@ -399,10 +426,6 @@ def calculate_max_trades_today(user_id: int = DEFAULT_USER_ID) -> int:
                   f"(konfiguriert verfügbar: ${available_capital:.2f}, echtes Cash bei Alpaca: ${real_cash:.2f}) "
                   f"– echtes Kapital gilt als harte Obergrenze.")
         available_capital = min(available_capital, real_cash)
-    # real_snapshot is None: Alpaca gerade nicht erreichbar – bewusst KEIN
-    # zusätzlicher Abzug (Fail-safe wie schon immer: rein konfigurationsbasiert
-    # weiterrechnen, statt Handel für alle Nutzer auszusetzen nur weil ein
-    # einzelner Status-Abruf fehlschlug).
 
     max_by_capital = int(available_capital / max_per_trade) if max_per_trade > 0 else 0
     max_by_positions = max_open - current_open
