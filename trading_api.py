@@ -156,6 +156,7 @@ def get_overview(user_id: int = Depends(get_current_user_id)):
                    entry_price, stop_loss, take_profit,
                    quantity, capital_used, rule_score,
                    trailing_sl_active, trailing_sl_price,
+                   time_exit_grace_used, time_exit_grace_deadline,
                    created_at, mode, broker, status_detail, sector
             FROM trades WHERE status = 'OPEN' AND user_id = :user_id
             ORDER BY created_at DESC
@@ -211,6 +212,11 @@ def get_overview(user_id: int = Depends(get_current_user_id)):
     # MAX_HOLDING_DAYS, mit aktivem Trailing-SL die harte Obergrenze
     # MAX_HOLDING_DAYS * MAX_HOLDING_DAYS_TRAILING_MULTIPLIER (Time-Exit dort
     # ausgesetzt, siehe broker.py). Nur Alpaca – Saxo kennt kein Time-Exit.
+    # Fix 2026-08-05 (UPS-Befund): berücksichtigt jetzt auch die Time-Exit-
+    # Schutzfrist (time_exit_grace_used/-deadline, siehe broker.py Zeilen
+    # 1289-1300) – vorher fehlte dieser dritte Zustand hier komplett, wodurch
+    # Positionen in einer noch laufenden, gültigen Schutzfrist fälschlich als
+    # "überfällig" (negative time_exit_days_remaining) auftauchten.
     max_holding_days = int(config.get("MAX_HOLDING_DAYS", 5))
     max_holding_days_trailing_multiplier = int(config.get("MAX_HOLDING_DAYS_TRAILING_MULTIPLIER", 2))
 
@@ -238,13 +244,35 @@ def get_overview(user_id: int = Depends(get_current_user_id)):
             row["unrealized_pnl"] = round((current_price - row["entry_price"]) * row["quantity"], 2)
             row["unrealized_pnl_pct"] = round((current_price - row["entry_price"]) / row["entry_price"] * 100, 2) if row["entry_price"] else 0
 
-        days_held = count_trading_days(row["created_at"].date(), datetime.now().date())
-        limit = (
-            max_holding_days * max_holding_days_trailing_multiplier
-            if row["trailing_sl_active"]
-            else max_holding_days
+        today = datetime.now().date()
+        days_held = count_trading_days(row["created_at"].date(), today)
+
+        # Schutzfrist gilt nur, solange kein Trailing-SL aktiv ist (der
+        # übernimmt in broker.py Vorrang vor der Grace-Prüfung) UND die
+        # Deadline noch nicht erreicht ist (an/nach der Deadline greift der
+        # reguläre Time-Exit, siehe broker.py Zeile 1295).
+        grace_active = bool(
+            not row["trailing_sl_active"]
+            and row["time_exit_grace_used"]
+            and row["time_exit_grace_deadline"] is not None
+            and today < row["time_exit_grace_deadline"]
         )
-        row["time_exit_days_remaining"] = limit - days_held
+
+        if row["trailing_sl_active"]:
+            limit = max_holding_days * max_holding_days_trailing_multiplier
+            row["time_exit_days_remaining"] = limit - days_held
+        elif grace_active:
+            # Tage bis zur Schutzfrist-Deadline statt bis zur ursprünglichen
+            # MAX_HOLDING_DAYS-Grenze (die ist für diese Position bereits
+            # überholt, siehe broker.py Zeile 1289 elif-Zweig).
+            row["time_exit_days_remaining"] = count_trading_days(today, row["time_exit_grace_deadline"]) - 1
+        else:
+            row["time_exit_days_remaining"] = max_holding_days - days_held
+
+        row["time_exit_grace_active"] = grace_active
+        row["time_exit_grace_deadline"] = (
+            row["time_exit_grace_deadline"].isoformat() if row["time_exit_grace_deadline"] else None
+        )
 
         open_trades_out.append(row)
 
