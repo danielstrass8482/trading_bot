@@ -69,7 +69,29 @@ python main.py
 
 ---
 
-## Deployment auf Railway.app
+## Deployment auf VPS (aktueller Produktivbetrieb)
+
+**Railway.app ist historisch/nicht mehr aktiv** (siehe Abschnitt unten – Anleitung veraltet, das
+Railway-Projekt wurde 2026-08-05 bestätigt gestoppt/gelöscht und `railway.toml` entfernt). Der Bot
+läuft produktiv auf einem VPS (`/home/administrator/trading_bot/`), gesteuert über drei systemd-
+Services: `trading-bot.service` (Scheduler, `python main.py`), `trading-api.service` (JWT-API, Port
+8504, hinter nginx), `trading-dashboard.service` (Streamlit, Port 8501). **Die systemd-Unit-Dateien
+sind NICHT in diesem Repo versioniert** (reine VPS-Konfiguration, analog zum `--ws none`-Fix für
+Alpaca-Connect) – bei einem Neuaufsetzen müssen sie von Hand nachgebaut werden. Wichtig dabei:
+
+- `trading-dashboard.service`: `ExecStart` MUSS `--server.address 127.0.0.1` verwenden, NICHT
+  `0.0.0.0`. Bis 2026-08-05 lief das Dashboard mit `0.0.0.0` und war dadurch ohne jede
+  Authentifizierung öffentlich im Internet erreichbar (`ufw` hatte eine offene `ALLOW Anywhere`-Regel
+  für Port 8501 – vermutlich ein Überbleibsel von vor der JWT-API/dem React-Frontend). Fix:
+  Streamlit an `127.0.0.1` binden UND die `ufw`-Regel für 8501 entfernen (Verteidigung in der Tiefe –
+  ohne offene Firewall-Regel wäre der Port auch bei einem künftigen Konfigurationsfehler nicht von
+  außen erreichbar). Die JWT-API (Port 8504) und das React-Frontend sind davon nicht betroffen –
+  die laufen ausschließlich über nginx/Domains, nie über direkten Portzugriff, und Port 8504 hatte
+  ohnehin nie eine offene `ufw`-Regel (blockiert durch `ufw`-Default-Policy `deny incoming`).
+
+---
+
+## Deployment auf Railway.app (veraltet, siehe oben)
 
 ### Schritt 1: GitHub Repository erstellen
 
