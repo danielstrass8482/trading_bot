@@ -1209,6 +1209,7 @@ def monitor_open_positions(user_id: int = DEFAULT_USER_ID):
     """
     from rule_engine import calculate_atr
     from post_exit_tracking import start_tracking_if_applicable
+    from trading_shared.atr import clamped_trailing_distance
 
     config = get_live_config()
     max_days = int(config.get("MAX_HOLDING_DAYS", 5))
@@ -1220,16 +1221,9 @@ def monitor_open_positions(user_id: int = DEFAULT_USER_ID):
     trailing_activation_pct = config.get("TRAILING_ACTIVATION_PCT", 0.06)
 
     def _clamped_trailing_distance(atr, reference_price):
-        """ATR-basierte Trailing-Distanz in $, auf ATR_MIN_SL_PCT/ATR_MAX_SL_PCT
-        geclampt (analog zum Entry-SL in rule_engine.py). Fallback 3% falls
-        kein ATR verfügbar. `reference_price` ist der Kurs, gegen den der
-        %-Anteil berechnet wird (bei Aktivierung: current_price; beim
-        Nachziehen: highest_price_since_entry, da davon abgezogen wird)."""
-        if atr and atr > 0:
-            raw_distance = atr * atr_multiplier_sl
-            pct = max(min_sl_pct, min(max_sl_pct, raw_distance / reference_price))
-            return reference_price * pct
-        return reference_price * 0.03
+        """ATR-basierte Trailing-Distanz – seit Audit Chunk 1 (2026-08-05) in
+        trading_shared.atr (identisch zur Saxo-Version, siehe dort)."""
+        return clamped_trailing_distance(atr, reference_price, atr_multiplier_sl, min_sl_pct, max_sl_pct)
 
     with get_session() as session:
         open_trades = get_open_trades(session, user_id)

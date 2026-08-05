@@ -14,6 +14,8 @@ import json
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from trading_shared import weights_store
+
 from config import (
     DATABASE_URL, SCORE_WEIGHTS, ENCRYPTION_KEY, SAXO_TOKEN_ENCRYPTION_KEY,
     SAXO_ACCESS_TOKEN_INITIAL, SAXO_REFRESH_TOKEN_INITIAL,
@@ -496,25 +498,31 @@ class SaxoToken(Base):
 
 class CurrentWeight(Base):
     """
-    Aktuell aktive Score-Gewichtung pro Kriterium.
+    Aktuell aktive Score-Gewichtung pro Kriterium UND Broker.
     Startwerte kommen aus config.SCORE_WEIGHTS; der wöchentliche Backlook
     (siehe backlook.py) darf sie danach minimal anpassen. Liegt in der DB
     (statt nur in config.py), damit Bot- und Dashboard-Service auf Railway
     – getrennte Prozesse, gemeinsame Postgres-DB – denselben Stand sehen.
+    broker seit Audit Chunk 1 (2026-08-05, siehe trading_shared/README.md):
+    vorher war criterion alleiniger Primary Key (global, ohne Bot-Trennung) –
+    das hätte bei der Saxo-Anbindung dazu geführt, dass ausschließlich aus
+    US-Aktien-Trades gelernte Gewichte auch europäische Saxo-Trades steuern.
     """
     __tablename__ = "current_weights"
 
     criterion  = Column(String(50), primary_key=True)
+    broker     = Column(String(20), primary_key=True, default="alpaca")
     weight     = Column(Integer, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
 class WeightHistory(Base):
-    """Protokoll jeder Gewichtungsanpassung durch den wöchentlichen Backlook."""
+    """Protokoll jeder Gewichtungsanpassung durch den wöchentlichen Backlook, pro Broker."""
     __tablename__ = "weight_history"
 
     id              = Column(Integer, primary_key=True, autoincrement=True)
     run_at          = Column(DateTime, default=datetime.utcnow)
+    broker          = Column(String(20), nullable=False, default="alpaca")
     criterion       = Column(String(50), nullable=False)
     old_weight      = Column(Integer, nullable=False)
     new_weight      = Column(Integer, nullable=False)
@@ -714,6 +722,7 @@ def init_db():
     _migrate_trades_time_exit_grace_columns()
     _migrate_trades_status_column_width()
     _migrate_daily_log_user_id_column()
+    _migrate_current_weights_broker_column()
     _seed_saxo_token_from_env()
     # Initiale Bot-State-Werte setzen falls nicht vorhanden
     with get_session() as session:
@@ -723,9 +732,9 @@ def init_db():
             BotState.set(session, "last_reset_date", str(date.today()))
         if not BotState.get(session, "bot_paused"):
             BotState.set(session, "bot_paused", "false")
-        # Gewichtungen mit config-Defaults seeden, falls noch nicht vorhanden
-        if not session.query(CurrentWeight).first():
-            set_active_weights(session, SCORE_WEIGHTS)
+        # Gewichtungen mit config-Defaults seeden, falls für diesen Broker noch nicht vorhanden
+        if not session.query(CurrentWeight).filter_by(broker="alpaca").first():
+            set_active_weights(session, SCORE_WEIGHTS, broker="alpaca")
         # Bot-Konfiguration mit Defaults seeden – nur fehlende Keys, damit
         # im Dashboard geänderte Werte bei einem Neustart nicht überschrieben werden.
         for key, (value, beschreibung) in DEFAULT_CONFIG.items():
@@ -978,6 +987,45 @@ def _migrate_daily_log_user_id_column():
         """))
 
 
+def _migrate_current_weights_broker_column():
+    """
+    current_weights (und weight_history) hatten bisher keine broker-Spalte –
+    criterion war GLOBALER Primary Key, ohne Trennung nach Bot/Broker (Audit
+    Chunk 1, 2026-08-05, siehe trading_shared/README.md). Das hätte bei einer
+    naiven Saxo-Anbindung dazu geführt, dass ausschließlich aus US-Aktien-
+    Trades gelernte Gewichte (Alpaca-Backlook) auch europäische Saxo-Trades
+    gesteuert hätten – eine versteckte, unentschiedene Kopplung mit echtem
+    Geld dahinter.
+
+    Additive, non-destruktive Migration: Spalte ergänzen, bestehende Zeilen
+    (ausschließlich Alpaca bisher) auf 'alpaca' zurückschreiben, NOT NULL
+    setzen, dann den alten Ein-Spalten-Primary-Key (current_weights_pkey,
+    Postgres-Default-Name) gegen einen zusammengesetzten PRIMARY KEY
+    (criterion, broker) ersetzen. Analog zu _migrate_daily_log_user_id_column
+    (DO-Block mit pg_constraint-Existenzcheck, da Postgres kein
+    `ADD CONSTRAINT IF NOT EXISTS` kennt).
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE current_weights ADD COLUMN IF NOT EXISTS broker VARCHAR(20)"))
+        conn.execute(text("UPDATE current_weights SET broker = 'alpaca' WHERE broker IS NULL"))
+        conn.execute(text("ALTER TABLE current_weights ALTER COLUMN broker SET NOT NULL"))
+        conn.execute(text("ALTER TABLE current_weights DROP CONSTRAINT IF EXISTS current_weights_pkey"))
+        conn.execute(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'pk_current_weights_criterion_broker'
+                ) THEN
+                    ALTER TABLE current_weights ADD CONSTRAINT pk_current_weights_criterion_broker PRIMARY KEY (criterion, broker);
+                END IF;
+            END $$;
+        """))
+        conn.execute(text("ALTER TABLE weight_history ADD COLUMN IF NOT EXISTS broker VARCHAR(20)"))
+        conn.execute(text("UPDATE weight_history SET broker = 'alpaca' WHERE broker IS NULL"))
+        conn.execute(text("ALTER TABLE weight_history ALTER COLUMN broker SET NOT NULL"))
+
+
 def _migrate_trades_entry_price_nullable():
     """
     entry_price war bisher NOT NULL – Fix 2026-07-31 (Kauf-Fill-Pendant zu
@@ -1220,27 +1268,19 @@ def set_user_bot_config(session: Session, user_id: int, key: str, value):
         session.add(UserBotConfig(user_id=user_id, key=key, value=str(value)))
 
 
-def get_active_weights(session: Session) -> dict:
+def get_active_weights(session: Session, broker: str = "alpaca") -> dict:
     """
-    Gibt die aktuell aktiven Score-Gewichtungen zurück.
-    Fällt auf config.SCORE_WEIGHTS zurück falls DB noch nicht geseedet ist.
+    Gibt die aktuell aktiven Score-Gewichtungen für `broker` zurück.
+    Fällt auf config.SCORE_WEIGHTS zurück falls DB für diesen Broker noch
+    nicht geseedet ist. Mechanik liegt in trading_shared.weights_store
+    (Parität mit trading_bot_saxo, siehe [[trading-bot-deployment]]).
     """
-    rows = session.query(CurrentWeight).all()
-    if not rows:
-        return dict(SCORE_WEIGHTS)
-    return {r.criterion: r.weight for r in rows}
+    return weights_store.get_active_weights(session, CurrentWeight, broker, SCORE_WEIGHTS)
 
 
-def set_active_weights(session: Session, weights: dict):
-    """Schreibt neue Gewichtungen in die current_weights Tabelle."""
-    now = datetime.utcnow()
-    for criterion, weight in weights.items():
-        row = session.query(CurrentWeight).filter_by(criterion=criterion).first()
-        if row:
-            row.weight = weight
-            row.updated_at = now
-        else:
-            session.add(CurrentWeight(criterion=criterion, weight=weight, updated_at=now))
+def set_active_weights(session: Session, weights: dict, broker: str = "alpaca"):
+    """Schreibt neue Gewichtungen für `broker` in die current_weights Tabelle."""
+    weights_store.set_active_weights(session, CurrentWeight, weights, broker)
 
 
 def get_active_entry_time_slots(session: Session) -> list["EntryTimeSlot"]:

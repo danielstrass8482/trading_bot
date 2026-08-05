@@ -5,13 +5,15 @@ Entscheidet ob ein Trade freigegeben wird. Kein LLM involviert.
 
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
 import concurrent.futures
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
 import warnings
 warnings.filterwarnings("ignore")
+
+from trading_shared import scoring as shared_scoring
+from trading_shared.atr import calculate_atr
 
 from config import (
     RSI_OVERSOLD, RSI_OVERBOUGHT,
@@ -22,16 +24,13 @@ from config import (
 from database import get_session, get_active_weights, get_open_trades
 from fair_value import get_fair_value_for_ticker
 
-
-# Branchen-Blacklist: Ticker aus diesen Sektoren/Industrien werden vor der
-# Score-Berechnung blockiert (BLOCKED, Score 0).
-BLACKLIST_MAPPING = {
-    "waffen": ["Aerospace & Defense"],
-    "tabak": ["Tobacco"],
-    "fossil": ["Oil & Gas", "Coal", "Energy"],
-    "pharma": ["Pharmaceuticals", "Drug Manufacturers"],
-    "gluecksspiel": ["Gambling", "Casinos"],
-    "krypto": ["Cryptocurrency"],
+_THRESHOLDS = {
+    "RSI_OVERSOLD": RSI_OVERSOLD,
+    "RSI_OVERBOUGHT": RSI_OVERBOUGHT,
+    "VOLUME_FACTOR": VOLUME_FACTOR,
+    "PE_MIN": PE_MIN,
+    "PE_MAX": PE_MAX,
+    "DE_MAX": DE_MAX,
 }
 
 
@@ -116,33 +115,8 @@ def fetch_fundamentals(ticker: str) -> dict:
         return {}
 
 
-def calculate_atr(ticker: str, period: int = 14) -> Optional[float]:
-    """Berechnet den Average True Range (ATR) für den SL/TP-Abstand.
-    Historie bewusst mit 3 Monaten Puffer geladen (statt exakt 1mo) – bei
-    Feiertagshäufungen (Thanksgiving, Weihnachten/Neujahr) lieferte "1mo"
-    teils nur knapp über den 14 für die ATR-Rolling-Periode nötigen Handels-
-    tagen. Die ATR-Berechnung selbst (rolling(period).mean()) bleibt unverändert."""
-    try:
-        df = yf.Ticker(ticker).history(period="3mo", interval="1d", auto_adjust=False)
-        if df.empty or len(df) < period:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        high = df["High"]
-        low = df["Low"]
-        close = df["Close"].shift(1)
-
-        tr1 = high - low
-        tr2 = (high - close).abs()
-        tr3 = (low - close).abs()
-        true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = true_range.rolling(period).mean().iloc[-1]
-        return float(atr)
-    except Exception as e:
-        print(f"ATR Fehler für {ticker}: {e}")
-        return None
-
+# calculate_atr kommt seit Audit Chunk 1 (2026-08-05) aus trading_shared.atr
+# (siehe Import oben) – war hier 1:1 identisch zur Saxo-Version dupliziert.
 
 _REGIME_CACHE = {"value": None, "ts": None}
 _REGIME_CACHE_TTL_SEC = 900  # 15 Min – vermeidet einen SPY-Download pro gescanntem Ticker
@@ -332,86 +306,23 @@ def calculate_score(ticker: str, df: pd.DataFrame, fundamentals: dict, is_invers
 
     cfg = get_live_config()  # MIN_SIGNAL_SCORE / SL / TP aus DB (mit Fallback)
 
-    breakdown = {}
     current_price = float(df["Close"].iloc[-1])
 
-    # ── RSI (20 Punkte) ──────────────────────────────────────────────
-    rsi_series = ta.rsi(df["Close"], length=14)
-    rsi = float(rsi_series.iloc[-1]) if rsi_series is not None and not rsi_series.empty else 50.0
+    # 6-Faktoren-Score (RSI/SMA-Trend/Volumen/KGV/Verschuldungsgrad/Umsatz-
+    # wachstum) – seit Audit Chunk 1 (2026-08-05) in trading_shared.scoring,
+    # geteilt mit trading_bot_saxo (identische Formeln/Punkteverteilung).
+    total_score, breakdown, raw = shared_scoring.calculate_score_factors(
+        df, fundamentals, weights, _THRESHOLDS, is_inverse_etf=is_inverse_etf
+    )
+    rsi = raw["rsi"]
+    sma50 = raw["sma50"]
+    sma200 = raw["sma200"]
+    volume_ratio = raw["volume_ratio"]
+    pe = raw["pe_ratio"]
+    de = raw["debt_to_equity"]
+    rev_growth = raw["revenue_growth"]
 
-    if is_inverse_etf:
-        # Für Inverse ETFs: überKAUFTER Markt ist POSITIV (wir wollen fallen sehen)
-        rsi_score = weights["rsi"] if rsi > RSI_OVERBOUGHT else int(weights["rsi"] * (rsi / RSI_OVERBOUGHT))
-    else:
-        # Für normale Aktien: überVERKAUFT ist bullisch
-        rsi_score = weights["rsi"] if rsi < RSI_OVERSOLD else int(weights["rsi"] * max(0, (RSI_OVERSOLD - rsi + 20) / 20))
-
-    breakdown["rsi"] = {"score": rsi_score, "max": weights["rsi"], "value": round(rsi, 1)}
-
-    # ── SMA 50/200 Trend (20 Punkte) ─────────────────────────────────
-    sma50  = float(df["Close"].rolling(50).mean().iloc[-1])  if len(df) >= 50  else None
-    sma200 = float(df["Close"].rolling(200).mean().iloc[-1]) if len(df) >= 200 else None
-
-    if sma50 and sma200:
-        if is_inverse_etf:
-            # Inverse ETF profitiert wenn Markt unter SMA50/200 fällt
-            sma_score = weights["sma_trend"] if current_price < sma50 < sma200 else int(weights["sma_trend"] * 0.3)
-        else:
-            sma_score = weights["sma_trend"] if current_price > sma50 > sma200 else int(weights["sma_trend"] * 0.3)
-    else:
-        sma_score = int(weights["sma_trend"] * 0.5)  # Neutral wenn nicht genug Daten
-
-    breakdown["sma_trend"] = {"score": sma_score, "max": weights["sma_trend"],
-                               "value": {"sma50": round(sma50, 2) if sma50 else None,
-                                         "sma200": round(sma200, 2) if sma200 else None}}
-
-    # ── Volumen-Bestätigung (20 Punkte) ──────────────────────────────
-    vol_20d_avg  = float(df["Volume"].rolling(20).mean().iloc[-1])
-    vol_today    = float(df["Volume"].iloc[-1])
-    volume_ratio = vol_today / vol_20d_avg if vol_20d_avg > 0 else 1.0
-    vol_score    = weights["volume"] if volume_ratio >= VOLUME_FACTOR else int(weights["volume"] * (volume_ratio / VOLUME_FACTOR))
-
-    breakdown["volume"] = {"score": vol_score, "max": weights["volume"], "value": round(volume_ratio, 2)}
-
-    # ── KGV (15 Punkte) ──────────────────────────────────────────────
-    pe = fundamentals.get("pe_ratio")
-    if is_inverse_etf or pe is None:
-        pe_score = int(weights["pe_ratio"] * 0.7)  # Neutral für ETFs
-    elif PE_MIN <= pe <= PE_MAX:
-        pe_score = weights["pe_ratio"]
-    elif pe < PE_MIN or pe > PE_MAX * 1.5:
-        pe_score = 0
-    else:
-        pe_score = int(weights["pe_ratio"] * 0.4)
-
-    breakdown["pe_ratio"] = {"score": pe_score, "max": weights["pe_ratio"], "value": round(pe, 1) if pe else None}
-
-    # ── Verschuldungsgrad (15 Punkte) ────────────────────────────────
-    de = fundamentals.get("debt_to_equity")
-    if is_inverse_etf or de is None:
-        de_score = int(weights["debt_equity"] * 0.7)
-    elif de <= DE_MAX:
-        de_score = weights["debt_equity"]
-    else:
-        de_score = 0
-
-    breakdown["debt_equity"] = {"score": de_score, "max": weights["debt_equity"], "value": round(de, 1) if de else None}
-
-    # ── Revenue-Wachstum (10 Punkte) ─────────────────────────────────
-    rev_growth = fundamentals.get("revenue_growth")
-    if is_inverse_etf or rev_growth is None:
-        rev_score = int(weights["revenue_growth"] * 0.7)
-    elif rev_growth > 0:
-        rev_score = weights["revenue_growth"]
-    else:
-        rev_score = 0
-
-    breakdown["revenue_growth"] = {"score": rev_score, "max": weights["revenue_growth"],
-                                    "value": f"{rev_growth:.1%}" if rev_growth else None}
-
-    # ── Gesamtscore ───────────────────────────────────────────────────
-    total_score = sum(v["score"] for v in breakdown.values())
-    approved    = total_score >= cfg["MIN_SIGNAL_SCORE"]
+    approved = total_score >= cfg["MIN_SIGNAL_SCORE"]
 
     # Stop Loss & Take Profit – ATR-basiert (volatilitätsabhängiger Abstand),
     # mit Fallback auf feste Prozente aus bot_config falls ATR nicht verfügbar.
@@ -520,15 +431,14 @@ def analyze_ticker(ticker: str) -> SignalResult:
     # Branchen-Blacklist prüfen (vor der Score-Berechnung)
     sector = fundamentals.get("sector", "") or ""
     industry = fundamentals.get("industry", "") or ""
-    for blacklist_key, sectors in BLACKLIST_MAPPING.items():
-        if any(s.lower() in sector.lower() or s.lower() in industry.lower()
-               for s in sectors):
-            return SignalResult(
-                ticker=ticker, score=0, direction="BLOCKED",
-                instrument_type="STOCK", approved=False,
-                ko_reason=f"Blacklist: {blacklist_key}",
-                market_regime=regime,
-            )
+    blacklist_key = shared_scoring.is_sector_blacklisted(sector, industry)
+    if blacklist_key:
+        return SignalResult(
+            ticker=ticker, score=0, direction="BLOCKED",
+            instrument_type="STOCK", approved=False,
+            ko_reason=f"Blacklist: {blacklist_key}",
+            market_regime=regime,
+        )
 
     # KO-Kriterien prüfen
     ko = check_ko_criteria(ticker, df, fundamentals)

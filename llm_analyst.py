@@ -4,8 +4,8 @@ Das LLM ENTSCHEIDET NICHT. Es erklärt und dokumentiert.
 Bei API-Ausfall läuft der Bot im degraded mode weiter.
 """
 
-import json
 import anthropic
+from trading_shared.llm_commentary import analyze_with_llm as _shared_analyze_with_llm
 from config import ANTHROPIC_API_KEY, LLM_MODEL, LLM_MAX_TOKENS
 from rule_engine import SignalResult
 
@@ -31,10 +31,10 @@ def analyze_with_llm(signal: SignalResult) -> dict:
     Sendet Signal-Daten an Claude und erhält strukturierte Analyse zurück.
     Gibt dict mit summary, risks, sentiment_score zurück.
     Bei Fehler: leeres dict (Bot läuft weiter ohne LLM-Analyse).
+    Call/Parse/Fallback-Mechanik seit Audit Chunk 1 (2026-08-05) in
+    trading_shared.llm_commentary (identisch zur Saxo-Version, siehe dort) –
+    hier bleibt nur der Alpaca-spezifische Prompt-Aufbau.
     """
-    if not ANTHROPIC_API_KEY:
-        return _fallback_response("Kein API-Key konfiguriert")
-
     # Kontext für das LLM aufbauen
     user_content = f"""Analysiere diesen Swing-Trade-Kandidaten:
 
@@ -58,31 +58,7 @@ Stop Loss: ${signal.stop_loss} (-3%)
 Take Profit: ${signal.take_profit} (+6%)
 CRV: 2:1"""
 
-    try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
-            model=LLM_MODEL,
-            max_tokens=LLM_MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_content}]
-        )
-
-        raw_text = response.content[0].text.strip()
-        # JSON parsen (Backticks entfernen falls doch vorhanden)
-        clean_text = raw_text.replace("```json", "").replace("```", "").strip()
-        parsed = json.loads(clean_text)
-
-        # Validierung
-        return {
-            "summary":         str(parsed.get("summary", "")),
-            "risks":           list(parsed.get("risks", [])),
-            "sentiment_score": int(parsed.get("sentiment_score", 5))
-        }
-
-    except json.JSONDecodeError as e:
-        return _fallback_response(f"JSON-Parse-Fehler: {e}")
-    except Exception as e:
-        return _fallback_response(f"API-Fehler: {e}")
+    return _shared_analyze_with_llm(ANTHROPIC_API_KEY, LLM_MODEL, LLM_MAX_TOKENS, SYSTEM_PROMPT, user_content)
 
 
 def get_market_brief() -> str:
@@ -147,13 +123,3 @@ Hinweis am Ende: "Dies ist kein Anlageberatung."
     except Exception as e:
         print(f"⚠️  Marktbriefing-Generierung fehlgeschlagen: {e} (degraded mode)")
         return f"Marktdaten (KI-Briefing fehlgeschlagen):\n{market_summary}" if market_summary else "Marktdaten aktuell nicht verfügbar."
-
-
-def _fallback_response(reason: str) -> dict:
-    """Leere Antwort wenn LLM nicht verfügbar – Bot läuft weiter."""
-    print(f"⚠️  LLM-Analyse nicht verfügbar: {reason} (degraded mode)")
-    return {
-        "summary":         None,
-        "risks":           [],
-        "sentiment_score": None
-    }
