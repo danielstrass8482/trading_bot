@@ -396,17 +396,36 @@ def check_guardrails(signal: SignalResult, user_id: int = DEFAULT_USER_ID) -> No
         if real_snapshot is not None:
             capital_used_sum = get_total_capital_in_trades(session, user_id)
             real_total_capital = real_snapshot["cash"] + capital_used_sum
-            # Für DEFAULT_USER_ID strukturell nicht mehr erreichbar (Aufgabe
-            # "Kapital-Einstellungen Prozent-Umbau"): get_effective_max_
-            # capital_total_bot_costbasis() ist als Prozentsatz GENAU dieser
-            # (cash + capital_used_sum)-Größe definiert, kann sie also nie
-            # übersteigen. Bleibt für andere Nutzer (weiterhin absolutes
-            # UserBotConfig.MAX_CAPITAL_TOTAL, nicht von deren eigenem Cash/
-            # Cost-Basis abgeleitet) unverändert wirksam.
+            # BUGFIX 2026-08-06 (live Fehlalarm, Score-98-Kandidaten trotz
+            # freier Slots übersprungen): für DEFAULT_USER_ID bei bot_pct=100
+            # ist effective_max_capital_total MATHEMATISCH identisch zu
+            # real_total_capital (get_effective_max_capital_total_bot_
+            # costbasis() ist exakt als Prozentsatz dieser (cash +
+            # capital_used_sum)-Größe definiert) – eine frühere Version
+            # dieses Kommentars hielt den Fall deshalb für "strukturell nicht
+            # erreichbar". Das ignorierte, dass effective_max_capital_total
+            # GERUNDET wird (round(..., 2)), real_total_capital hier aber
+            # UNGERUNDET blieb: Binärfließkomma kann beim Runden minimal nach
+            # oben kippen (z.B. 467.649999999999977... -> gerundet
+            # 467.65000000000003...), sodass die gerundete Seite die
+            # ungerundete Seite um einen Bruchteil eines Cents überstieg und
+            # ">" fälschlich auslöste, obwohl beide Werte auf 2 Dezimalstellen
+            # identisch angezeigt wurden ("$467.17 vs $467.17"). Live
+            # beobachtet 2026-08-06: 110 Kandidaten in 2 von 3 Scan-Zyklen
+            # fälschlich übersprungen. Fix: real_total_capital für den
+            # Vergleich auf dieselbe Cent-Genauigkeit runden wie
+            # effective_max_capital_total – macht den Vergleich für den
+            # bot_pct=100-Fall exakt (keine Cent-Rundungsartefakte mehr),
+            # erkennt einen ECHTEN Kapitalüberschuss (z.B. fehlerhaft
+            # konfiguriertes bot_pct > 100, oder für andere Nutzer ein
+            # UserBotConfig.MAX_CAPITAL_TOTAL deutlich über deren eigenem
+            # Cash/Cost-Basis) weiterhin zuverlässig, da ein solcher
+            # Unterschied um Größenordnungen über dem Cent-Rundungsrauschen
+            # liegt.
             effective_max_capital_total = get_effective_max_capital_total_bot_costbasis(
                 user_id, real_snapshot, capital_used_sum
             )
-            if effective_max_capital_total > real_total_capital:
+            if effective_max_capital_total > round(real_total_capital, 2):
                 raise GuardrailViolation(
                     f"Nutzer {user_id}: konfiguriertes Limit übersteigt echtes Kapital "
                     f"(konfiguriert: ${effective_max_capital_total:.2f}, echt: ${real_total_capital:.2f}), "
