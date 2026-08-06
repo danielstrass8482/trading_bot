@@ -418,6 +418,61 @@ def calculate_quantity(price: float, max_capital: float = None) -> float:
     return round(qty, 6)
 
 
+def _is_confirmed_not_found(exc: Exception) -> bool:
+    """
+    Erkennt eine NACHWEISLICH bestätigte "Order/Position existiert nicht"-
+    Antwort (z.B. echtes 404) anhand der Fehlermeldung – analog zum bereits
+    korrekten Muster in _sell_position_at_alpaca() ("position does not
+    exist"/"404"). Alles andere (Timeout, Rate-Limit, 5xx, Netzwerkfehler)
+    ist KEINE Bestätigung, sondern lediglich ein fehlgeschlagener
+    Verifikationsversuch – siehe _verify_order_with_retry.
+    """
+    msg = str(exc).lower()
+    return "404" in msg or "not found" in msg or "does not exist" in msg
+
+
+def _verify_order_with_retry(client, client_order_id: str, ticker: str, max_attempts: int = 3):
+    """
+    BUGFIX 2026-08-06 (Code-Audit Chunk 1, Fund 2): fragt eine Order per
+    client_order_id ab und unterscheidet dabei sauber zwei völlig
+    unterschiedliche Fälle, die vorher beide identisch als "Order existiert
+    nicht" behandelt wurden:
+      (a) NACHWEISLICH bestätigt nicht vorhanden (echtes 404/"not found")
+          -> sicher, ein neuer Versuch mit neuer client_order_id ist erlaubt.
+      (b) die Verifikationsabfrage SELBST schlägt technisch fehl (Timeout,
+          Rate-Limit, 5xx, Netzwerkfehler) -> das ist KEINE Bestätigung,
+          dass die ursprüngliche Order nie ankam! Ein Retry mit Backoff wird
+          versucht, bevor aufgegeben wird.
+
+    Gibt (order, "found") zurück falls die Order gefunden wurde,
+    (None, "not_found") falls nachweislich bestätigt nicht vorhanden, oder
+    (None, "inconclusive") falls nach allen Versuchen weiterhin unklar ist,
+    ob die Order angekommen ist – der Aufrufer darf im letzten Fall NIEMALS
+    automatisch einen neuen Kauf-/Verkaufsversuch auslösen (Doppel-Order-
+    Risiko), sondern muss den PendingOrderAttempt unresolved (PENDING)
+    lassen, damit der nächste reguläre Zyklus erneut nachschaut.
+    """
+    import time
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            return client.get_order_by_client_order_id(client_order_id), "found"
+        except Exception as e:
+            last_exc = e
+            if _is_confirmed_not_found(e):
+                return None, "not_found"
+            if attempt < max_attempts - 1:
+                wait_s = 2 ** attempt  # 1s, 2s, 4s, ...
+                print(f"⚠️  {ticker}: Verifikation von Order {client_order_id} (Versuch {attempt + 1}/"
+                      f"{max_attempts}) technisch fehlgeschlagen ({e}) – kein bestätigtes 'existiert nicht', "
+                      f"erneuter Versuch in {wait_s}s...")
+                time.sleep(wait_s)
+    print(f"🚨 {ticker}: Verifikation von Order {client_order_id} nach {max_attempts} Versuchen weiterhin "
+          f"unklar (letzter Fehler: {last_exc}) – Status bleibt PENDING, KEIN automatischer neuer Versuch "
+          f"(Doppel-Order-Risiko), nächster regulärer Zyklus prüft erneut nach.")
+    return None, "inconclusive"
+
+
 def _submit_order_idempotent(client, ticker: str, user_id: int = DEFAULT_USER_ID, **submit_kwargs):
     """
     Idempotenz-Schutz (Aufgabe 1, 2026-07-30): platziert eine Alpaca-Order mit
@@ -460,17 +515,27 @@ def _submit_order_idempotent(client, ticker: str, user_id: int = DEFAULT_USER_ID
     except Exception as e:
         print(f"⚠️  {ticker}: Order-Submit unklar fehlgeschlagen ({e}) – prüfe bei Alpaca nach, "
               f"ob sie trotzdem angenommen wurde, bevor ein zweiter Versuch startet...")
-        try:
-            existing = client.get_order_by_client_order_id(client_order_id)
+        existing, verdict = _verify_order_with_retry(client, client_order_id, ticker)
+        if verdict == "found":
             print(f"ℹ️  {ticker}: Order {client_order_id} EXISTIERT bei Alpaca trotz Fehler "
                   f"(Status: {existing.status}) – kein Doppel-Versuch, nutze diese Order.")
             _resolve("FILLED")
             return existing, client_order_id
-        except Exception:
+        if verdict == "not_found":
             print(f"✅ {ticker}: Order {client_order_id} existiert NICHT bei Alpaca – Request ist "
                   f"nachweislich nie angekommen, ein neuer Versuch ist sicher.")
             _resolve("FAILED")
             raise e
+        # verdict == "inconclusive": bewusst NICHT als FAILED markieren (bleibt
+        # PENDING für die nächste reguläre Reconciliation) und bewusst KEINE
+        # neue Order erlauben – GuardrailViolation wird von run_entry_cycle()
+        # bereits sauber pro Kandidat abgefangen (nur dieser Kandidat wird
+        # übersprungen, siehe check_guardrails-Aufrufer).
+        raise GuardrailViolation(
+            f"{ticker}: Order-Status nach Submit-Fehler UND fehlgeschlagener Verifikation weiterhin "
+            f"unklar – Kandidat sicherheitshalber übersprungen (Doppel-Order-Risiko), nächster Zyklus "
+            f"prüft den offenen Versuch erneut."
+        )
 
 
 def _reconcile_pending_entry_attempt(client, ticker: str, user_id: int = DEFAULT_USER_ID):
@@ -486,8 +551,14 @@ def _reconcile_pending_entry_attempt(client, ticker: str, user_id: int = DEFAULT
 
     Gibt die existierende Alpaca-Order zurück, falls der alte Versuch
     tatsächlich durchging (Aufrufer darf dann KEINEN neuen Kauf platzieren),
-    sonst None (alter Versuch war nachweislich fehlgeschlagen oder es gab
-    keinen offenen Versuch – sicher, normal fortzufahren).
+    oder None (alter Versuch war nachweislich fehlgeschlagen oder es gab
+    keinen offenen Versuch – sicher, normal fortzufahren). Wirft
+    GuardrailViolation, falls sich auch nach mehreren Versuchen mit Backoff
+    NICHT klären lässt, ob der alte Versuch durchging (BUGFIX 2026-08-06,
+    Code-Audit Chunk 1, Fund 2, analog _submit_order_idempotent) – ein
+    technischer Verifikations-Fehlschlag (Timeout/5xx/Netzwerk) ist KEINE
+    Bestätigung, dass der alte Versuch nie ankam, und darf NIE automatisch
+    einen neuen Kauf freigeben (Doppel-Order-Risiko).
     """
     with get_session() as session:
         pending = (
@@ -502,9 +573,9 @@ def _reconcile_pending_entry_attempt(client, ticker: str, user_id: int = DEFAULT
 
     print(f"🔎 {ticker}: Ein vorheriger Entry-Order-Versuch ({client_order_id}) war noch ungeklärt "
           f"(PENDING) – prüfe bei Alpaca nach, bevor ein neuer Versuch startet.")
-    try:
-        existing = client.get_order_by_client_order_id(client_order_id)
-    except Exception:
+    existing, verdict = _verify_order_with_retry(client, client_order_id, ticker)
+
+    if verdict == "not_found":
         print(f"✅ {ticker}: Alter Versuch {client_order_id} existiert NICHT bei Alpaca – "
               f"nie angekommen, sicher für einen neuen Versuch.")
         with get_session() as session:
@@ -514,6 +585,15 @@ def _reconcile_pending_entry_attempt(client, ticker: str, user_id: int = DEFAULT
                 row.resolved_at = datetime.utcnow()
                 session.commit()
         return None
+
+    if verdict == "inconclusive":
+        # Bewusst NICHT als FAILED markieren (bleibt PENDING für die nächste
+        # reguläre Reconciliation) und bewusst KEIN neuer Kauf – siehe Docstring.
+        raise GuardrailViolation(
+            f"{ticker}: Status des vorherigen Entry-Versuchs ({client_order_id}) auch nach mehreren "
+            f"Verifikationsversuchen weiterhin unklar – Kandidat sicherheitshalber übersprungen "
+            f"(Doppel-Order-Risiko), nächster Zyklus prüft erneut nach."
+        )
 
     print(f"ℹ️  {ticker}: Alter Versuch {client_order_id} EXISTIERT bei Alpaca (Status: {existing.status}) "
           f"– kein neuer Kauf, alter Versuch wird stattdessen übernommen.")
