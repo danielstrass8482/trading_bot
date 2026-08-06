@@ -89,7 +89,8 @@ Alpaca-Connect) – bei einem Neuaufsetzen müssen sie von Hand nachgebaut werde
   die laufen ausschließlich über nginx/Domains, nie über direkten Portzugriff, und Port 8504 hatte
   ohnehin nie eine offene `ufw`-Regel (blockiert durch `ufw`-Default-Policy `deny incoming`).
 
-- `trading-bot.service`/`trading-api.service`: `TimeoutStopSec=100` (statt des systemd-Defaults
+- `trading-bot.service` (NICHT `trading-api.service` – das ist ein zustandsloser uvicorn-Server ohne
+  Entry-/Monitoring-Zyklen, unverändert am Default): `TimeoutStopSec=100` (statt des systemd-Defaults
   90s) – seit dem Graceful-Shutdown-Fix (2026-08-06, siehe `graceful_shutdown.py` in
   `trading_shared`) fängt der Bot SIGTERM ab und führt einen bereits laufenden Entry-/Monitoring-
   Zyklus zu Ende (bis zu 75s eigenes Zeitlimit), statt sofort zu sterben. **Ein `systemctl restart`
