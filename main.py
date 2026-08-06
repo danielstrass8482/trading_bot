@@ -669,14 +669,20 @@ def run_entry_cycle(slot: EntryTimeSlot):
                 except GuardrailViolation as gv:
                     user_guardrail_reasons[signal.ticker] = str(gv)
                     print(f"   🛡️  Nutzer {user_id}, {signal.ticker}: Guardrail – {gv}")
-                    if "Verlustlimit" in str(gv) and not verlustlimit_alert_gesendet:
+                    reason_code = getattr(gv, "reason_code", None)
+                    if reason_code in ("daily_loss_limit", "loss_streak_cooldown") and not verlustlimit_alert_gesendet:
+                        if reason_code == "daily_loss_limit":
+                            subject = "🛑 Trading Bot – Daily Loss Limit erreicht"
+                            hinweis = "Der Bot wurde automatisch pausiert und handelt erst nach manueller Freigabe wieder."
+                        else:
+                            subject = "⏸️ Trading Bot – Verlustserie-Cooldown ausgelöst"
+                            hinweis = "Der Bot pausiert automatisch für die konfigurierte Cooldown-Dauer und nimmt danach selbstständig wieder auf."
                         send_email(
-                            subject="🛑 Trading Bot – Daily Loss Limit erreicht",
+                            subject=subject,
                             body=(
                                 f"{gv}\n\n"
                                 f"Nutzer: {user_id}\n"
-                                f"Der Bot wurde automatisch pausiert und handelt erst nach "
-                                f"manueller Freigabe wieder."
+                                f"{hinweis}"
                             )
                         )
                         verlustlimit_alert_gesendet = True
@@ -734,14 +740,20 @@ def run_entry_cycle(slot: EntryTimeSlot):
                 except GuardrailViolation as gv:
                     user_guardrail_reasons[signal.ticker] = str(gv)
                     print(f"   🛡️  Nutzer {user_id}: Guardrail – {gv}")
-                    if "Verlustlimit" in str(gv) and not verlustlimit_alert_gesendet:
+                    reason_code = getattr(gv, "reason_code", None)
+                    if reason_code in ("daily_loss_limit", "loss_streak_cooldown") and not verlustlimit_alert_gesendet:
+                        if reason_code == "daily_loss_limit":
+                            subject = "🛑 Trading Bot – Daily Loss Limit erreicht"
+                            hinweis = "Der Bot wurde automatisch pausiert und handelt erst nach manueller Freigabe wieder."
+                        else:
+                            subject = "⏸️ Trading Bot – Verlustserie-Cooldown ausgelöst"
+                            hinweis = "Der Bot pausiert automatisch für die konfigurierte Cooldown-Dauer und nimmt danach selbstständig wieder auf."
                         send_email(
-                            subject="🛑 Trading Bot – Daily Loss Limit erreicht",
+                            subject=subject,
                             body=(
                                 f"{gv}\n\n"
                                 f"Nutzer: {user_id}\n"
-                                f"Der Bot wurde automatisch pausiert und handelt erst nach "
-                                f"manueller Freigabe wieder."
+                                f"{hinweis}"
                             )
                         )
                         verlustlimit_alert_gesendet = True

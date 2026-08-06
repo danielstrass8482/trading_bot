@@ -111,7 +111,13 @@ def fetch_fundamentals(ticker: str) -> dict:
             "sector":         info.get("sector"),
             "industry":       info.get("industry"),
         }
-    except Exception:
+    except Exception as e:
+        # Fund 14 (Code-Audit 2026-08-06): Sichtbarkeit statt stillem
+        # Verschlucken – der Fallback (leere Fundamentaldaten -> neutrale
+        # Score-Teilkredite) bleibt unverändert, ein systematisches
+        # yfinance-Problem für eine Ticker-Untergruppe soll aber im Log
+        # auffallen statt unbegrenzt lange unbemerkt zu bleiben.
+        print(f"⚠️  fetch_fundamentals({ticker}): yfinance-Fehler ({e}) – keine Fundamentaldaten verfügbar.")
         return {}
 
 
@@ -360,16 +366,16 @@ def calculate_score(ticker: str, df: pd.DataFrame, fundamentals: dict, is_invers
         stop_loss       = stop_loss,
         take_profit     = take_profit,
         score_breakdown = breakdown,
-        atr             = round(atr, 2) if atr else None,
+        atr             = round(atr, 2) if not shared_scoring.is_missing(atr) else None,
         sl_pct          = sl_pct,
         tp_pct          = tp_pct,
         rsi             = round(rsi, 1),
-        pe_ratio        = round(pe, 1) if pe else None,
-        debt_to_equity  = round(de, 1) if de else None,
+        pe_ratio        = round(pe, 1) if not shared_scoring.is_missing(pe) else None,
+        debt_to_equity  = round(de, 1) if not shared_scoring.is_missing(de) else None,
         revenue_growth  = rev_growth,
         volume_ratio    = round(volume_ratio, 2),
-        sma50           = round(sma50, 2) if sma50 else None,
-        sma200          = round(sma200, 2) if sma200 else None,
+        sma50           = round(sma50, 2) if not shared_scoring.is_missing(sma50) else None,
+        sma200          = round(sma200, 2) if not shared_scoring.is_missing(sma200) else None,
         sector          = fundamentals.get("sector"),
     )
 

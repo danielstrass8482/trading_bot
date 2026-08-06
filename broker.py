@@ -27,8 +27,16 @@ from notifications import send_email
 
 
 class GuardrailViolation(Exception):
-    """Wird geworfen wenn ein Guardrail-Limit erreicht wurde."""
-    pass
+    """Wird geworfen wenn ein Guardrail-Limit erreicht wurde.
+
+    reason_code (2026-08-06, Fund 13): strukturierter Ersatz für das bisherige
+    String-Matching auf den Fehlertext ("Verlustlimit" in str(gv)) an den
+    Alarm-Mail-Stellen in main.py – None für alle Guardrails, die keine
+    Sofort-Mail auslösen sollen.
+    """
+    def __init__(self, message: str, reason_code: str | None = None):
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 def get_broker(user_id: int = None) -> BrokerInterface:
@@ -320,7 +328,8 @@ def check_guardrails(signal: SignalResult, user_id: int = DEFAULT_USER_ID) -> No
             session.commit()
             raise GuardrailViolation(
                 f"Tägliches Verlustlimit erreicht (${abs(daily_pnl):.2f} / ${daily_loss_limit:.2f}). "
-                f"{'Bot' if user_id == DEFAULT_USER_ID else f'Nutzer {user_id}'} pausiert automatisch."
+                f"{'Bot' if user_id == DEFAULT_USER_ID else f'Nutzer {user_id}'} pausiert automatisch.",
+                reason_code="daily_loss_limit",
             )
 
         # 5b. Verlustserie-Cooldown (AUFGABE 1, 2026-08-06): EIGENSTÄNDIGER
@@ -336,7 +345,8 @@ def check_guardrails(signal: SignalResult, user_id: int = DEFAULT_USER_ID) -> No
         if loss_streak["cooldown_active"]:
             raise GuardrailViolation(
                 f"Verlustserie-Cooldown aktiv ({loss_streak['consecutive_losses']} Verluste in Folge) – "
-                f"pausiert bis {loss_streak['cooldown_until'].isoformat()}."
+                f"pausiert bis {loss_streak['cooldown_until'].isoformat()}.",
+                reason_code="loss_streak_cooldown",
             )
 
         # 6. AUFGABE 4 (2026-07-30): konfiguriertes Kapital-Limit vs. echtes
@@ -1558,8 +1568,12 @@ def get_portfolio_value(user_id: int = DEFAULT_USER_ID) -> float:
                 import yfinance as yf
                 current_price = yf.Ticker(trade.ticker).fast_info.get("lastPrice", trade.entry_price)
                 unrealized_pnl += (float(current_price) - trade.entry_price) * trade.quantity
-            except Exception:
-                pass  # Unrealisiert ≈ 0 wenn Preis nicht abrufbar
+            except Exception as e:
+                # Fund 14 (Code-Audit 2026-08-06): Sichtbarkeit statt stillem
+                # Verschlucken – ein systematisches yfinance-Problem für eine
+                # Ticker-Untergruppe soll auffallen, auch wenn der Fallback
+                # (Unrealisiert ≈ 0) selbst unverändert bleibt.
+                print(f"⚠️  get_portfolio_value: Preis für {trade.ticker} nicht abrufbar ({e}) – unrealisiert ≈ 0 für diese Position.")
 
         max_capital_total = get_user_live_config(user_id)["MAX_CAPITAL_TOTAL"]
         return round(max_capital_total + realized_pnl + unrealized_pnl, 2)
