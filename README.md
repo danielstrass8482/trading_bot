@@ -89,6 +89,17 @@ Alpaca-Connect) – bei einem Neuaufsetzen müssen sie von Hand nachgebaut werde
   die laufen ausschließlich über nginx/Domains, nie über direkten Portzugriff, und Port 8504 hatte
   ohnehin nie eine offene `ufw`-Regel (blockiert durch `ufw`-Default-Policy `deny incoming`).
 
+- `trading-bot.service`/`trading-api.service`: `TimeoutStopSec=100` (statt des systemd-Defaults
+  90s) – seit dem Graceful-Shutdown-Fix (2026-08-06, siehe `graceful_shutdown.py` in
+  `trading_shared`) fängt der Bot SIGTERM ab und führt einen bereits laufenden Entry-/Monitoring-
+  Zyklus zu Ende (bis zu 75s eigenes Zeitlimit), statt sofort zu sterben. **Ein `systemctl restart`
+  während der Handelszeit kann dadurch bis zu ~60-90 Sekunden dauern, statt sofort durchzulaufen –
+  das ist normal, kein Hänger.** Prüfen lässt sich das im Journal: `🛑 ... SIGTERM empfangen ...`
+  gefolgt von `✅ ... laufender Zyklus sauber abgeschlossen ... Prozess beendet sich jetzt`. Nur wenn
+  stattdessen `🚨 ... Graceful-Shutdown-Zeitlimit ... überschritten` erscheint, hat der eigene
+  75s-Fallback zugeschlagen (Zyklus hing fest, z.B. an einem externen API-Call) – auch das ist ein
+  kontrolliertes, geloggtes Ende, kein SIGKILL "aus dem Nichts".
+
 ---
 
 ## Deployment auf Railway.app (veraltet, siehe oben)

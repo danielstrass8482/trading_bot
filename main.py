@@ -35,6 +35,9 @@ from backlook import run_backlook
 from fair_value import update_fair_value_cache, get_undervalued_tickers
 from saxo_client import get_valid_access_token
 from post_exit_tracking import update_pending_tracking
+from trading_shared.graceful_shutdown import (
+    install_sigterm_handler, is_shutdown_requested, cycle_guard,
+)
 
 
 def _get_current_price_for_snapshot(ticker: str, fallback: float) -> float:
@@ -514,6 +517,7 @@ def get_trades_for_slot(slot: EntryTimeSlot, user_id: int = DEFAULT_USER_ID) -> 
     return trades_this_slot
 
 
+@cycle_guard
 def run_entry_cycle(slot: EntryTimeSlot):
     """
     Entry-Zyklus für einen einzelnen Zeitslot (siehe entry_time_slots /
@@ -535,6 +539,15 @@ def run_entry_cycle(slot: EntryTimeSlot):
     DEFAULT_USER_ID/global verankert (Dashboard/Scan-Historie-UI ist nicht Teil
     dieses Auftrags – nur der Handelsloop selbst wurde multi-tenant-fähig gemacht).
     """
+    # Graceful Shutdown (Bugfix 2026-08-06): ein SIGTERM (z.B. durch
+    # `systemctl restart` bei einem Deploy) lässt einen bereits laufenden
+    # Zyklus bewusst zu Ende laufen (siehe graceful_shutdown.py) – aber ein
+    # NEUER Zyklus/Slot darf danach nicht mehr starten.
+    if is_shutdown_requested():
+        print(f"⏭️  Entry-Zyklus {slot.stunde_et:02d}:{slot.minute_et:02d} ET übersprungen – "
+              f"Shutdown angefordert, kein neuer Zyklus mehr.")
+        return
+
     print(f"\n{'='*60}")
     print(f"🤖 Entry-Zyklus {slot.stunde_et:02d}:{slot.minute_et:02d} ET gestartet: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
@@ -644,6 +657,11 @@ def run_entry_cycle(slot: EntryTimeSlot):
         print(f"\n👥 Multi-Tenant: {len(connected_user_ids)} verbundene Nutzer in diesem Zyklus "
               f"({', '.join(str(u) for u in connected_user_ids)})")
 
+    # Graceful Shutdown: nur EINMAL geloggt (nicht pro Kandidat) – der Zyklus
+    # läuft bewusst trotzdem normal zu Ende (kein Abbruch mitten in einer
+    # Order-Platzierung), siehe graceful_shutdown.py.
+    shutdown_notice_logged = False
+
     for user_id in connected_user_ids:
         # Jeder Nutzer läuft in seiner eigenen try/except-Grenze: ein
         # unerwarteter Fehler bei EINEM Nutzer (z.B. Netzwerkproblem mit
@@ -659,6 +677,12 @@ def run_entry_cycle(slot: EntryTimeSlot):
             for signal in approved:
                 if user_trades_in_slot >= user_erlaubt:
                     break
+
+                if is_shutdown_requested() and not shutdown_notice_logged:
+                    print(f"   ℹ️  Shutdown angefordert (aktueller Kandidat: {signal.ticker}) – "
+                          f"Zyklus läuft trotzdem normal zu Ende (kein Abbruch mitten in Guardrail-"
+                          f"Prüfung/LLM/Order-Platzierung), kein neuer Zyklus mehr danach.")
+                    shutdown_notice_logged = True
 
                 # check_guardrails() fragt open_trades/daily_trade_count/daily_pnl
                 # bei jedem Aufruf frisch aus der DB ab (pro Nutzer gefiltert) –
@@ -844,6 +868,8 @@ def run_entry_cycle(slot: EntryTimeSlot):
     print(f"\n{'='*60}")
     print(f"✅ Entry-Zyklus abgeschlossen. Trades in diesem Slot: {len(executed_trades)}")
     print(f"{'='*60}\n")
+    # Graceful Shutdown: @cycle_guard (siehe Funktionsdefinition) beendet den
+    # Prozess hier automatisch sauber, falls währenddessen ein SIGTERM einging.
 
 
 def schedule_entry_jobs(scheduler: BlockingScheduler, et_tz):
@@ -890,6 +916,7 @@ def init_fair_value_if_empty():
         update_fair_value_cache(LONG_WATCHLIST + ACTIVE_SHORT_INSTRUMENTS)
 
 
+@cycle_guard
 def run_monitoring_cycle():
     """
     Leichtgewichtiger Zyklus: Nur SL/TP überwachen (alle 30 Min während Handelszeit).
@@ -901,7 +928,20 @@ def run_monitoring_cycle():
     darf die anderen nicht vom Monitoring/Watchdog ausschließen (analog zum
     Prinzip in run_entry_cycle).
     """
+    # Graceful Shutdown (Bugfix 2026-08-06): siehe run_entry_cycle – ein
+    # bereits laufender Monitoring-Zyklus läuft bewusst zu Ende (offene
+    # Positionen könnten bereits mitten in einer Sell-Order-Vorbereitung
+    # stecken), aber kein neuer startet mehr danach.
+    if is_shutdown_requested():
+        print("⏭️  Monitoring-Zyklus übersprungen – Shutdown angefordert, kein neuer Zyklus mehr.")
+        return
+
+    shutdown_notice_logged = False
     for user_id in get_connected_user_ids():
+        if is_shutdown_requested() and not shutdown_notice_logged:
+            print(f"   ℹ️  Shutdown angefordert (aktueller Nutzer: {user_id}) – Monitoring läuft "
+                  f"trotzdem normal zu Ende (kein Abbruch mitten in SL/TP/Trailing-Prüfung).")
+            shutdown_notice_logged = True
         try:
             monitor_open_positions(user_id)
             check_position_consistency(user_id)
@@ -915,6 +955,8 @@ def run_monitoring_cycle():
     with get_session() as session:
         BotHeartbeat.touch(session, "alpaca", "monitoring")
         session.commit()
+    # Graceful Shutdown: @cycle_guard (siehe Funktionsdefinition) beendet den
+    # Prozess hier automatisch sauber, falls währenddessen ein SIGTERM einging.
 
 
 def saxo_token_refresh_job():
@@ -935,6 +977,12 @@ def saxo_token_refresh_job():
 def main():
     """Startet den Scheduler."""
     print("🚀 Trading Bot startet...")
+
+    # Graceful Shutdown (Bugfix 2026-08-06): so früh wie möglich installieren,
+    # damit auch ein SIGTERM direkt nach dem Start (z.B. während init_db())
+    # abgefangen wird, siehe graceful_shutdown.py und run_entry_cycle/
+    # run_monitoring_cycle für die eigentliche Zyklus-Logik.
+    install_sigterm_handler(bot_label="Alpaca", grace_period_sec=75)
 
     # Konfiguration validieren
     warnings = validate_config()

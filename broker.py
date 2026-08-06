@@ -24,6 +24,7 @@ from database import (
 from rule_engine import SignalResult
 from broker_interface import BrokerInterface
 from notifications import send_email
+from trading_shared.graceful_shutdown import is_shutdown_requested
 
 
 class GuardrailViolation(Exception):
@@ -1380,7 +1381,18 @@ def monitor_open_positions(user_id: int = DEFAULT_USER_ID):
         # Trailing unten bleiben unverändert sofort-reagierend.
         time_exit_allowed = _time_exit_currently_allowed(session, user_id)
 
+        # Graceful Shutdown (Bugfix 2026-08-06): rein informativ (einmaliges
+        # Log) – der Zyklus läuft bewusst zu Ende, ein Abbruch mitten in
+        # dieser Schleife könnte eine bereits vorbereitete Sell-Order
+        # (SL/TP/Trailing/Time-Exit) unvollständig lassen, siehe
+        # graceful_shutdown.py.
+        shutdown_notice_logged = False
+
         for trade in open_trades:
+            if is_shutdown_requested() and not shutdown_notice_logged:
+                print(f"   ℹ️  Shutdown angefordert (aktuelle Position: {trade.ticker}) – Monitoring "
+                      f"läuft trotzdem normal zu Ende (kein Abbruch mitten in SL/TP/Trailing-Check).")
+                shutdown_notice_logged = True
             try:
                 # State-Machine-Gate (Aufgabe 2, 2026-07-30, erweitert Fix
                 # 2026-07-31 um die Entry-Seite): steckt diese Position bereits

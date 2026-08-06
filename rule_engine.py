@@ -14,6 +14,7 @@ warnings.filterwarnings("ignore")
 
 from trading_shared import scoring as shared_scoring
 from trading_shared.atr import calculate_atr
+from trading_shared.graceful_shutdown import is_shutdown_requested
 
 from config import (
     RSI_OVERSOLD, RSI_OVERBOUGHT,
@@ -532,6 +533,13 @@ def scan_watchlist_parallel(watchlist: list, max_workers: int = 15) -> list[Sign
     """
     results = []
     errors = 0
+    # Graceful Shutdown (Bugfix 2026-08-06): der Scan läuft bei einem
+    # SIGTERM-während-Deploy BEWUSST vollständig zu Ende (siehe
+    # graceful_shutdown.py) – ein hier abgebrochener Scan war genau der
+    # Incident vom 06.08.: ein später fertiggewordener Kandidat hätte über
+    # der Kaufschwelle liegen können, ohne dass es jemand erfährt. Der Flag-
+    # Check hier ist daher rein informativ (einmaliges Log), kein Abbruch.
+    shutdown_notice_logged = False
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(analyze_ticker, ticker): ticker for ticker in watchlist}
@@ -545,6 +553,11 @@ def scan_watchlist_parallel(watchlist: list, max_workers: int = 15) -> list[Sign
             except Exception as e:
                 errors += 1
                 print(f"⚠️ {ticker}: {e}")
+
+            if is_shutdown_requested() and not shutdown_notice_logged:
+                print(f"   ℹ️  Shutdown angefordert – Scan läuft trotzdem vollständig zu Ende "
+                      f"(kein verpasster Kandidat), zuletzt fertig: {ticker}.")
+                shutdown_notice_logged = True
 
     print(f"✅ Parallel-Scan: {len(results)} Ergebnisse, {errors} Fehler")
     results.sort(key=lambda r: (not r.approved, -r.score))
