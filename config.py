@@ -339,6 +339,16 @@ TRAILING_ACTIVATION_PCT = 0.06   # Fixer Trailing-Aktivierungs-Trigger ggü. Ent
                                   # Trailing startet beim NIEDRIGEREN von (diesem
                                   # Wert, individuellem ATR-TP) – siehe broker.py
 DAILY_LOSS_LIMIT_PCT  = 0.05     # Bot pausiert bei -5% Tagesverlust auf Gesamtkapital
+# Verlustserie-Cooldown (2026-08-06): EIGENSTÄNDIGER Guardrail, unabhängig vom
+# Tagesverlustlimit oben – zählt aufeinanderfolgende Verlust-Trades UNABHÄNGIG
+# von deren Höhe (ein einziger Gewinn-Trade setzt zurück, siehe
+# database.close_trade/_record_loss_streak_result). Erreicht der Zähler
+# MAX_CONSECUTIVE_LOSSES, pausiert der Bot für COOLDOWN_HOURS_AFTER_LOSS_STREAK
+# Stunden (nur neue Entries – offene Positionen laufen normal per SL/TP/
+# Trailing weiter, siehe broker.check_guardrails). Kann gleichzeitig mit dem
+# Tagesverlustlimit aktiv sein.
+MAX_CONSECUTIVE_LOSSES = 3
+COOLDOWN_HOURS_AFTER_LOSS_STREAK = 4.0
 MIN_SIGNAL_SCORE      = 65       # Minimaler Rule-Engine-Score (0–100) für Trade-Freigabe
 
 # Markt-Kontext-Filter (KO-Kriterien)
@@ -399,6 +409,8 @@ _LIVE_CONFIG_SPEC = {
     "TAKE_PROFIT_PCT":         (float, TAKE_PROFIT_PCT),
     "TRAILING_ACTIVATION_PCT": (float, TRAILING_ACTIVATION_PCT),
     "DAILY_LOSS_LIMIT_PCT":    (float, DAILY_LOSS_LIMIT_PCT),
+    "MAX_CONSECUTIVE_LOSSES":  (int,   MAX_CONSECUTIVE_LOSSES),
+    "COOLDOWN_HOURS_AFTER_LOSS_STREAK": (float, COOLDOWN_HOURS_AFTER_LOSS_STREAK),
     "MIN_SIGNAL_SCORE":        (int,   MIN_SIGNAL_SCORE),
     "VIX_PAUSE_THRESHOLD":     (float, VIX_PAUSE_THRESHOLD),
     "MONITORING_INTERVAL_MIN": (int,   15),

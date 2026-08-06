@@ -378,6 +378,8 @@ DEFAULT_CONFIG = {
     "TAKE_PROFIT_PCT":         ("0.06",   "Take Profit %"),
     "TRAILING_ACTIVATION_PCT": ("0.06",   "Fixer Trailing-Aktivierungs-Trigger % ggü. Entry (niedrigerer von diesem und ATR-TP löst aus)"),
     "DAILY_LOSS_LIMIT_PCT":    ("0.05",   "Tagesverlust-Limit %"),
+    "MAX_CONSECUTIVE_LOSSES":  ("3",      "Verlustserie-Cooldown: Anzahl aufeinanderfolgender Verlust-Trades bis zur Pause"),
+    "COOLDOWN_HOURS_AFTER_LOSS_STREAK": ("4.0", "Verlustserie-Cooldown: Pausendauer in Stunden"),
     "MIN_SIGNAL_SCORE":        ("65",     "Minimaler Score"),
     "VIX_PAUSE_THRESHOLD":     ("30",     "VIX-Limit"),
     "MONITORING_INTERVAL_MIN": ("15",     "Monitoring-Intervall Minuten"),
@@ -1158,7 +1160,83 @@ def close_trade(session: Session, trade: Trade, exit_price: float, reason: str) 
     trade.status_detail = None
     trade.pending_client_order_id = None
     trade.pending_exit_reason = None
+    # Verlustserie-Cooldown (2026-08-06): EINZIGER Aufrufpunkt für alle 4
+    # close_trade()-Call-Sites in broker.py – zählt/pausiert unabhängig vom
+    # jeweiligen Exit-Grund, siehe _record_loss_streak_result.
+    _record_loss_streak_result(session, trade.user_id, trade.pnl_usd)
     return trade
+
+
+def _loss_streak_count_key(user_id: int = DEFAULT_USER_ID) -> str:
+    """Analog zu broker._user_pause_key: DEFAULT_USER_ID nutzt den bestehenden
+    globalen Key (keine Verhaltensänderung für Daniels Account möglich, da es
+    diesen Mechanismus vor 2026-08-06 nicht gab), andere Nutzer bekommen einen
+    eigenen Key, damit eine Verlustserie bei EINEM Nutzer nicht alle anderen
+    mit-pausiert."""
+    return "consecutive_losses" if user_id == DEFAULT_USER_ID else f"consecutive_losses_user_{user_id}"
+
+
+def _loss_streak_cooldown_key(user_id: int = DEFAULT_USER_ID) -> str:
+    return "loss_streak_cooldown_until" if user_id == DEFAULT_USER_ID else f"loss_streak_cooldown_until_user_{user_id}"
+
+
+def _record_loss_streak_result(session: Session, user_id: int, pnl_usd: float) -> None:
+    """
+    Wird von close_trade() nach JEDEM geschlossenen Trade aufgerufen (AUFGABE 1,
+    2026-08-06). Zählt aufeinanderfolgende Verlust-Trades (pnl_usd < 0)
+    unabhängig von deren Höhe; ein Gewinn-Trade (pnl_usd >= 0) setzt den
+    Zähler zurück auf 0. Erreicht/überschreitet der Zähler
+    MAX_CONSECUTIVE_LOSSES, wird ein Cooldown-Ende (jetzt + COOLDOWN_HOURS_
+    AFTER_LOSS_STREAK Stunden) gesetzt bzw. verlängert – siehe
+    broker.check_guardrails für die tatsächliche Entry-Sperre und
+    get_loss_streak_state für die automatische Freigabe nach Ablauf.
+    Committet NICHT selbst (wie close_trade() – der jeweilige Aufrufer in
+    broker.py committet die gesamte Session).
+    """
+    from config import get_live_config  # lazy: Zirkelimport-Vermeidung, siehe get_user_live_config
+    cfg = get_live_config()
+    count_key = _loss_streak_count_key(user_id)
+    cooldown_key = _loss_streak_cooldown_key(user_id)
+
+    if pnl_usd < 0:
+        count = int(BotState.get(session, count_key, "0")) + 1
+    else:
+        count = 0
+    BotState.set(session, count_key, str(count))
+
+    if count >= cfg["MAX_CONSECUTIVE_LOSSES"]:
+        cooldown_until = datetime.utcnow() + timedelta(hours=cfg["COOLDOWN_HOURS_AFTER_LOSS_STREAK"])
+        BotState.set(session, cooldown_key, cooldown_until.isoformat())
+
+
+def get_loss_streak_state(session: Session, user_id: int = DEFAULT_USER_ID) -> dict:
+    """
+    Liest den Verlustserie-Cooldown-Zustand für einen Nutzer. Ein bereits
+    abgelaufener Cooldown wird hier sofort aufgeräumt (Zähler auf 0
+    zurückgesetzt, cooldown_until gelöscht – AUFGABE 1 Punkt 5 "automatisch
+    wieder freigeben") – Aufrufer (broker.check_guardrails, trading_api.py,
+    notifications.py) bekommen also nie einen bereits abgelaufenen, aber noch
+    gesetzten Cooldown zurück. Selbstheilend/idempotent, daher auch aus reinen
+    Lesekontexten (API) sicher aufrufbar.
+    """
+    count_key = _loss_streak_count_key(user_id)
+    cooldown_key = _loss_streak_cooldown_key(user_id)
+
+    raw_until = BotState.get(session, cooldown_key)
+    cooldown_until = datetime.fromisoformat(raw_until) if raw_until else None
+
+    if cooldown_until is not None and datetime.utcnow() >= cooldown_until:
+        BotState.set(session, count_key, "0")
+        BotState.set(session, cooldown_key, "")
+        session.commit()
+        cooldown_until = None
+
+    count = int(BotState.get(session, count_key, "0") or "0")
+    return {
+        "consecutive_losses": count,
+        "cooldown_until": cooldown_until,
+        "cooldown_active": cooldown_until is not None,
+    }
 
 
 class PendingOrderAttempt(Base):

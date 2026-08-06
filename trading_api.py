@@ -33,6 +33,7 @@ from broker import (
     get_effective_max_capital_total_bot, get_or_seed_capital_allocations,
     CAPITAL_ALLOCATION_CATEGORIES,
     get_portfolio_value, get_alpaca_account_snapshot, count_trading_days,
+    get_pause_status,
 )
 from rule_engine import get_market_regime
 import yfinance as yf
@@ -293,6 +294,11 @@ def get_overview(user_id: int = Depends(get_current_user_id)):
         # Nutzer soll "PAPER" sehen, nicht Daniels globales LIVE (siehe
         # database.get_trade_mode_for_user-Docstring).
         "trading_mode": get_trade_mode_for_user(user_id),
+        # Pause-Sichtbarkeit (AUFGABE 2, 2026-08-06): fasst Tagesverlustlimit
+        # UND Verlustserie-Cooldown zusammen (siehe broker.get_pause_status) –
+        # vorher hatte das Frontend KEINE Möglichkeit, einen aktiven
+        # bot_paused-Zustand überhaupt anzuzeigen.
+        "pause_status": get_pause_status(user_id),
     }
 
 

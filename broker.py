@@ -19,6 +19,7 @@ from database import (
     get_active_entry_time_slots, get_user_live_config,
     get_trade_mode_for_user, get_bot_config,
     get_capital_allocations, set_capital_allocations,
+    get_loss_streak_state,
 )
 from rule_engine import SignalResult
 from broker_interface import BrokerInterface
@@ -242,6 +243,41 @@ def _user_pause_key(user_id: int) -> str:
     return "bot_paused" if user_id == DEFAULT_USER_ID else f"bot_paused_user_{user_id}"
 
 
+def get_pause_status(user_id: int = DEFAULT_USER_ID) -> dict:
+    """
+    Aktueller Pause-Zustand für Frontend/Mail-Sichtbarkeit (AUFGABE 2,
+    2026-08-06) – fasst BEIDE unabhängigen Pause-Mechanismen zusammen, die
+    check_guardrails() prüft: das Tagesverlustlimit (Guard 5, Key
+    _user_pause_key) und den Verlustserie-Cooldown (Guard 5b, siehe
+    get_loss_streak_state). Beide können gleichzeitig aktiv sein.
+
+    Tagesverlustlimit hat bewusst KEIN "bis"-Zeitpunkt (until=None): der
+    bot_paused-Key wird nirgends automatisch zurückgesetzt (siehe
+    _user_pause_key-Docstring, dashboard.py-Toggle) – die Freigabe erfordert
+    einen manuellen Reset im Dashboard. Der Verlustserie-Cooldown dagegen
+    läuft automatisch nach COOLDOWN_HOURS_AFTER_LOSS_STREAK Stunden ab.
+    """
+    with get_session() as session:
+        global_paused = BotState.get(session, "bot_paused") == "true"
+        user_paused = (
+            user_id != DEFAULT_USER_ID
+            and BotState.get(session, _user_pause_key(user_id)) == "true"
+        )
+        loss_streak = get_loss_streak_state(session, user_id)
+
+    reasons = []
+    if global_paused or user_paused:
+        reasons.append({"reason": "daily_loss_limit", "until": None})
+    if loss_streak["cooldown_active"]:
+        reasons.append({
+            "reason": "loss_streak_cooldown",
+            "until": loss_streak["cooldown_until"].isoformat(),
+            "consecutive_losses": loss_streak["consecutive_losses"],
+        })
+
+    return {"paused": bool(reasons), "reasons": reasons}
+
+
 def check_guardrails(signal: SignalResult, user_id: int = DEFAULT_USER_ID) -> None:
     """
     Prüft ALLE Guardrails vor Trade-Ausführung, für EINEN Nutzer (Multi-Tenant-
@@ -285,6 +321,22 @@ def check_guardrails(signal: SignalResult, user_id: int = DEFAULT_USER_ID) -> No
             raise GuardrailViolation(
                 f"Tägliches Verlustlimit erreicht (${abs(daily_pnl):.2f} / ${daily_loss_limit:.2f}). "
                 f"{'Bot' if user_id == DEFAULT_USER_ID else f'Nutzer {user_id}'} pausiert automatisch."
+            )
+
+        # 5b. Verlustserie-Cooldown (AUFGABE 1, 2026-08-06): EIGENSTÄNDIGER
+        # Guardrail, unabhängig vom Tagesverlustlimit oben – beide können
+        # gleichzeitig aktiv sein. Zählt aufeinanderfolgende Verlust-Trades
+        # unabhängig von deren Höhe (siehe database.close_trade/
+        # _record_loss_streak_result), sperrt hier nur NEUE Entries; offene
+        # Positionen laufen unverändert per SL/TP/Trailing weiter (siehe
+        # monitor_open_positions, das diesen Guard nicht aufruft). Läuft
+        # automatisch nach COOLDOWN_HOURS_AFTER_LOSS_STREAK Stunden ab (siehe
+        # get_loss_streak_state) – kein manueller Reset nötig.
+        loss_streak = get_loss_streak_state(session, user_id)
+        if loss_streak["cooldown_active"]:
+            raise GuardrailViolation(
+                f"Verlustserie-Cooldown aktiv ({loss_streak['consecutive_losses']} Verluste in Folge) – "
+                f"pausiert bis {loss_streak['cooldown_until'].isoformat()}."
             )
 
         # 6. AUFGABE 4 (2026-07-30): konfiguriertes Kapital-Limit vs. echtes

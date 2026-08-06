@@ -29,7 +29,7 @@ from broker import (
     place_trade, monitor_open_positions, get_portfolio_value, get_bot_performance,
     check_guardrails, check_position_consistency, GuardrailViolation,
     get_alpaca_account_snapshot, get_effective_max_capital_total_bot,
-    get_effective_max_capital_total_bot_costbasis,
+    get_effective_max_capital_total_bot_costbasis, get_pause_status,
 )
 from backlook import run_backlook
 from fair_value import update_fair_value_cache, get_undervalued_tickers
@@ -173,6 +173,20 @@ def send_daily_summary_email():
             FROM trades WHERE status = 'OPEN'
         """)).fetchall()
 
+        # Pause-Sichtbarkeit in der Tages-Mail (AUFGABE 2, 2026-08-06): erfasst
+        # sowohl das bereits bestehende Tagesverlustlimit als auch den neuen
+        # Verlustserie-Cooldown. guardrail_reason wird von run_entry_cycle für
+        # JEDEN durch check_guardrails() geblockten Kandidaten in scan_log
+        # geschrieben (siehe log_scan_results) – damit lässt sich auch ein
+        # inzwischen bereits wieder abgelaufener Cooldown noch rückblickend
+        # für "heute" erkennen (siehe pause_hits_today unten).
+        pause_hits_today = session.execute(text("""
+            SELECT DISTINCT guardrail_reason FROM scan_log
+            WHERE DATE(scan_time AT TIME ZONE 'America/New_York') = :today
+              AND (guardrail_reason LIKE 'Tägliches Verlustlimit erreicht%'
+                   OR guardrail_reason LIKE 'Verlustserie-Cooldown aktiv%')
+        """), {"today": today}).fetchall()
+
         prev_snapshot = get_previous_position_snapshot(session, today)
 
     portfolio_value = get_portfolio_value()
@@ -195,6 +209,31 @@ Portfolio-Wert heute Abend: ${portfolio_value:.2f}
         )
     else:
         body += "Erster Tag mit Snapshot-Tracking, Vergleich ab morgen verfügbar.\n"
+
+    # Pause-Hinweis (AUFGABE 2, 2026-08-06): kombiniert den aktuellen
+    # Pause-Zustand (get_pause_status, z.B. falls der Cooldown noch bis nach
+    # Mail-Versand läuft) mit heute im Tagesverlauf aufgetretenen Treffern
+    # (pause_hits_today, deckt auch einen inzwischen schon wieder
+    # abgelaufenen Verlustserie-Cooldown ab).
+    pause_status = get_pause_status()
+    pause_notes = set()
+    for r in pause_status["reasons"]:
+        if r["reason"] == "daily_loss_limit":
+            pause_notes.add("Tagesverlust-Limit erreicht – Bot pausiert weiterhin bis zum manuellen Reset im Dashboard.")
+        elif r["reason"] == "loss_streak_cooldown":
+            pause_notes.add(
+                f"Verlustserie-Cooldown aktiv ({r['consecutive_losses']} Verluste in Folge) – "
+                f"pausiert bis {r['until']}."
+            )
+    for row in pause_hits_today:
+        if row.guardrail_reason.startswith("Tägliches Verlustlimit erreicht"):
+            pause_notes.add("Tagesverlust-Limit wurde heute erreicht.")
+        elif row.guardrail_reason.startswith("Verlustserie-Cooldown aktiv"):
+            pause_notes.add("Verlustserie-Cooldown wurde heute ausgelöst.")
+    if pause_notes:
+        body += "\n⚠️ BOT PAUSIERT\n"
+        for note in sorted(pause_notes):
+            body += f"  - {note}\n"
 
     body += "\nTRADES HEUTE\n"
     for slot in slots_heute:
