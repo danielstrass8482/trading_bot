@@ -524,6 +524,45 @@ class PendingConfirmation(Base):
     resolved_at                  = Column(DateTime, nullable=True)
 
 
+class CapitalFlow(Base):
+    """
+    Kapitalzu-/-abflüsse (Ein-/Auszahlungen), Grundlage für Aufgabe
+    "Kapitalfluss-Erfassung Chunk 1" (2026-08-07): get_bot_performance()
+    zählt aktuell JEDE Einzahlung fälschlich als Trading-Gewinn mit - live
+    bestätigter Fall: Saxo zeigte 124,38% für 30 Tage, weil zwischenzeitlich
+    1800 EUR eingezahlt wurden. Diese Tabelle erfasst nur die Kapitalflüsse
+    selbst - die Korrektur der Performance-Formeln um diese Flüsse ist
+    bewusst NICHT Teil dieses Chunks (Chunk 2).
+
+    Physisch DIESELBE Tabelle wie im trading_bot_saxo-Repo (`broker`-Spalte
+    unterscheidet 'alpaca'/'saxo') - unabhängige Modell-Definition hier,
+    analog zum bestehenden SaxoToken-/PendingConfirmation-Muster (kein
+    Shared-Code-Import zwischen den Repos).
+
+    UniqueConstraint auf (broker, broker_reference_id) statt eines bloßen
+    globalen unique=True auf broker_reference_id: die Referenz-ID-Formate
+    unterscheiden sich strukturell zwischen den Brokern (Alpacas Activity-
+    IDs sind zusammengesetzte Strings wie "20260722000000000::<uuid>",
+    Saxos BookingId ist ein rein numerischer String) - eine zufällige
+    Kollision ist astronomisch unwahrscheinlich, aber semantisch korrekt
+    ist die Eindeutigkeit ohnehin nur INNERHALB eines Brokers gemeint.
+    """
+    __tablename__ = "capital_flows"
+    __table_args__ = (
+        UniqueConstraint("broker", "broker_reference_id", name="uq_capital_flows_broker_reference"),
+    )
+
+    id                  = Column(Integer, primary_key=True, autoincrement=True)
+    user_id             = Column(Integer, nullable=False, index=True)
+    broker              = Column(String(10), nullable=False)  # 'alpaca' / 'saxo'
+    amount              = Column(Float, nullable=False)       # positiv = Einzahlung, negativ = Auszahlung
+    currency            = Column(String(10), nullable=False)
+    flow_type           = Column(String(20), nullable=False)  # 'deposit' / 'withdrawal'
+    broker_reference_id = Column(String(128), nullable=False, index=True)
+    occurred_at         = Column(DateTime, nullable=False)
+    synced_at           = Column(DateTime, default=datetime.utcnow)
+
+
 class SaxoToken(Base):
     """
     OAuth Access-/Refresh-Token für die Saxo Bank OpenAPI (LIVE). Es gibt

@@ -30,6 +30,7 @@ from broker import (
     check_guardrails, check_position_consistency, GuardrailViolation,
     get_alpaca_account_snapshot, get_effective_max_capital_total_bot,
     get_effective_max_capital_total_bot_costbasis, get_pause_status,
+    sync_capital_flows,
 )
 from backlook import run_backlook
 from fair_value import update_fair_value_cache, get_undervalued_tickers
@@ -959,6 +960,23 @@ def run_monitoring_cycle():
     # Prozess hier automatisch sauber, falls währenddessen ein SIGTERM einging.
 
 
+def capital_flows_sync_job():
+    """
+    Täglicher Sync-Job für Kapitalzu-/-abflüsse (Chunk 1, 2026-08-07, siehe
+    broker.sync_capital_flows) - läuft für JEDEN aktiven Multi-Tenant-Nutzer
+    (get_connected_user_ids(), analog zu anderen Multi-Tenant-Loops in
+    diesem Modul), damit auch für später verbundene Nutzer automatisch
+    Ein-/Auszahlungen erfasst werden, nicht nur für Daniel. Ein einzelner
+    Nutzer-Fehlschlag (z.B. abgelaufene persönliche Alpaca-Keys) bricht den
+    Job für die übrigen Nutzer NICHT ab.
+    """
+    for uid in get_connected_user_ids():
+        try:
+            sync_capital_flows(user_id=uid)
+        except Exception as e:
+            print(f"⚠️  capital_flows_sync_job: Sync für user_id={uid} fehlgeschlagen: {e}")
+
+
 def saxo_token_refresh_job():
     """
     Proaktiver Saxo-Token-Refresh alle 10 Minuten (siehe saxo_client.py) –
@@ -1030,6 +1048,22 @@ def main():
         ),
         id="monitor_cycle",
         name="SL/TP Monitoring"
+    )
+
+    # Kapitalfluss-Sync: täglich 04:50 ET, vor allen anderen Wartungs-Jobs
+    # (Chunk 1, 2026-08-07, siehe broker.sync_capital_flows/
+    # capital_flows_sync_job) - reine Datenerfassung, beeinflusst noch keine
+    # Performance-Berechnung (Chunk 2).
+    scheduler.add_job(
+        capital_flows_sync_job,
+        CronTrigger(
+            hour=4, minute=50,
+            day_of_week="mon-fri",
+            timezone=et_tz
+        ),
+        id="capital_flows_sync",
+        name="Kapitalfluss-Sync (Ein-/Auszahlungen)",
+        replace_existing=True
     )
 
     # Post-Exit-Tracking Update: täglich 05:00 ET (vor Handelsbeginn und vor

@@ -19,7 +19,7 @@ from database import (
     get_active_entry_time_slots, get_user_live_config,
     get_trade_mode_for_user, get_bot_config,
     get_capital_allocations, set_capital_allocations,
-    get_loss_streak_state,
+    get_loss_streak_state, CapitalFlow,
 )
 from rule_engine import SignalResult
 from broker_interface import BrokerInterface
@@ -1635,3 +1635,110 @@ def get_bot_performance(days: int = 30, user_id: int = DEFAULT_USER_ID) -> float
 
     current_value = get_portfolio_value(user_id)
     return round((current_value - start_snapshot.portfolio_value) / start_snapshot.portfolio_value * 100, 2)
+
+
+# Kapitalfluss-Erfassung Chunk 1 (2026-08-07): Alpacas Account-Activities-
+# Endpoint liefert Ein-/Auszahlungen als eigene "Non-Trade-Activity"-Typen
+# CSD (Cash Deposit) und CSW (Cash Withdrawal) - siehe
+# https://docs.alpaca.markets/reference/getaccountactivitiesbyactivitytype-1
+# (GET /v2/account/activities/{activity_type}, api.alpaca.markets bzw.
+# paper-api.alpaca.markets, Header-Auth wie überall sonst in diesem Modul).
+# Empirisch verifiziert 2026-08-07 gegen Daniels echtes LIVE-Konto
+# (nur lesend, GET, kein Order-relevanter Call): api.get_activities(
+# activity_types=["CSD","CSW"]) liefert 1 CSD-Eintrag über $475 vom
+# 2026-07-22 zurück (deckt sich exakt mit der bekannten Startkapital-
+# Einzahlung) - Feldformat: {"id": "20260722000000000::<uuid>",
+# "activity_type": "CSD", "date": "2026-07-22", "net_amount": "475"
+# (STRING, kein float!), "currency": "USD", "status": "executed"}.
+# Kein dokumentiertes Historientiefen-Limit; die zusammengesetzte "id"
+# (Datum + UUID) ist bereits von Alpaca selbst global eindeutig sortierbar
+# und dient direkt als broker_reference_id.
+CAPITAL_FLOW_ACTIVITY_TYPES = ["CSD", "CSW"]
+
+
+def _fetch_all_alpaca_capital_activities(client) -> list:
+    """
+    Holt ALLE CSD/CSW-Activities eines Kontos, seitenweise (page_token/
+    page_size, siehe get_activities-Doku) - kein Datums-Cutoff, damit ein
+    einmaliger Aufruf sowohl für den initialen Komplett-Backfill als auch
+    den täglichen Sync-Job reicht (Dedup passiert ohnehin erst beim Insert
+    in capital_flows, ein wiederholter voller Abruf ist nur unnötiger
+    Netzwerk-Overhead, keine Korrektheitsgefahr).
+    """
+    all_activities = []
+    page_token = None
+    while True:
+        batch = client.get_activities(
+            activity_types=CAPITAL_FLOW_ACTIVITY_TYPES,
+            direction="asc",
+            page_size=100,
+            page_token=page_token,
+        )
+        if not batch:
+            break
+        all_activities.extend(batch)
+        if len(batch) < 100:
+            break
+        page_token = batch[-1].id
+    return all_activities
+
+
+def sync_capital_flows(user_id: int = DEFAULT_USER_ID) -> int:
+    """
+    Ruft Alpacas CSD/CSW-Activities ab und pflegt neue Datensätze idempotent
+    in capital_flows ein (Dedup über die UniqueConstraint (broker,
+    broker_reference_id) - ein erneuter INSERT-Versuch für eine bereits
+    bekannte Activity wird einfach übersprungen, kein Fehler). Dient sowohl
+    für den initialen historischen Backfill als auch den täglichen Sync-Job
+    (siehe main.py-Scheduler) - beide rufen dieselbe Funktion auf.
+
+    NUR Datenerfassung - fließt in diesem Chunk NOCH NICHT in
+    get_bot_performance() oder irgendeine andere Performance-Berechnung ein
+    (das ist Chunk 2).
+
+    Returns: Anzahl NEU eingefügter Datensätze (0 bei bereits vollständig
+    synchronisiertem Zustand oder falls kein Alpaca-Client verfügbar ist).
+    """
+    client = _get_alpaca_client(user_id)
+    if not client:
+        print(f"⚠️  sync_capital_flows: kein Alpaca-Client für user_id={user_id} verfügbar.")
+        return 0
+
+    try:
+        activities = _fetch_all_alpaca_capital_activities(client)
+    except Exception as e:
+        print(f"⚠️  sync_capital_flows: Alpaca-Activities-Abruf fehlgeschlagen (user_id={user_id}): {e}")
+        return 0
+
+    inserted = 0
+    with get_session() as session:
+        existing_ids = {
+            r[0] for r in session.query(CapitalFlow.broker_reference_id).filter_by(broker="alpaca").all()
+        }
+        for a in activities:
+            if a.id in existing_ids:
+                continue
+            try:
+                amount = float(a.net_amount)
+                occurred_at = datetime.fromisoformat(a.date)
+            except (TypeError, ValueError) as e:
+                print(f"⚠️  sync_capital_flows: Activity {a.id} übersprungen, unerwartetes Format: {e}")
+                continue
+            flow_type = "deposit" if a.activity_type == "CSD" else "withdrawal"
+            session.add(CapitalFlow(
+                user_id=user_id,
+                broker="alpaca",
+                amount=amount,
+                currency=getattr(a, "currency", None) or "USD",
+                flow_type=flow_type,
+                broker_reference_id=a.id,
+                occurred_at=occurred_at,
+            ))
+            existing_ids.add(a.id)
+            inserted += 1
+        if inserted:
+            session.commit()
+
+    if inserted:
+        print(f"💰 sync_capital_flows: {inserted} neue Kapitalfluss-Einträge für user_id={user_id} gespeichert.")
+    return inserted
