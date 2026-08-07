@@ -431,6 +431,10 @@ _LIVE_CONFIG_SPEC = {
     "EARNINGS_BUFFER_DAYS":    (int,   EARNINGS_BUFFER_DAYS),
     "ACTIVE_BROKER":           (str,   "alpaca"),  # "alpaca" oder "ibkr" (siehe broker.get_broker)
     "ALPACA_DRAIN_MODE":       (str,   "false"),   # "true" = keine neuen Alpaca-Käufe, nur bestehende Positionen managen
+    # Confirm-Tier (Chunk 1, 2026-08-07): Datenmodell/Settings, noch ohne
+    # Verhaltensänderung (siehe database.py::DEFAULT_CONFIG/DEFAULT_USER_CONFIG).
+    "EXECUTION_MODE":         (str,   "auto"),     # "auto" oder "confirm" (manuelle Bestätigung vor Entry-Trades)
+    "PRICE_TOLERANCE_PCT":    (float, 0.02),
 }
 
 

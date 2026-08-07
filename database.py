@@ -395,6 +395,10 @@ DEFAULT_CONFIG = {
     "EARNINGS_BUFFER_DAYS":    ("3",      "Tage vor Earnings in denen nicht gekauft wird"),
     "ACTIVE_BROKER":           ("alpaca", "Aktiver Broker für neue Trades: alpaca / ibkr"),
     "ALPACA_DRAIN_MODE":       ("true",   "Alpaca: Keine neuen Käufe, nur bestehende Positionen managen"),
+    # Confirm-Tier (Chunk 1, 2026-08-07): Datenmodell/Settings nur, noch
+    # keine Verhaltensänderung – kein bestehender Code liest diese Keys.
+    "EXECUTION_MODE":          ("auto",   "Trade-Ausführung: 'auto' (sofort) oder 'confirm' (manuelle Bestätigung vor Entry-Trades)"),
+    "PRICE_TOLERANCE_PCT":     ("0.02",   "Erlaubte Preisabweichung ggü. Signal-Preis bei manueller Bestätigung, bevor der Trade verworfen wird"),
 }
 
 
@@ -477,7 +481,47 @@ DEFAULT_USER_CONFIG: dict = {
     "MAX_OPEN_POSITIONS":    (int,   3),
     "MAX_TRADES_PER_DAY":    (int,   2),
     "DAILY_LOSS_LIMIT_PCT":  (float, 0.05),
+    # Confirm-Tier (Chunk 1, 2026-08-07): siehe DEFAULT_CONFIG oben für die
+    # volle Begründung. Default 'auto'/0.02 hält jeden bestehenden Nutzer
+    # unverändert im heutigen Sofort-Ausführungs-Verhalten.
+    "EXECUTION_MODE":        (str,   "auto"),
+    "PRICE_TOLERANCE_PCT":   (float, 0.02),
 }
+
+
+class PendingConfirmation(Base):
+    """
+    Confirm-Tier (manuelle Bestätigung vor Entry-Trades, Chunk 1 von 4,
+    2026-08-07) – reines Datenmodell in diesem Chunk, wird von keinem
+    bestehenden Code gelesen/geschrieben (keine Verhaltensänderung).
+
+    Physisch DIESELBE Tabelle wie im trading_bot_saxo-Repo (`broker`-Spalte
+    unterscheidet 'alpaca'/'saxo', ein gemeinsamer Bestätigungs-Posteingang
+    über beide Broker hinweg) – unabhängige Modell-Definition hier, da
+    bewusst kein Shared-Code-Import zwischen den Repos existiert (analog
+    SaxoToken/current_weights, siehe trading_shared/weights_store.py-
+    Docstring). Token-/Ablauf-Helfer liegen in
+    trading_shared.confirm_execution (ORM-agnostisch).
+
+    user_id ohne ForeignKey (wie überall sonst in diesem Modul) – pos_users
+    "gehört" portfolio_os, kein eigenes ORM-Modell hier (siehe
+    get_connected_alpaca_users()).
+    """
+    __tablename__ = "pending_confirmations"
+
+    id                           = Column(Integer, primary_key=True, autoincrement=True)
+    user_id                      = Column(Integer, nullable=False, index=True)
+    broker                       = Column(String(10), nullable=False)  # 'alpaca' / 'saxo'
+    ticker                       = Column(String(20), nullable=False)
+    qty_or_amount                = Column(Float, nullable=False)
+    signal_price                 = Column(Float, nullable=False)
+    signal_timestamp             = Column(DateTime, nullable=False)
+    status                       = Column(String(20), nullable=False, default="pending")  # pending/confirmed/expired/rejected
+    confirmation_token           = Column(String(64), nullable=False, unique=True, index=True)
+    expires_at                   = Column(DateTime, nullable=False)
+    price_tolerance_pct_snapshot = Column(Float, nullable=False)
+    created_at                   = Column(DateTime, default=datetime.utcnow)
+    resolved_at                  = Column(DateTime, nullable=True)
 
 
 class SaxoToken(Base):
