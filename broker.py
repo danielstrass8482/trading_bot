@@ -135,59 +135,84 @@ def get_alpaca_account_snapshot(user_id: int = None) -> dict | None:
 CAPITAL_ALLOCATION_CATEGORIES = ["bot", "active_trading"]
 
 
-def get_or_seed_capital_allocations(real_total_capital: float | None) -> dict:
+def get_or_seed_capital_allocations(user_id: int, real_total_capital: float | None) -> dict:
     """
-    Liest die Prozent-Aufteilung des Gesamtkapitals (Aufgabe "Kapital-
-    Einstellungen Prozent-Umbau"); beim allerersten Aufruf (Tabelle noch
-    leer) wird sie EINMALIG aus dem alten statischen MAX_CAPITAL_TOTAL-Wert
-    hergeleitet (Migrations-Punkt 6): bot_pct = altes MAX_CAPITAL_TOTAL /
-    echtes Gesamtkapital × 100, Rest an "active_trading". Ist real_total_
-    capital gerade nicht bekannt (Alpaca nicht erreichbar), wird
-    Fail-safe mit bot_pct=100 geseedet (kompletter Umbau erst beim nächsten
-    erfolgreichen Aufruf mit echtem Kapital – verhindert einen falschen,
-    zu niedrigen Startwert allein wegen eines vorübergehenden API-Ausfalls).
+    Liest die Prozent-Aufteilung des Gesamtkapitals EINES Nutzers (Aufgabe
+    "Kapital-Einstellungen Prozent-Umbau"); beim allerersten Aufruf (noch
+    keine Zeilen für diesen Nutzer) wird sie EINMALIG geseedet.
+
+    Für DEFAULT_USER_ID (Daniel) unverändert wie vor der Multi-Tenant-
+    Erweiterung (2026-08-08): Herleitung aus dem alten statischen
+    MAX_CAPITAL_TOTAL-Wert (Migrations-Punkt 6): bot_pct = altes
+    MAX_CAPITAL_TOTAL / echtes Gesamtkapital × 100, Rest an
+    "active_trading". Ist real_total_capital gerade nicht bekannt (Alpaca
+    nicht erreichbar), wird Fail-safe mit bot_pct=100 geseedet (kompletter
+    Umbau erst beim nächsten erfolgreichen Aufruf mit echtem Kapital –
+    verhindert einen falschen, zu niedrigen Startwert allein wegen eines
+    vorübergehenden API-Ausfalls).
+
+    Für jeden anderen Nutzer (2026-08-08 neu, vorher require_owner() in
+    trading_api.py – kein eigenes UI): kein Legacy-Wert vorhanden, daher
+    einfacher Seed bot_pct=100 ("mein ganzes verbundenes Konto ist
+    Bot-Kapital", identisch zur bisherigen impliziten Bedeutung von
+    UserBotConfig.MAX_CAPITAL_TOTAL als alleinigem Kapitallimit) – der
+    Kunde kann den Anteil danach selbst über /api/capital-allocations
+    verschieben, genau wie Daniel.
     """
     with get_session() as session:
-        existing = get_capital_allocations(session)
+        existing = get_capital_allocations(session, user_id)
         if existing:
             return existing
-        legacy_max_capital_total = float(get_bot_config(session, "MAX_CAPITAL_TOTAL") or MAX_CAPITAL_TOTAL)
-        if real_total_capital and real_total_capital > 0:
-            bot_pct = max(0.0, min(100.0, round(legacy_max_capital_total / real_total_capital * 100, 1)))
+        if user_id == DEFAULT_USER_ID:
+            legacy_max_capital_total = float(get_bot_config(session, "MAX_CAPITAL_TOTAL") or MAX_CAPITAL_TOTAL)
+            if real_total_capital and real_total_capital > 0:
+                bot_pct = max(0.0, min(100.0, round(legacy_max_capital_total / real_total_capital * 100, 1)))
+            else:
+                bot_pct = 100.0
         else:
             bot_pct = 100.0
         allocations = {"bot": bot_pct, "active_trading": round(100 - bot_pct, 1)}
-        set_capital_allocations(session, allocations)
+        set_capital_allocations(session, user_id, allocations)
         return allocations
 
 
 def get_effective_max_capital_total_bot(user_id: int = DEFAULT_USER_ID) -> float:
     """
     Ersetzt die alte statische MAX_CAPITAL_TOTAL-Grenze in den Guardrails
-    (Aufgabe "Kapital-Einstellungen Prozent-Umbau") – NUR für DEFAULT_USER_ID
-    (Daniel): effective = echtes Gesamtkapital (cash + gebundenes Kapital,
-    siehe get_alpaca_account_snapshot "equity") × Bot-Anteil-Prozent (siehe
-    CapitalAllocation, Kategorie "bot"). Andere verbundene Nutzer haben für
-    dieses Feature aktuell kein eigenes Einstellungen-UI (siehe require_owner
-    in trading_api.py) und behalten deshalb unverändert ihr eigenes
-    UserBotConfig.MAX_CAPITAL_TOTAL als absoluten, weiterhin manuell
-    konfigurierten Wert.
+    (Aufgabe "Kapital-Einstellungen Prozent-Umbau"): effective = echtes
+    Gesamtkapital DIESES Nutzers (cash + gebundenes Kapital, siehe
+    get_alpaca_account_snapshot "equity") × dessen eigener Bot-Anteil-
+    Prozent (siehe CapitalAllocation, Kategorie "bot").
 
-    Broker gerade nicht erreichbar (real_snapshot is None): Fail-safe-
-    Fallback auf den (weiterhin in bot_config gepflegten) MAX_CAPITAL_TOTAL-
-    Wert, statt 0 zurückzugeben – 0 würde jeden Trade blockieren und wäre
+    Bis 2026-08-08 galt diese Prozent-Rechnung NUR für DEFAULT_USER_ID
+    (Daniel) – andere Nutzer hatten kein eigenes Einstellungen-UI (siehe
+    require_owner in trading_api.py) und blieben bei ihrem statischen
+    UserBotConfig.MAX_CAPITAL_TOTAL. Aufgabe "Presets/Kapitalaufteilung/
+    Guardrails pro Nutzer" (regulatorischer Hintergrund: jeder Kunde muss
+    seine eigene Kapitalaufteilung selbst festlegen können) macht diese
+    Rechnung jetzt für JEDEN Nutzer identisch – get_or_seed_capital_
+    allocations() seedet einen neuen Kunden mit bot_pct=100 (siehe dortige
+    Docstring), was ohne weiteres Zutun exakt dem alten Verhalten
+    entspricht ("mein ganzes verbundenes Konto ist Bot-Kapital"). Daniels
+    eigener Wert bleibt unverändert, da get_or_seed_capital_allocations()
+    für ihn weiterhin dieselbe Legacy-Herleitung nutzt und seine
+    bestehenden DB-Zeilen von der Migration unangetastet übernommen wurden.
+
+    Broker gerade nicht erreichbar/nicht verbunden (real_total is None):
+    Fail-safe-Fallback auf den statischen, weiterhin gepflegten
+    MAX_CAPITAL_TOTAL-Wert dieses Nutzers (bot_config für Daniel,
+    UserBotConfig sonst) statt 0 – 0 würde jeden Trade blockieren und wäre
     strenger als der bisherige Fail-safe-Pfad dieser Guardrails.
     """
-    if user_id != DEFAULT_USER_ID:
-        return float(get_user_live_config(user_id).get("MAX_CAPITAL_TOTAL", 100))
-
     real_snapshot = get_alpaca_account_snapshot(user_id)
     real_total = real_snapshot["equity"] if real_snapshot else None
-    allocations = get_or_seed_capital_allocations(real_total)
+    allocations = get_or_seed_capital_allocations(user_id, real_total)
     bot_pct = allocations.get("bot", 100.0)
 
     if real_total is None:
-        return float(get_live_config().get("MAX_CAPITAL_TOTAL", MAX_CAPITAL_TOTAL))
+        fallback_cfg = get_live_config() if user_id == DEFAULT_USER_ID else get_user_live_config(user_id)
+        fallback_default = MAX_CAPITAL_TOTAL if user_id == DEFAULT_USER_ID else 100
+        return float(fallback_cfg.get("MAX_CAPITAL_TOTAL", fallback_default))
     return round(real_total * bot_pct / 100, 2)
 
 
@@ -220,21 +245,14 @@ def get_effective_max_capital_total_bot_costbasis(user_id: int, real_snapshot: d
     dieses Risiko in kleinerem Maß, weil get_effective_max_capital_total_bot
     intern einen eigenen, zweiten get_alpaca_account_snapshot()-Call machte).
 
-    Für DEFAULT_USER_ID: (cash + capital_used_sum) × bot_pct. Für andere
-    Nutzer unverändert ihr eigenes UserBotConfig.MAX_CAPITAL_TOTAL (bereits
-    ein absoluter, nicht von equity/cost-basis abgeleiteter Wert – siehe
-    get_effective_max_capital_total_bot()).
+    Seit 2026-08-08 (Aufgabe "Guardrails pro Nutzer", siehe get_effective_
+    max_capital_total_bot()-Docstring): (cash + capital_used_sum) × dessen
+    eigener bot_pct, für JEDEN Nutzer identisch berechnet – beide Aufrufer
+    (check_guardrails, main.calculate_max_trades_today) rufen diese Funktion
+    ohnehin nur auf, wenn real_snapshot bereits bekannt ist (Broker
+    verbunden), ein None-Fallback ist hier also nie nötig.
     """
-    if user_id != DEFAULT_USER_ID:
-        return float(get_user_live_config(user_id).get("MAX_CAPITAL_TOTAL", 100))
-
-    # Seeding der Bot-Anteil-Prozent-Aufteilung (get_or_seed_capital_
-    # allocations) braucht weiterhin eine möglichst gute Schätzung des
-    # ECHTEN Gesamtkapitals (nur beim allerersten Aufruf relevant, danach
-    # No-Op) – equity bleibt dafür die richtige Bemessungsgrundlage,
-    # unabhängig davon, dass die GUARD-Verwendung unten auf Cost-Basis
-    # umgestellt ist.
-    allocations = get_or_seed_capital_allocations(real_snapshot["equity"])
+    allocations = get_or_seed_capital_allocations(user_id, real_snapshot["equity"])
     bot_pct = allocations.get("bot", 100.0)
     real_capital_costbasis = real_snapshot["cash"] + capital_used_sum
     return round(real_capital_costbasis * bot_pct / 100, 2)
@@ -1326,11 +1344,22 @@ def monitor_open_positions(user_id: int = DEFAULT_USER_ID):
     Prüft alle offenen Positionen EINES Nutzers gegen aktuelle Preise (Multi-
     Tenant, 2026-07-30 – main.run_monitoring_cycle ruft dies einmal je
     verbundenem Nutzer auf; user_id=DEFAULT_USER_ID hält den bisherigen
-    Single-User-Aufrufer unverändert). SL/TP/Trailing/Time-Exit-Parameter
-    (MAX_HOLDING_DAYS, ATR-Multiplikatoren etc.) bleiben bewusst GLOBAL aus
-    get_live_config() für alle Nutzer gleich (siehe UserBotConfig-Docstring
-    in database.py) – nur WELCHE Positionen/welcher Broker-Client betroffen
-    sind, ist pro Nutzer getrennt.
+    Single-User-Aufrufer unverändert).
+
+    BUGFIX 2026-08-08 (Aufgabe "Guardrails pro Nutzer"): SL/TP-Management-
+    Parameter (MAX_HOLDING_DAYS/-_TRAILING_MULTIPLIER/TIME_EXIT_GRACE_DAYS,
+    ATR_MULTIPLIER_SL/ATR_MIN_SL_PCT/ATR_MAX_SL_PCT, TRAILING_ACTIVATION_PCT)
+    lasen bisher IMMER get_live_config() (Daniels globale bot_config), obwohl
+    user_id hier längst als Parameter vorliegt und diese Funktion ohnehin nur
+    die eigenen, bereits offenen Positionen GENAU DIESES Nutzers anfasst –
+    jeder Kunde bekam sein Time-Exit-/Trailing-Verhalten also nach Daniels
+    Werten statt nach seinen eigenen (siehe DEFAULT_USER_CONFIG in
+    database.py). get_user_live_config(user_id) liefert für DEFAULT_USER_ID
+    unverändert dieselbe globale bot_config wie vorher (kein Verhaltens-
+    unterschied für Daniel). Der Entry-seitige SL/TP-Preis (rule_engine.
+    analyze_ticker, EINMAL pro Ticker pro Scan für alle Nutzer berechnet)
+    bleibt bewusst unverändert global – nur wie eine bereits offene Position
+    danach verwaltet wird, ist jetzt pro Nutzer konfigurierbar.
     - Time-based Exit: Ohne aktiven Trailing-SL wird die Position nach
       MAX_HOLDING_DAYS Handelstagen geschlossen (CLOSED_TIME_EXIT) – AUSSER
       (Schutzfrist-Feature, 2026-07-31) sie steht zu diesem Zeitpunkt im Plus:
@@ -1373,7 +1402,7 @@ def monitor_open_positions(user_id: int = DEFAULT_USER_ID):
     from post_exit_tracking import start_tracking_if_applicable
     from trading_shared.atr import clamped_trailing_distance
 
-    config = get_live_config()
+    config = get_user_live_config(user_id)
     max_days = int(config.get("MAX_HOLDING_DAYS", 5))
     max_days_trailing_multiplier = int(config.get("MAX_HOLDING_DAYS_TRAILING_MULTIPLIER", 2))
     grace_days = int(config.get("TIME_EXIT_GRACE_DAYS", 3))

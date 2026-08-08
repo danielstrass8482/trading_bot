@@ -717,9 +717,14 @@ def run_entry_cycle(slot: EntryTimeSlot):
                 # an den offenen Positionen DIESES Nutzers begrenzen bzw. gezielt
                 # auffüllen (siehe Feature Portfolio-Segmentierung). Frisch pro
                 # Kandidat berechnet, damit bereits in diesem Zyklus ausgeführte
-                # Trades berücksichtigt sind. VOLATILE_SEGMENT_PCT bleibt bewusst
-                # global (nicht Teil der Pro-Nutzer-Guardrails in AUFGABE 1).
-                seg_config = get_live_config()
+                # Trades berücksichtigt sind.
+                # BUGFIX 2026-08-08 (Aufgabe "Guardrails pro Nutzer"): las bisher
+                # IMMER get_live_config() (Daniels globale bot_config), obwohl
+                # user_id hier längst vorliegt und der Rest dieser Schleife
+                # (open_trades_all etc.) ohnehin schon pro Nutzer gefiltert ist –
+                # jeder Kunde bekam sein Segment-Ziel nach Daniels Wert statt
+                # nach seinem eigenen (siehe DEFAULT_USER_CONFIG in database.py).
+                seg_config = get_user_live_config(user_id)
                 volatile_target = float(seg_config.get("VOLATILE_SEGMENT_PCT", 0.33))
 
                 with get_session() as seg_session:

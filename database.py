@@ -404,42 +404,56 @@ DEFAULT_CONFIG = {
 
 class CapitalAllocation(Base):
     """
-    Prozent-Aufteilung von Daniels echtem Gesamtkapital (Aufgabe "Kapital-
-    Einstellungen Prozent-Umbau") – ersetzt die alte statische MAX_CAPITAL_
-    TOTAL-Grenze (bleibt als DB-Wert/Fallback bestehen, siehe get_portfolio_
-    value()/Profit-Alert, wird aber nicht mehr als Guardrail-Obergrenze
-    genutzt). GENERISCH über `category` statt fest benannter Spalten (z.B.
-    "bot"/"active_trading"), damit eine dritte Kategorie später per simplem
-    INSERT dazukommt statt einer Schema-Migration. Summe aller Zeilen muss
-    100 ergeben (von der API validiert, nicht vom Schema erzwungen). Bewusst
-    GLOBAL wie bot_config (nicht user_bot_config) – dieses Feature hat wie
-    bot_config kein Multi-Tenant-UI (siehe require_owner in trading_api.py),
-    andere Nutzer behalten ihr eigenes UserBotConfig.MAX_CAPITAL_TOTAL
-    unverändert als absoluten Wert (siehe broker.get_effective_max_capital_
-    total_bot).
+    Prozent-Aufteilung des echten Gesamtkapitals eines Nutzers (Aufgabe
+    "Kapital-Einstellungen Prozent-Umbau") – ersetzt die alte statische
+    MAX_CAPITAL_TOTAL-Grenze (bleibt als DB-Wert/Fallback bestehen, siehe
+    get_portfolio_value()/Profit-Alert, wird aber nicht mehr als Guardrail-
+    Obergrenze genutzt). GENERISCH über `category` statt fest benannter
+    Spalten (z.B. "bot"/"active_trading"), damit eine dritte Kategorie später
+    per simplem INSERT dazukommt statt einer Schema-Migration. Summe aller
+    Zeilen EINES Nutzers muss 100 ergeben (von der API validiert, nicht vom
+    Schema erzwungen).
+
+    Multi-Tenant-Umbau (Aufgabe "Presets/Kapitalaufteilung/Guardrails pro
+    Nutzer", 2026-08-08): war bis dahin bewusst GLOBAL wie bot_config (siehe
+    Git-History dieser Docstring) – require_owner() in trading_api.py machte
+    das Feature faktisch Daniel-only, andere Nutzer behielten nur ihr
+    UserBotConfig.MAX_CAPITAL_TOTAL als absoluten Wert. Regulatorisch muss
+    aber JEDER Kunde seine eigene Kapitalaufteilung selbst festlegen können
+    (sonst kippt das Produkt Richtung erlaubnispflichtiger Finanzportfolio-
+    verwaltung), daher jetzt user_id Teil des Primärschlüssels (siehe
+    _migrate_capital_allocations_user_id_column – Daniels zwei bestehende
+    Zeilen wandern unverändert auf user_id=DEFAULT_USER_ID). broker.
+    get_effective_max_capital_total_bot() nutzt seither für JEDEN Nutzer
+    dieselbe Prozent-vom-echten-Broker-Kapital-Rechnung, nicht mehr nur für
+    Daniel.
     """
     __tablename__ = "capital_allocations"
 
+    user_id    = Column(Integer, primary_key=True, default=DEFAULT_USER_ID)
     category   = Column(String(30), primary_key=True)
     percentage = Column(Float, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-def get_capital_allocations(session: Session) -> dict:
-    return {r.category: r.percentage for r in session.query(CapitalAllocation).all()}
+def get_capital_allocations(session: Session, user_id: int = DEFAULT_USER_ID) -> dict:
+    return {
+        r.category: r.percentage
+        for r in session.query(CapitalAllocation).filter_by(user_id=user_id).all()
+    }
 
 
-def set_capital_allocations(session: Session, allocations: dict):
-    """Ersetzt ALLE übergebenen Kategorien atomar (Zwei-Segment-Slider
-    liefert immer den kompletten neuen Satz). Summen-Validierung (=100)
-    liegt bewusst beim Aufrufer (trading_api.py), nicht hier – diese
-    Funktion ist ein reiner Persistenz-Helper."""
+def set_capital_allocations(session: Session, user_id: int, allocations: dict):
+    """Ersetzt ALLE übergebenen Kategorien atomar für GENAU diesen Nutzer
+    (Zwei-Segment-Slider liefert immer den kompletten neuen Satz). Summen-
+    Validierung (=100) liegt bewusst beim Aufrufer (trading_api.py), nicht
+    hier – diese Funktion ist ein reiner Persistenz-Helper."""
     for category, pct in allocations.items():
-        row = session.query(CapitalAllocation).filter_by(category=category).first()
+        row = session.query(CapitalAllocation).filter_by(user_id=user_id, category=category).first()
         if row:
             row.percentage = pct
         else:
-            session.add(CapitalAllocation(category=category, percentage=pct))
+            session.add(CapitalAllocation(user_id=user_id, category=category, percentage=pct))
     session.commit()
 
 
@@ -452,12 +466,25 @@ class UserBotConfig(Base):
     schon immer gelesen/geschrieben haben – keine Breaking Change dort). Andere
     Nutzer bekommen ihre Zeilen hier erst lazy angelegt (siehe
     get_user_live_config), sobald sie das erste Mal im Multi-Tenant-Loop
-    auftauchen. Absichtlich NUR die Guardrail-Keys, die pro Nutzer wirklich
-    unterschiedlich sein müssen (Kapital/Positions-/Tageslimits) – SL/TP-
-    Prozentsätze, ATR-Parameter, Time-Exit-Schwellen etc. bleiben bewusst
-    GLOBAL (aus get_live_config()) für alle Nutzer gleich, da sie nicht
-    Teil dieses Auftrags waren und der gemeinsame Signal-Scan ohnehin pro
-    Ticker einen einzigen SL/TP-Preis berechnet (nutzerunabhängig).
+    auftauchen.
+
+    Erweitert 2026-08-08 (Aufgabe "Presets/Kapitalaufteilung/Guardrails pro
+    Nutzer", regulatorischer Hintergrund: jeder Kunde muss seine eigenen
+    Handelsparameter selbst festlegen können) um alle Keys, die NUR das
+    Management einer bereits offenen Position ODER die Segment-Ziel-
+    Aufteilung neuer Trades betreffen (Trailing-Aktivierung, Verlustserie-
+    Cooldown, Time-Exit-Fristen, Trailing-Distanz-Klammern) – siehe
+    DEFAULT_USER_CONFIG unten für die vollständige, kommentierte Liste.
+    Bewusst GLOBAL (aus get_live_config()) bleiben dagegen MIN_SIGNAL_SCORE/
+    STOP_LOSS_PCT/TAKE_PROFIT_PCT/ATR_MULTIPLIER_TP/EARNINGS_BUFFER_DAYS/
+    VIX_PAUSE_THRESHOLD, da der gemeinsame Signal-Scan (rule_engine.
+    analyze_ticker) für jeden Ticker EINMAL pro Scan einen einzigen Score/
+    SL/TP-Preis berechnet, bevor überhaupt in die Pro-Nutzer-Schleife
+    verzweigt wird – eine echte Pro-Nutzer-Umstellung bräuchte einen Umbau
+    dieser Scan-Pipeline (separates, größeres Vorhaben, siehe Bericht vom
+    2026-08-08). Ebenfalls bewusst GLOBAL: reine System-/Betreiber-Schalter
+    ohne Kunden-Risikobezug (MONITORING_INTERVAL_MIN, ENTRY_LEARNING_MODE,
+    ACTIVE_BROKER, ALPACA_DRAIN_MODE).
     """
     __tablename__ = "user_bot_config"
 
@@ -467,12 +494,17 @@ class UserBotConfig(Base):
     updated_at   = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-# Konservative Default-Werte für neu verbundene Nutzer, solange es noch kein
-# eigenes Einstellungen-UI für sie gibt (nur der Trading-Bot-Loop selbst ist
-# Teil dieses Auftrags) – bewusst kleiner als Daniels DEFAULT_CONFIG-Werte
-# oben, damit ein frisch verbundener Account nicht versehentlich mit einem für
-# ihn viel zu hohen Kapital-Limit loslegt. AUFGABE 4 (echtes Broker-Kapital als
-# harte Obergrenze) fängt eine grobe Fehlkonfiguration zusätzlich ab.
+# Default-Werte für neu verbundene Nutzer, solange sie den jeweiligen Key noch
+# nie selbst gesetzt haben. Kapital-/Positions-/Tages-Limits (erste 5 Keys)
+# bewusst kleiner als Daniels DEFAULT_CONFIG-Werte oben, damit ein frisch
+# verbundener Account nicht versehentlich mit einem für ihn viel zu hohen
+# Kapital-Limit loslegt (AUFGABE 4, echtes Broker-Kapital als harte
+# Obergrenze, fängt eine grobe Fehlkonfiguration zusätzlich ab). Die übrigen,
+# 2026-08-08 ergänzten Risiko-FORM-Parameter (Trailing/Cooldown/Time-Exit/
+# ATR-Klammern/Segment-Ziel, siehe UserBotConfig-Docstring "Klasse A") haben
+# dagegen keine so offensichtliche "konservativere" Richtung wie ein reiner
+# Kapitalbetrag – spiegeln deshalb Daniels eigene, produktiv gelaufene
+# DEFAULT_CONFIG-Werte als sinnvollen, bereits bewährten Startpunkt.
 # Format wie config._LIVE_CONFIG_SPEC: key -> (cast, default_value) – expliziter
 # Typ statt String-Heuristik beim Rücklesen in get_user_live_config().
 DEFAULT_USER_CONFIG: dict = {
@@ -486,6 +518,69 @@ DEFAULT_USER_CONFIG: dict = {
     # unverändert im heutigen Sofort-Ausführungs-Verhalten.
     "EXECUTION_MODE":        (str,   "auto"),
     "PRICE_TOLERANCE_PCT":   (float, 0.02),
+    # Ab hier: Aufgabe "Presets/Kapitalaufteilung/Guardrails pro Nutzer"
+    # (2026-08-08) – vorher NUR in der globalen bot_config, siehe DEFAULT_
+    # CONFIG oben. Alle fünf betreffen ausschließlich das Management einer
+    # bereits offenen Position (Trailing-Aktivierung, Verlustserie-Cooldown,
+    # Time-Exit-Frist, Trailing-Distanz-Klammern) bzw. die Segment-Ziel-
+    # Aufteilung neuer Trades – strukturell unabhängig vom gemeinsamen
+    # Signal-Scan, siehe broker.monitor_open_positions()/database.
+    # _record_loss_streak_result()/main.run_entry_cycle() (jetzt
+    # get_user_live_config(user_id) statt get_live_config() an diesen
+    # Stellen). MIN_SIGNAL_SCORE/STOP_LOSS_PCT/TAKE_PROFIT_PCT/ATR_MULTIPLIER_
+    # TP/EARNINGS_BUFFER_DAYS/VIX_PAUSE_THRESHOLD bleiben bewusst GLOBAL
+    # (weiterhin nur in bot_config) – die entscheiden im gemeinsamen,
+    # EINMAL pro Ticker pro Scan laufenden Signal-Scan, BEVOR überhaupt in
+    # die Pro-Nutzer-Schleife verzweigt wird (rule_engine.analyze_ticker);
+    # eine echte Pro-Nutzer-Umstellung bräuchte einen Umbau dieser
+    # Scan-Pipeline (separates, größeres Vorhaben).
+    "TRAILING_ACTIVATION_PCT":              (float, 0.06),
+    "MAX_CONSECUTIVE_LOSSES":               (int,   3),
+    "COOLDOWN_HOURS_AFTER_LOSS_STREAK":     (float, 4.0),
+    "MAX_HOLDING_DAYS":                     (int,   5),
+    "MAX_HOLDING_DAYS_TRAILING_MULTIPLIER": (int,   2),
+    # TIME_EXIT_GRACE_DAYS lag bisher NUR in config._LIVE_CONFIG_SPEC (Fallback-
+    # Konstante 3, siehe dort) statt in database.DEFAULT_CONFIG – nie ein
+    # eigener bot_config-Key gewesen, get_live_config() liefert ihn trotzdem
+    # korrekt (Fallback ohne DB-Zeile). broker.monitor_open_positions() liest
+    # ihn genau wie MAX_HOLDING_DAYS im per-Nutzer-Kontext (Zeile "grace_days").
+    "TIME_EXIT_GRACE_DAYS":                 (int,   3),
+    "VOLATILE_SEGMENT_PCT":                 (float, 0.33),
+    "ATR_MULTIPLIER_SL":                    (float, 1.5),
+    "ATR_MIN_SL_PCT":                       (float, 0.01),
+    "ATR_MAX_SL_PCT":                       (float, 0.08),
+}
+
+
+# Sinnvolle Min/Max-Grenzen für Kunden-Selbstverwaltung (Aufgabe Punkt 4,
+# 2026-08-08) – verhindert, dass ein Kunde einen Guardrail auf einen Wert
+# setzt, der ihn faktisch abschaltet (z.B. DAILY_LOSS_LIMIT_PCT=1.0 = 100%)
+# oder technisch unsinnig ist (negative/Null-Limits). NUR für den Nicht-
+# Owner-Selbstbedienungs-Pfad angewendet (siehe trading_api.update_bot_config)
+# – Daniel behält als Owner unverändert volle, ungeprüfte Kontrolle über die
+# globale bot_config, wie schon vor dieser Aufgabe. (min, max) inklusive.
+USER_CONFIG_BOUNDS: dict = {
+    "MAX_CAPITAL_TOTAL":                    (1.0,    1_000_000.0),
+    "MAX_CAPITAL_PER_TRADE":                (1.0,    1_000_000.0),
+    "MAX_OPEN_POSITIONS":                   (1,      50),
+    "MAX_TRADES_PER_DAY":                   (1,      50),
+    "DAILY_LOSS_LIMIT_PCT":                 (0.01,   0.9),
+    "PRICE_TOLERANCE_PCT":                  (0.0,    0.2),
+    "TRAILING_ACTIVATION_PCT":              (0.005,  0.5),
+    "MAX_CONSECUTIVE_LOSSES":               (1,      20),
+    "COOLDOWN_HOURS_AFTER_LOSS_STREAK":     (0.1,    168.0),
+    "MAX_HOLDING_DAYS":                     (1,      60),
+    "MAX_HOLDING_DAYS_TRAILING_MULTIPLIER": (1,      10),
+    "TIME_EXIT_GRACE_DAYS":                 (0,      30),
+    "VOLATILE_SEGMENT_PCT":                 (0.0,    1.0),
+    "ATR_MULTIPLIER_SL":                    (0.1,    10.0),
+    "ATR_MIN_SL_PCT":                       (0.001,  0.5),
+    "ATR_MAX_SL_PCT":                       (0.001,  0.5),
+}
+# EXECUTION_MODE ist kein numerischer Wert (siehe DEFAULT_USER_CONFIG-Cast
+# str) – eigene Enum-Prüfung statt (min, max) in trading_api.update_bot_config.
+USER_CONFIG_ENUM_BOUNDS: dict = {
+    "EXECUTION_MODE": {"auto", "confirm"},
 }
 
 
@@ -808,6 +903,7 @@ def init_db():
     _migrate_trades_status_column_width()
     _migrate_daily_log_user_id_column()
     _migrate_current_weights_broker_column()
+    _migrate_capital_allocations_user_id_column()
     _seed_saxo_token_from_env()
     # Initiale Bot-State-Werte setzen falls nicht vorhanden
     with get_session() as session:
@@ -1111,6 +1207,40 @@ def _migrate_current_weights_broker_column():
         conn.execute(text("ALTER TABLE weight_history ALTER COLUMN broker SET NOT NULL"))
 
 
+def _migrate_capital_allocations_user_id_column():
+    """
+    capital_allocations hatte bisher keine user_id-Spalte (category war
+    GLOBALER Primary Key, siehe CapitalAllocation-Docstring) – Multi-Tenant-
+    Umbau der Kapitalaufteilung (Aufgabe "Presets/Kapitalaufteilung/
+    Guardrails pro Nutzer", 2026-08-08) braucht stattdessen eine Zeile PRO
+    NUTZER PRO KATEGORIE.
+
+    Additive, non-destruktive Migration: Spalte ergänzen, bestehende Zeilen
+    (ausschließlich Daniels eigene bot/active_trading-Aufteilung bisher) auf
+    DEFAULT_USER_ID zurückschreiben – Daniels aktuell laufende Prozent-Werte
+    bleiben dabei unverändert, nur der Primärschlüssel wird zusammengesetzt.
+    Analog zu _migrate_daily_log_user_id_column/_migrate_current_weights_
+    broker_column (DO-Block mit pg_constraint-Existenzcheck, da Postgres
+    kein `ADD CONSTRAINT IF NOT EXISTS` kennt).
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE capital_allocations ADD COLUMN IF NOT EXISTS user_id INTEGER"))
+        conn.execute(text("UPDATE capital_allocations SET user_id = :uid WHERE user_id IS NULL"), {"uid": DEFAULT_USER_ID})
+        conn.execute(text("ALTER TABLE capital_allocations ALTER COLUMN user_id SET NOT NULL"))
+        conn.execute(text("ALTER TABLE capital_allocations DROP CONSTRAINT IF EXISTS capital_allocations_pkey"))
+        conn.execute(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'pk_capital_allocations_user_category'
+                ) THEN
+                    ALTER TABLE capital_allocations ADD CONSTRAINT pk_capital_allocations_user_category PRIMARY KEY (user_id, category);
+                END IF;
+            END $$;
+        """))
+
+
 def _migrate_trades_entry_price_nullable():
     """
     entry_price war bisher NOT NULL – Fix 2026-07-31 (Kauf-Fill-Pendant zu
@@ -1275,9 +1405,18 @@ def _record_loss_streak_result(session: Session, user_id: int, pnl_usd: float) -
     get_loss_streak_state für die automatische Freigabe nach Ablauf.
     Committet NICHT selbst (wie close_trade() – der jeweilige Aufrufer in
     broker.py committet die gesamte Session).
+
+    BUGFIX 2026-08-08 (Aufgabe "Guardrails pro Nutzer"): las bisher IMMER
+    get_live_config() (Daniels globale bot_config), obwohl user_id hier
+    längst als Parameter vorliegt und der Zähler/Cooldown selbst schon immer
+    pro Nutzer geführt wird (_loss_streak_count_key(user_id) unten) – jeder
+    Kunde wurde bei Erreichen SEINER EIGENEN Verlustserie trotzdem nach
+    Daniels Schwellenwerten pausiert statt nach seinen eigenen (siehe
+    DEFAULT_USER_CONFIG). get_user_live_config(user_id) liefert für
+    DEFAULT_USER_ID unverändert dieselbe globale bot_config wie vorher
+    (kein Verhaltensunterschied für Daniel).
     """
-    from config import get_live_config  # lazy: Zirkelimport-Vermeidung, siehe get_user_live_config
-    cfg = get_live_config()
+    cfg = get_user_live_config(user_id)
     count_key = _loss_streak_count_key(user_id)
     cooldown_key = _loss_streak_cooldown_key(user_id)
 
@@ -1711,12 +1850,17 @@ def get_user_live_config(user_id: int) -> dict:
     Wahrheit für den bereits existierenden Nutzer/UI).
 
     Andere Nutzer lesen aus user_bot_config; fehlende Keys werden lazy mit
-    DEFAULT_USER_CONFIG geseedet (persistiert beim ersten Aufruf, damit ein
-    künftiges Pro-Nutzer-Einstellungen-UI dieselben Zeilen vorfindet/ändern
-    kann – nicht Teil dieses Auftrags, nur die Backend-Grundlage dafür).
-    Nicht-Guardrail-Keys (SL/TP, ATR-Parameter, Time-Exit etc.) werden IMMER
-    aus der globalen config.get_live_config() ergänzt (siehe UserBotConfig-
-    Docstring) – das zurückgegebene dict ist also immer vollständig nutzbar.
+    DEFAULT_USER_CONFIG geseedet (persistiert beim ersten Aufruf, damit
+    /api/bot-config & Einstellungen.tsx dieselben Zeilen vorfinden/ändern
+    können, siehe trading_api.get_bot_config_all/update_bot_config).
+    Alle anderen bot_config-Keys (der gemeinsame, EINMAL pro Ticker pro Scan
+    laufende Signal-Scan – MIN_SIGNAL_SCORE, STOP_LOSS_PCT/TAKE_PROFIT_PCT,
+    ATR_MULTIPLIER_TP, EARNINGS_BUFFER_DAYS, VIX_PAUSE_THRESHOLD, sowie reine
+    System-/Betreiber-Schalter wie MONITORING_INTERVAL_MIN/ACTIVE_BROKER)
+    werden IMMER aus der globalen config.get_live_config() ergänzt (siehe
+    UserBotConfig-Docstring) – das zurückgegebene dict ist also immer
+    vollständig nutzbar, auch für Keys, die (noch) nicht Teil von
+    DEFAULT_USER_CONFIG sind.
     """
     from config import get_live_config
 
