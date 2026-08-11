@@ -437,6 +437,19 @@ _LIVE_CONFIG_SPEC = {
     "EARNINGS_BUFFER_DAYS":    (int,   EARNINGS_BUFFER_DAYS),
     "ACTIVE_BROKER":           (str,   "alpaca"),  # "alpaca" oder "ibkr" (siehe broker.get_broker)
     "ALPACA_DRAIN_MODE":       (str,   "false"),   # "true" = keine neuen Alpaca-Käufe, nur bestehende Positionen managen
+    # Bugfix (2026-08-11, Zwei-Nutzer-Test): fehlte hier bisher komplett,
+    # obwohl backlook.py den Wert korrekt direkt per get_bot_config() liest
+    # (unbetroffen von dieser Lücke, siehe dortige Zeile 354) – GET
+    # /api/settings/entry-learning-mode in trading_api.py liest ihn aber über
+    # get_live_config(), das NUR Keys aus diesem Dict zurückgibt. Ohne
+    # diesen Eintrag fiel config.get("ENTRY_LEARNING_MODE", "false") in der
+    # API IMMER auf den literalen "false"-Fallback zurück, egal was
+    # tatsächlich in der DB stand (live verifiziert: DB stand auf "true",
+    # der Endpoint lieferte trotzdem {"lernmodus": false}) – die Lernmodus-
+    # Checkbox im Frontend konnte den echten Zustand dadurch nie korrekt
+    # anzeigen, unabhängig vom PUT-Pfad (der schrieb korrekt, siehe
+    # set_bot_config in update_entry_learning_mode).
+    "ENTRY_LEARNING_MODE":     (str,   "false"),
     # Confirm-Tier (Chunk 1, 2026-08-07; main.run_entry_cycle liest den Wert
     # tatsächlich seit Chunk 2a, 2026-08-11, siehe confirm_execution.py).
     # Dieser Fallback greift AUSSCHLIESSLICH für Daniel/DEFAULT_USER_ID (die

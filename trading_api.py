@@ -965,6 +965,32 @@ def update_capital_allocations(body: dict, user_id: int = Depends(get_current_us
     return {"ok": True}
 
 
+
+# Bugfix (2026-08-11, Zwei-Nutzer-Test): jedes Preset ließ bisher 3 Klasse-A-
+# Guardrails unangetastet, obwohl sie einzeln manuell editierbar sind
+# (MAX_CONSECUTIVE_LOSSES/COOLDOWN_HOURS_AFTER_LOSS_STREAK/TIME_EXIT_
+# GRACE_DAYS) - ein Klick auf "Konservativ"/"Aggressiv" änderte diese Werte
+# unsichtbar nicht mit, obwohl die restlichen 5 Felder pro Preset korrekt
+# angepasst wurden. MAX_HOLDING_DAYS war davon NICHT betroffen (war bereits
+# vollständig, siehe unten) - trotzdem als "auch kaputt" gemeldet, vermutlich
+# in Verwechslung mit der thematisch verwandten Schutzfrist (TIME_EXIT_
+# GRACE_DAYS), die tatsächlich fehlte.
+#
+# Werte für die 3 neu ergänzten Felder (Begründung, da nicht aus einer
+# vorhandenen Spezifikation ableitbar): dieselbe Risiko-Richtung wie die
+# bereits vorhandenen 5 Felder desselben Presets - "ausgewogen" übernimmt
+# exakt die globalen Systemdefaults (DEFAULT_USER_CONFIG in database.py: 3 /
+# 4.0 / 3), "konservativ"/"aggressiv" skalieren von dort aus konsistent mit
+# der Spreizung der bereits vorhandenen Felder (z.B. MAX_OPEN_POSITIONS
+# 3/5/8, ATR_MULTIPLIER_SL 1.0/1.5/2.0):
+#   - MAX_CONSECUTIVE_LOSSES (Verlustserie-Cooldown-Trigger, kleiner = löst
+#     schneller aus = vorsichtiger): 2 / 3 / 5.
+#   - COOLDOWN_HOURS_AFTER_LOSS_STREAK (Pausendauer danach, länger =
+#     vorsichtiger): 8.0 / 4.0 / 2.0.
+#   - TIME_EXIT_GRACE_DAYS (Schutzfrist für Gewinner ohne Trailing, kürzer =
+#     sichert Gewinn schneller = vorsichtiger, konsistent mit dem jeweils
+#     eigenen MAX_HOLDING_DAYS 3/5/7 desselben Presets): 2 / 3 / 5.
+# Alle Werte liegen innerhalb USER_CONFIG_BOUNDS (database.py).
 BOT_CONFIG_PRESETS = {
     "konservativ": {
         "MAX_CAPITAL_PER_TRADE": "30",
@@ -973,6 +999,9 @@ BOT_CONFIG_PRESETS = {
         "ATR_MULTIPLIER_TP": "2.0",
         "MAX_HOLDING_DAYS": "3",
         "VOLATILE_SEGMENT_PCT": "0.0",
+        "MAX_CONSECUTIVE_LOSSES": "2",
+        "COOLDOWN_HOURS_AFTER_LOSS_STREAK": "8.0",
+        "TIME_EXIT_GRACE_DAYS": "2",
     },
     "ausgewogen": {
         "MAX_CAPITAL_PER_TRADE": "50",
@@ -981,6 +1010,9 @@ BOT_CONFIG_PRESETS = {
         "ATR_MULTIPLIER_TP": "3.0",
         "MAX_HOLDING_DAYS": "5",
         "VOLATILE_SEGMENT_PCT": "0.33",
+        "MAX_CONSECUTIVE_LOSSES": "3",
+        "COOLDOWN_HOURS_AFTER_LOSS_STREAK": "4.0",
+        "TIME_EXIT_GRACE_DAYS": "3",
     },
     "aggressiv": {
         "MAX_CAPITAL_PER_TRADE": "100",
@@ -989,6 +1021,9 @@ BOT_CONFIG_PRESETS = {
         "ATR_MULTIPLIER_TP": "4.0",
         "MAX_HOLDING_DAYS": "7",
         "VOLATILE_SEGMENT_PCT": "0.5",
+        "MAX_CONSECUTIVE_LOSSES": "5",
+        "COOLDOWN_HOURS_AFTER_LOSS_STREAK": "2.0",
+        "TIME_EXIT_GRACE_DAYS": "5",
     },
 }
 

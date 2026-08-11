@@ -222,11 +222,27 @@ def test_presets_isolation_and_attack():
     cfg_a = {row["key"]: row["value"] for row in r.json()}
     record("a) Account A: eigenes MAX_CAPITAL_PER_TRADE jetzt 30 (Preset-Wert)", cfg_a.get("MAX_CAPITAL_PER_TRADE") == "30.0",
            f"got={cfg_a.get('MAX_CAPITAL_PER_TRADE')}")
+    # Bugfix (2026-08-11, Zwei-Nutzer-Test): diese 3 Felder fehlten bisher
+    # komplett in BOT_CONFIG_PRESETS - ein Preset-Klick änderte sie unsichtbar
+    # nicht mit, obwohl sie einzeln manuell editierbar sind. Erwartete Werte
+    # siehe BOT_CONFIG_PRESETS-Docstring (trading_api.py) für die Begründung.
+    record("a) Account A: MAX_CONSECUTIVE_LOSSES jetzt 2 (Preset-Wert, vorher nicht Teil des Presets)",
+           cfg_a.get("MAX_CONSECUTIVE_LOSSES") == "2", f"got={cfg_a.get('MAX_CONSECUTIVE_LOSSES')}")
+    record("a) Account A: COOLDOWN_HOURS_AFTER_LOSS_STREAK jetzt 8.0 (Preset-Wert)",
+           cfg_a.get("COOLDOWN_HOURS_AFTER_LOSS_STREAK") == "8.0", f"got={cfg_a.get('COOLDOWN_HOURS_AFTER_LOSS_STREAK')}")
+    record("a) Account A: TIME_EXIT_GRACE_DAYS jetzt 2 (Preset-Wert)",
+           cfg_a.get("TIME_EXIT_GRACE_DAYS") == "2", f"got={cfg_a.get('TIME_EXIT_GRACE_DAYS')}")
 
     r = client.get("/api/bot-config", headers=auth_headers(USER_B))
     cfg_b = {row["key"]: row["value"] for row in r.json()}
     record("b) Account B: unveränderter eigener Default (20.0), kein Preset angewendet",
            cfg_b.get("MAX_CAPITAL_PER_TRADE") == "20.0", f"got={cfg_b.get('MAX_CAPITAL_PER_TRADE')}")
+    record("b) Account B: eigener Default für die 3 neuen Preset-Felder unverändert (3 / 4.0 / 3), unabhängig von A",
+           cfg_b.get("MAX_CONSECUTIVE_LOSSES") == "3" and cfg_b.get("COOLDOWN_HOURS_AFTER_LOSS_STREAK") == "4.0"
+           and cfg_b.get("TIME_EXIT_GRACE_DAYS") == "3",
+           f"MAX_CONSECUTIVE_LOSSES={cfg_b.get('MAX_CONSECUTIVE_LOSSES')} "
+           f"COOLDOWN_HOURS_AFTER_LOSS_STREAK={cfg_b.get('COOLDOWN_HOURS_AFTER_LOSS_STREAK')} "
+           f"TIME_EXIT_GRACE_DAYS={cfg_b.get('TIME_EXIT_GRACE_DAYS')}")
 
     # (c) Angriff: B versucht per Body user_id=A ein Preset für A zu triggern.
     r = client.post("/api/bot-config/preset", json={"preset": "aggressiv", "user_id": USER_A}, headers=auth_headers(USER_B))
@@ -239,6 +255,49 @@ def test_presets_isolation_and_attack():
 
     r = client.post("/api/bot-config/preset", json={"preset": "nicht-existent"}, headers=auth_headers(USER_A))
     record("Validierung: unbekanntes Preset -> 400", r.status_code == 400, f"status={r.status_code}")
+
+
+# ─────────────────────────────────────────────
+# Bugfix (2026-08-11, Zwei-Nutzer-Test): Owner-Preset-Pfad + ENTRY_LEARNING_MODE-Rückkopplung
+# ─────────────────────────────────────────────
+def test_owner_preset_all_fields_and_entry_learning_mode_roundtrip():
+    """
+    Zwei getrennte Regressionen aus demselben Bugreport, beide gegen den
+    ECHTEN Owner-Account (DEFAULT_USER_ID) getestet (läuft hier gegen die
+    Wegwerf-Test-DB, NIEMALS Produktion):
+
+    1) Der Owner-Preset-Pfad (user_id == DEFAULT_USER_ID, schreibt direkt in
+       die globale bot_config statt user_bot_config) muss dieselben 3 neu
+       ergänzten Felder wie der Nicht-Owner-Pfad anwenden (siehe
+       BOT_CONFIG_PRESETS-Docstring in trading_api.py).
+    2) GET/PUT /api/settings/entry-learning-mode müssen sich jetzt gegenseitig
+       spiegeln (vorher: GET ignorierte den echten DB-Wert komplett, siehe
+       ENTRY_LEARNING_MODE-Kommentar in config.py._LIVE_CONFIG_SPEC).
+    """
+    r = client.post("/api/bot-config/preset", json={"preset": "aggressiv"}, headers=auth_headers(DEFAULT_USER_ID))
+    record("Owner: POST Preset 'aggressiv' -> 200", r.status_code == 200, f"status={r.status_code} body={r.text}")
+
+    r = client.get("/api/bot-config", headers=auth_headers(DEFAULT_USER_ID))
+    cfg = {row["key"]: row["value"] for row in r.json()}
+    record("Owner: MAX_CONSECUTIVE_LOSSES jetzt 5 (Preset-Wert, direkt in globaler bot_config)",
+           cfg.get("MAX_CONSECUTIVE_LOSSES") == "5", f"got={cfg.get('MAX_CONSECUTIVE_LOSSES')}")
+    record("Owner: COOLDOWN_HOURS_AFTER_LOSS_STREAK jetzt 2.0 (Preset-Wert)",
+           cfg.get("COOLDOWN_HOURS_AFTER_LOSS_STREAK") == "2.0", f"got={cfg.get('COOLDOWN_HOURS_AFTER_LOSS_STREAK')}")
+    record("Owner: TIME_EXIT_GRACE_DAYS jetzt 5 (Preset-Wert)",
+           cfg.get("TIME_EXIT_GRACE_DAYS") == "5", f"got={cfg.get('TIME_EXIT_GRACE_DAYS')}")
+    record("Owner: MAX_HOLDING_DAYS jetzt 7 (war bereits vorher Teil des Presets, Regressionscheck)",
+           cfg.get("MAX_HOLDING_DAYS") == "7", f"got={cfg.get('MAX_HOLDING_DAYS')}")
+
+    r = client.put("/api/settings/entry-learning-mode", json={"lernmodus": True}, headers=auth_headers(DEFAULT_USER_ID))
+    record("Lernmodus: PUT true -> 200", r.status_code == 200, f"status={r.status_code}")
+    r = client.get("/api/settings/entry-learning-mode", headers=auth_headers(DEFAULT_USER_ID))
+    record("Lernmodus: GET spiegelt true (vorher: IMMER false unabhängig vom echten DB-Wert)",
+           r.status_code == 200 and r.json().get("lernmodus") is True, f"status={r.status_code} body={r.text}")
+
+    r = client.put("/api/settings/entry-learning-mode", json={"lernmodus": False}, headers=auth_headers(DEFAULT_USER_ID))
+    r = client.get("/api/settings/entry-learning-mode", headers=auth_headers(DEFAULT_USER_ID))
+    record("Lernmodus: GET spiegelt false nach erneutem Umschalten (Round-Trip in beide Richtungen)",
+           r.status_code == 200 and r.json().get("lernmodus") is False, f"status={r.status_code} body={r.text}")
 
 
 # ─────────────────────────────────────────────
@@ -334,7 +393,8 @@ def test_unauthenticated_rejected():
 
 def main():
     for fn in (test_guardrails_isolation_and_attack, test_capital_allocations_isolation_and_attack,
-               test_presets_isolation_and_attack, test_scan_log_isolation, test_unauthenticated_rejected):
+               test_presets_isolation_and_attack, test_owner_preset_all_fields_and_entry_learning_mode_roundtrip,
+               test_scan_log_isolation, test_unauthenticated_rejected):
         print(f"\n--- {fn.__name__} ---")
         try:
             fn()
