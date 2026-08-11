@@ -681,16 +681,21 @@ def get_benchmark(days: int = 30, user_id: int = Depends(get_current_user_id)):
 
 
 @protected.get("/api/scan-log")
-def get_scan_log(limit: int = 500, ticker: Optional[str] = None):
+def get_scan_log(limit: int = 500, ticker: Optional[str] = None, user_id: int = Depends(get_current_user_id)):
     """
-    Bewusst NICHT auf user_id gescopt (Security-Review 2026-07-31): der
-    Signal-Scan läuft zentral EINMAL pro Ticker/Slot für die gesamte
-    Watchlist – scan_log enthält keine Kapital-/Positions-/Kontodaten
-    irgendeines Nutzers, nur öffentlich am Markt beobachtbare Indikatoren
-    (RSI/SMA/Volumen/Score) plus ob der GLOBALE Bot bei diesem Scan gekauft
-    hat. Für jeden Nutzer identisch und nicht sensibel – im Unterschied zu
-    /api/overview, /api/trades/history etc. war das nie Teil der Sicherheits-
-    lücke, daher hier absichtlich keine Änderung.
+    Datenleck-Fix (2026-08-11, Korrektur der früheren Security-Review vom
+    2026-07-31): der frühere Review-Befund "scan_log enthält keine Kapital-/
+    Positions-/Kontodaten irgendeines Nutzers" war UNVOLLSTÄNDIG – ticker/
+    score/rsi_score/etc. stimmt (ein zentraler Markt-Scan, für alle Nutzer
+    identisch), aber guardrail_reason/trade_executed/trade_id sind sehr wohl
+    Konto-spezifisch (spiegeln eigenes Kapital/offene Positionen/Cooldown
+    wider, siehe run_entry_cycle). Ein Test-User ohne jede Beziehung zu
+    Daniels Account konnte über diesen ungescopten Endpoint dessen
+    Guardrail-Gründe sehen (z.B. "Max. offene Position erreicht 5/5"). Seit
+    _migrate_scan_log_user_id_column (database.py) schreibt main.py pro
+    verbundenem Nutzer eine eigene scan_log-Zeile (Marktdaten-Spalten bewusst
+    dupliziert statt normalisiert) – hier entsprechend auf den anfragenden
+    Nutzer gefiltert, analog zu get_trade_history.
     """
     query = """
         SELECT
@@ -703,10 +708,11 @@ def get_scan_log(limit: int = 500, ticker: Optional[str] = None):
             ko_reason, guardrail_reason,
             trade_executed, mode, market_regime, broker
         FROM scan_log
+        WHERE user_id = :user_id
     """
-    params = {"limit": min(limit, 5000)}
+    params = {"limit": min(limit, 5000), "user_id": user_id}
     if ticker:
-        query += " WHERE ticker = :ticker"
+        query += " AND ticker = :ticker"
         params["ticker"] = ticker.upper()
     query += " ORDER BY scan_time DESC LIMIT :limit"
 
@@ -745,11 +751,15 @@ def get_scan_log(limit: int = 500, ticker: Optional[str] = None):
 
 
 @protected.get("/api/scan-log/stats")
-def get_scan_log_stats():
-    """Welche Filter haben in den letzten 30 Tagen wie oft geblockt (siehe
-    Filter-Statistik im Scan-Historie-Tab). Bewusst nicht user_id-gescopt,
-    gleicher Grund wie /api/scan-log oben (zentraler, nutzerunabhängiger
-    Signal-Scan – keine Konto-/Positionsdaten)."""
+def get_scan_log_stats(user_id: int = Depends(get_current_user_id)):
+    """
+    Welche Filter haben in den letzten 30 Tagen wie oft geblockt (siehe
+    Filter-Statistik im Scan-Historie-Tab). Datenleck-Fix (2026-08-11, siehe
+    get_scan_log oben): die "Guardrail"-Kategorie zählt guardrail_reason-
+    Treffer und ist damit ebenso Konto-spezifisch wie der Grund-Text selbst
+    (verrät z.B. wie oft DIESES Konto durch Kapital-/Positionslimits blockiert
+    wurde) – jetzt auf den anfragenden Nutzer gescopt statt global.
+    """
     with get_session() as session:
         rows = session.execute(text("""
             SELECT
@@ -763,10 +773,10 @@ def get_scan_log_stats():
                 END as grund,
                 COUNT(*) as anzahl
             FROM scan_log
-            WHERE scan_time >= NOW() - INTERVAL '30 days'
+            WHERE scan_time >= NOW() - INTERVAL '30 days' AND user_id = :user_id
             GROUP BY grund
             ORDER BY anzahl DESC
-        """)).fetchall()
+        """), {"user_id": user_id}).fetchall()
         return [dict(r._mapping) for r in rows]
 
 

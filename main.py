@@ -533,7 +533,8 @@ Trading Bot startet heute um 09:45 ET.
     print("✅ Morning Brief gesendet")
 
 
-def log_scan_results(signals: list, slot_et: str, executed_trades: dict, guardrail_reasons: dict = None):
+def log_scan_results(signals: list, slot_et: str, executed_trades: dict, guardrail_reasons: dict = None,
+                      user_id: int = DEFAULT_USER_ID):
     """
     Loggt jedes Scan-Ergebnis (auch nicht ausgeführte Ticker) in scan_log,
     damit im Dashboard nachvollziehbar ist, warum ein Ticker gehandelt wurde
@@ -541,6 +542,19 @@ def log_scan_results(signals: list, slot_et: str, executed_trades: dict, guardra
     guardrail_reasons: Ticker -> Grund (siehe run_entry_cycle), None falls kein
     Guardrail griff (KO'd oder unter Schwellwert liegende Ticker erreichen die
     Guardrail-Prüfung ohnehin nie).
+
+    Multi-Tenant-Datenleck-Fix (2026-08-11, siehe _migrate_scan_log_user_id_
+    column in database.py): guardrail_reason/trade_executed/trade_id sind
+    PRO NUTZER unterschiedlich (eigenes Kapital, eigene offene Positionen,
+    eigener Cooldown) – executed_trades/guardrail_reasons müssen daher bereits
+    NUR das Ergebnis EINES bestimmten Nutzers enthalten (siehe run_entry_cycle,
+    ruft diese Funktion jetzt einmal PRO verbundenem Nutzer auf, nicht mehr
+    nur einmal mit DEFAULT_USER_IDs Ergebnis). ticker/score/rsi_score/etc.
+    sind zwar für alle Nutzer identisch (ein zentraler Markt-Scan) – werden
+    hier aber bewusst pro Nutzer dupliziert statt normalisiert, damit
+    /api/scan-log mit einem einzigen `WHERE user_id = ...` auskommt statt
+    Markt- und Guardrail-Daten aus getrennten Tabellen zusammenführen zu
+    müssen. Bei der aktuellen Nutzerzahl vernachlässigbarer Mehrverbrauch.
     """
     guardrail_reasons = guardrail_reasons or {}
     scan_time = datetime.utcnow()
@@ -574,6 +588,7 @@ def log_scan_results(signals: list, slot_et: str, executed_trades: dict, guardra
                 fair_value_avg          = signal.fair_value_avg,
                 fair_value_discount_pct = signal.fair_value_discount,
                 broker       = active_broker,
+                user_id      = user_id,
             )
             session.add(log_entry)
         session.commit()
@@ -1007,40 +1022,51 @@ def run_entry_cycle(slot: EntryTimeSlot):
                 "erlaubt": 0, "budget_exhausted": True,
             }
 
-    # Bestehende Variablen für Scan-Log/Dashboard (siehe Schritt 6 unten)
-    # bleiben exakt an DEFAULT_USER_IDs Ergebnis gebunden – keine Änderung an
-    # der (nicht Teil dieses Auftrags) Single-Tenant-Scan-Historie-UI.
-    default_result = results_by_user.get(DEFAULT_USER_ID, {
-        "executed_trades": [], "guardrail_reasons": {}, "trades_in_slot": 0, "erlaubt": erlaubt, "budget_exhausted": budget_exhausted,
-    })
-    executed_trades = default_result["executed_trades"]
-    guardrail_reasons = default_result["guardrail_reasons"]
-    trades_in_slot = default_result["trades_in_slot"]
-
     total_executed = sum(len(r["executed_trades"]) for r in results_by_user.values())
     if len(connected_user_ids) > 1:
         summary = ", ".join(f"Nutzer {uid}: {len(r['executed_trades'])}" for uid, r in results_by_user.items())
         print(f"\n👥 Multi-Tenant-Zusammenfassung dieses Slots – {total_executed} Trade(s) insgesamt ({summary})")
 
-    # Kandidaten, die wegen erreichtem Slot-Kontingent gar nicht mehr geprüft
-    # wurden (Schleife oben per break beendet), bekommen fürs Scan-Log trotzdem
-    # einen nachvollziehbaren Grund statt eines leeren guardrail_reason.
-    # BUDGET_EXHAUSTED (kein Restbudget/keine freie Position laut
-    # calculate_max_trades_today) wird dabei vom normalen Slot-Cap
-    # unterschieden, damit im Dashboard erkennbar bleibt, ob überhaupt kein
-    # Kapital mehr verfügbar war oder nur dieser einzelne Slot voll ist.
-    executed_tickers = {t.ticker for t in executed_trades}
-    for signal in approved:
-        if signal.ticker not in guardrail_reasons and signal.ticker not in executed_tickers:
-            guardrail_reasons[signal.ticker] = (
-                "BUDGET_EXHAUSTED" if budget_exhausted
-                else f"Slot-Cap erreicht ({trades_in_slot}/{erlaubt} für diesen Slot)"
-            )
-
-    # 6. Scan-Ergebnisse loggen (auch nicht ausgeführte Ticker, siehe Feature Scan-Log)
-    executed_trades_by_ticker = {t.ticker: t.id for t in executed_trades}
+    # 6. Scan-Ergebnisse loggen (auch nicht ausgeführte Ticker, siehe Feature
+    # Scan-Log) – EINMAL PRO verbundenem Nutzer (Multi-Tenant-Datenleck-Fix
+    # 2026-08-11, siehe log_scan_results-Docstring): guardrail_reason/
+    # trade_executed/trade_id spiegeln die individuelle Guardrail-Auswertung
+    # jedes einzelnen Nutzers wider, dürfen also nicht mehr wie vorher nur
+    # EINMAL mit ausschließlich DEFAULT_USER_IDs (Daniels) Ergebnis geloggt
+    # werden – das war exakt das Datenleck (ein Test-User ohne jede Beziehung
+    # zu Daniels Konto sah dessen Guardrail-Gründe über den zentralen, damals
+    # ungescopten /api/scan-log-Endpoint).
     slot_label = f"{slot.stunde_et:02d}:{slot.minute_et:02d}"
-    log_scan_results(signals, slot_label, executed_trades_by_ticker, guardrail_reasons)
+    for uid in connected_user_ids:
+        result = results_by_user.get(uid, {
+            "executed_trades": [], "guardrail_reasons": {}, "trades_in_slot": 0,
+            "erlaubt": erlaubt if uid == DEFAULT_USER_ID else 0,
+            "budget_exhausted": budget_exhausted if uid == DEFAULT_USER_ID else True,
+        })
+        user_executed_trades = result["executed_trades"]
+        user_guardrail_reasons = result["guardrail_reasons"]
+        user_trades_in_slot = result["trades_in_slot"]
+        user_erlaubt = result["erlaubt"]
+        user_budget_exhausted = result["budget_exhausted"]
+
+        # Kandidaten, die wegen erreichtem Slot-Kontingent DIESES Nutzers gar
+        # nicht mehr geprüft wurden (Schleife oben per break beendet),
+        # bekommen fürs Scan-Log trotzdem einen nachvollziehbaren Grund statt
+        # eines leeren guardrail_reason. BUDGET_EXHAUSTED (kein Restbudget/
+        # keine freie Position laut calculate_max_trades_today) wird dabei
+        # vom normalen Slot-Cap unterschieden, damit im Dashboard erkennbar
+        # bleibt, ob überhaupt kein Kapital mehr verfügbar war oder nur
+        # dieser einzelne Slot voll ist.
+        user_executed_tickers = {t.ticker for t in user_executed_trades}
+        for signal in approved:
+            if signal.ticker not in user_guardrail_reasons and signal.ticker not in user_executed_tickers:
+                user_guardrail_reasons[signal.ticker] = (
+                    "BUDGET_EXHAUSTED" if user_budget_exhausted
+                    else f"Slot-Cap erreicht ({user_trades_in_slot}/{user_erlaubt} für diesen Slot)"
+                )
+
+        user_executed_trades_by_ticker = {t.ticker: t.id for t in user_executed_trades}
+        log_scan_results(signals, slot_label, user_executed_trades_by_ticker, user_guardrail_reasons, user_id=uid)
 
     # 7. Tages-Snapshot speichern – EIN Snapshot PRO verbundenem Nutzer (Fix
     # 2026-08-04, Multi-Tenant-Performance/-Benchmark, siehe database.DailyLog/
@@ -1067,7 +1093,7 @@ def run_entry_cycle(slot: EntryTimeSlot):
         session.commit()
 
     print(f"\n{'='*60}")
-    print(f"✅ Entry-Zyklus abgeschlossen. Trades in diesem Slot: {len(executed_trades)}")
+    print(f"✅ Entry-Zyklus abgeschlossen. Trades in diesem Slot: {total_executed}")
     print(f"{'='*60}\n")
     # Graceful Shutdown: @cycle_guard (siehe Funktionsdefinition) beendet den
     # Prozess hier automatisch sauber, falls währenddessen ein SIGTERM einging.

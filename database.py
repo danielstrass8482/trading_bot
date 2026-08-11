@@ -792,6 +792,18 @@ class ScanLog(Base):
     # ACTIVE_BROKER zwischen Scan und tatsächlicher Order geändert hat.
     broker          = Column(String(20), default="alpaca")
 
+    # Multi-Tenant-Datenleck-Fix (2026-08-11, siehe _migrate_scan_log_user_id_column):
+    # ticker/score/rsi_score/etc. sind zwar für alle Nutzer identisch (EIN
+    # zentraler Markt-Scan, siehe run_entry_cycle-Docstring), aber
+    # guardrail_reason/trade_executed/trade_id sind es NICHT – sie spiegeln
+    # die individuelle Guardrail-Auswertung (eigenes Kapital, eigene offene
+    # Positionen, eigener Cooldown) EINES bestimmten Nutzers wider. main.py
+    # schreibt seit diesem Fix pro verbundenem Nutzer eine eigene Zeile
+    # (bewusste Duplizierung der Marktdaten-Spalten statt Normalisierung,
+    # siehe log_scan_results-Docstring) statt wie vorher nur EINE globale
+    # Zeile mit ausschließlich DEFAULT_USER_IDs (Daniels) Ergebnis.
+    user_id         = Column(Integer, nullable=True)
+
 
 class FairValueCache(Base):
     """
@@ -955,6 +967,7 @@ def init_db():
     _migrate_trades_state_machine_columns()
     _migrate_scan_log_regime_column()
     _migrate_scan_log_fair_value_columns()
+    _migrate_scan_log_user_id_column()
     _migrate_trades_sector_column()
     _migrate_trades_user_id_column()
     _migrate_pending_order_attempts_user_id_column()
@@ -1132,6 +1145,31 @@ def _migrate_scan_log_fair_value_columns():
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE scan_log ADD COLUMN IF NOT EXISTS fair_value_avg FLOAT"))
         conn.execute(text("ALTER TABLE scan_log ADD COLUMN IF NOT EXISTS fair_value_discount_pct FLOAT"))
+
+
+def _migrate_scan_log_user_id_column():
+    """
+    Multi-Tenant-Datenleck-Fix (2026-08-11): scan_log hatte bisher KEINE
+    user_id-Spalte – guardrail_reason/trade_executed/trade_id wurden pro
+    Scan-Zyklus nur EINMAL geloggt, ausschließlich mit DEFAULT_USER_IDs
+    (Daniels) eigenem Guardrail-Ergebnis (siehe run_entry_cycle), obwohl der
+    zentrale, ungescopte /api/scan-log-Endpoint dieses Ergebnis JEDEM
+    eingeloggten Nutzer zeigte – ein Test-User ohne jede Kapital-/Positions-
+    Beziehung zu Daniels Account sah so dessen Guardrail-Auswertungen (z.B.
+    "Max. offene Position erreicht 5/5"). Fix: main.py schreibt jetzt pro
+    verbundenem Nutzer eine eigene Zeile, /api/scan-log filtert auf den
+    jeweils anfragenden Nutzer (siehe trading_api.py).
+
+    Additive, non-destruktive Migration: Spalte ergänzen, bestehende Zeilen
+    (ausnahmslos vor diesem Feature aus Daniels globalem Scan-Log) auf
+    DEFAULT_USER_ID zurückschreiben – kein Datenverlust, analog zu
+    _migrate_trades_user_id_column.
+    """
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE scan_log ADD COLUMN IF NOT EXISTS user_id INTEGER"))
+        conn.execute(text(
+            "UPDATE scan_log SET user_id = :default_user_id WHERE user_id IS NULL"
+        ), {"default_user_id": DEFAULT_USER_ID})
 
 
 def _migrate_trades_sector_column():

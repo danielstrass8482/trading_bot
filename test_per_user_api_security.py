@@ -19,6 +19,12 @@ Deckt für JEDEN der drei umgebauten Endpoint-Gruppen ab:
       JWT liest (Depends(get_current_user_id)), niemals aus dem Body.
   (d) Fehlender/ungültiger Token -> 401 für alle drei Endpoint-Gruppen.
 
+Ergänzt (2026-08-11, Scan-Historie-Datenleck-Fix): test_scan_log_isolation
+deckt zusätzlich /api/scan-log + /api/scan-log/stats ab (siehe
+_migrate_scan_log_user_id_column in database.py) – ein Test-User sah dort
+bisher IMMER Daniels (DEFAULT_USER_ID) eigenes guardrail_reason, unabhängig
+vom eigenen Account.
+
 KEINE Produktions-DB (siehe test_per_user_guardrails.py für Setup-Befehle,
 identische Wegwerf-DB-Konvention). NIEMALS gegen echte Produktions-DB/Konto
 ausführen.
@@ -236,6 +242,77 @@ def test_presets_isolation_and_attack():
 
 
 # ─────────────────────────────────────────────
+# Scan-Historie-Datenleck-Fix (2026-08-11): /api/scan-log + /api/scan-log/stats
+# ─────────────────────────────────────────────
+def wipe_scan_log_test_users():
+    with database.get_session() as session:
+        session.query(database.ScanLog).filter(
+            database.ScanLog.user_id.in_([USER_A, USER_B])
+        ).delete(synchronize_session=False)
+        session.commit()
+
+
+def seed_scan_log_row(user_id: int, ticker: str, guardrail_reason, trade_executed: bool):
+    with database.get_session() as session:
+        session.add(database.ScanLog(
+            ticker=ticker, score=80, approved=True,
+            guardrail_reason=guardrail_reason, trade_executed=trade_executed,
+            broker="alpaca", mode="LIVE", user_id=user_id,
+        ))
+        session.commit()
+
+
+def test_scan_log_isolation():
+    """
+    Reproduziert exakt den vom Nutzer gemeldeten Vorfall: Account A (echtes
+    Konto, hier simuliert) hat ein Guardrail-Ereignis mit Konto-spezifischem
+    Text ("Max. offene Position erreicht 5/5"), Account B ist ein komplett
+    unabhängiger Test-Account ohne jede Beziehung zu A. Vor dem Fix hätte
+    B (weil /api/scan-log ungescoped war und main.py ohnehin nur
+    DEFAULT_USER_IDs Ergebnis loggte) je nach Konstellation As Text gesehen.
+    """
+    wipe_scan_log_test_users()
+    seed_scan_log_row(USER_A, "AAPL", "Max. offene Position erreicht 5/5", trade_executed=False)
+    seed_scan_log_row(USER_A, "TSLA", None, trade_executed=True)
+    seed_scan_log_row(USER_B, "AAPL", "Tagesverlustlimit erreicht (B's eigenes Limit)", trade_executed=False)
+
+    r = client.get("/api/scan-log", headers=auth_headers(USER_A))
+    record("scan-log a) Account A: 200", r.status_code == 200, f"status={r.status_code}")
+    rows_a = [t for day in r.json() for slot in day["slots"] for t in slot["tickers"]]
+    reasons_a = {row["ticker"]: row["guardrail_reason"] for row in rows_a}
+    record("scan-log a) Account A sieht sein EIGENES Guardrail (AAPL: 'Max. offene Position erreicht 5/5')",
+           reasons_a.get("AAPL") == "Max. offene Position erreicht 5/5", str(reasons_a))
+    record("scan-log a) Account A sieht KEINEN Eintrag von B ('Tagesverlustlimit erreicht (B's eigenes Limit)')",
+           "Tagesverlustlimit erreicht (B's eigenes Limit)" not in reasons_a.values(), str(reasons_a))
+
+    r = client.get("/api/scan-log", headers=auth_headers(USER_B))
+    record("scan-log b) Account B: 200", r.status_code == 200, f"status={r.status_code}")
+    rows_b = [t for day in r.json() for slot in day["slots"] for t in slot["tickers"]]
+    reasons_b = {row["ticker"]: row["guardrail_reason"] for row in rows_b}
+    record("scan-log b) Account B sieht sein EIGENES Guardrail (AAPL: 'Tagesverlustlimit erreicht (B's eigenes Limit)')",
+           reasons_b.get("AAPL") == "Tagesverlustlimit erreicht (B's eigenes Limit)", str(reasons_b))
+    record("scan-log b) Account B sieht NICHT As Text 'Max. offene Position erreicht 5/5' (der gemeldete Vorfall)",
+           "Max. offene Position erreicht 5/5" not in reasons_b.values(), str(reasons_b))
+    record("scan-log b) Account B sieht As TSLA-Zeile (trade_executed) überhaupt nicht",
+           "TSLA" not in reasons_b, str(reasons_b))
+
+    r = client.get("/api/scan-log/stats", headers=auth_headers(USER_A))
+    stats_a = {row["grund"]: row["anzahl"] for row in r.json()}
+    r = client.get("/api/scan-log/stats", headers=auth_headers(USER_B))
+    stats_b = {row["grund"]: row["anzahl"] for row in r.json()}
+    record("scan-log/stats: Account A zählt genau 1 Guardrail-Ereignis (nur sein eigenes)",
+           stats_a.get("Guardrail") == 1, str(stats_a))
+    record("scan-log/stats: Account B zählt genau 1 Guardrail-Ereignis (nur sein eigenes, unabhängig von A)",
+           stats_b.get("Guardrail") == 1, str(stats_b))
+
+    # Regression: Owner (Daniel) weiterhin erreichbar, keine Kollision mit
+    # den Test-Accounts.
+    r = client.get("/api/scan-log", headers=auth_headers(DEFAULT_USER_ID))
+    record("scan-log Regression: Owner (Daniel) kann /api/scan-log weiterhin lesen (200)",
+           r.status_code == 200, f"status={r.status_code}")
+
+
+# ─────────────────────────────────────────────
 # (d) Kein/ungültiger Token -> 401 für alle drei Endpoint-Gruppen
 # ─────────────────────────────────────────────
 def test_unauthenticated_rejected():
@@ -245,6 +322,8 @@ def test_unauthenticated_rejected():
         ("get", "/api/capital-allocations", {}),
         ("put", "/api/capital-allocations", {"json": {"allocations": {"bot": 50.0, "active_trading": 50.0}}}),
         ("post", "/api/bot-config/preset", {"json": {"preset": "konservativ"}}),
+        ("get", "/api/scan-log", {}),
+        ("get", "/api/scan-log/stats", {}),
     ]:
         r = getattr(client, method)(path, **kwargs)  # kein Authorization-Header
         record(f"d) {method.upper()} {path} ohne Token -> 401", r.status_code == 401, f"status={r.status_code}")
@@ -255,7 +334,7 @@ def test_unauthenticated_rejected():
 
 def main():
     for fn in (test_guardrails_isolation_and_attack, test_capital_allocations_isolation_and_attack,
-               test_presets_isolation_and_attack, test_unauthenticated_rejected):
+               test_presets_isolation_and_attack, test_scan_log_isolation, test_unauthenticated_rejected):
         print(f"\n--- {fn.__name__} ---")
         try:
             fn()
