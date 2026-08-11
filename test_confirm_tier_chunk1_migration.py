@@ -125,8 +125,16 @@ def test_get_user_live_config_lazy_seeds_new_user():
         session.commit()
 
     cfg = database.get_user_live_config(other_user_id)
-    record("neuer Multi-Tenant-Nutzer bekommt EXECUTION_MODE='auto'",
-           cfg.get("EXECUTION_MODE") == "auto", f"value={cfg.get('EXECUTION_MODE')!r}")
+    # Default 'confirm' seit Chunk 2a (2026-08-11, siehe database.py::
+    # DEFAULT_USER_CONFIG-Docstring) - bewusst NUR für neu verbundene
+    # Multi-Tenant-Nutzer, nicht für Daniel/DEFAULT_USER_ID (dessen Default
+    # in DEFAULT_CONFIG im Zuge der Deploy-Verifikation 2026-08-11 auf
+    # 'auto' zurückkorrigiert wurde, siehe dortige Docstring). War hier bei
+    # Einführung von Chunk 1 (2026-08-07) noch 'auto', bevor Chunk 2a den
+    # Default für neue Kunden bewusst auf den sichereren Bestätigungs-Modus
+    # umstellte - Test-Erwartung entsprechend nachgezogen.
+    record("neuer Multi-Tenant-Nutzer bekommt EXECUTION_MODE='confirm'",
+           cfg.get("EXECUTION_MODE") == "confirm", f"value={cfg.get('EXECUTION_MODE')!r}")
     record("neuer Multi-Tenant-Nutzer bekommt PRICE_TOLERANCE_PCT=0.02",
            cfg.get("PRICE_TOLERANCE_PCT") == 0.02, f"value={cfg.get('PRICE_TOLERANCE_PCT')!r}")
 
@@ -134,7 +142,7 @@ def test_get_user_live_config_lazy_seeds_new_user():
         rows = {r.key: r.value for r in
                 session.query(database.UserBotConfig).filter_by(user_id=other_user_id).all()}
     record("EXECUTION_MODE wurde für den neuen Nutzer tatsächlich persistiert (nicht nur im Rückgabewert)",
-           rows.get("EXECUTION_MODE") == "auto", f"rows={rows}")
+           rows.get("EXECUTION_MODE") == "confirm", f"rows={rows}")
 
 
 def main():

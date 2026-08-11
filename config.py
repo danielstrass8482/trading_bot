@@ -439,12 +439,20 @@ _LIVE_CONFIG_SPEC = {
     "ALPACA_DRAIN_MODE":       (str,   "false"),   # "true" = keine neuen Alpaca-Käufe, nur bestehende Positionen managen
     # Confirm-Tier (Chunk 1, 2026-08-07; main.run_entry_cycle liest den Wert
     # tatsächlich seit Chunk 2a, 2026-08-11, siehe confirm_execution.py).
-    # 'confirm' als Fail-Safe-Fallback (greift nur, falls die DB nicht
-    # erreichbar ist ODER kein bot_config-Wert existiert, siehe get_live_
-    # config()-Docstring) - konsistent zum neuen Seed-Default in database.py
-    # DEFAULT_CONFIG/DEFAULT_USER_CONFIG: lieber ein verpasster Auto-Trade als
-    # ein ungewollter, während dieser Zwischenphase (Chunk 2b/2c fehlen noch).
-    "EXECUTION_MODE":         (str,   "confirm"),  # "auto" oder "confirm" (manuelle Bestätigung vor Entry-Trades)
+    # Dieser Fallback greift AUSSCHLIESSLICH für Daniel/DEFAULT_USER_ID (die
+    # DB-Wert-Zeile hat sonst immer Vorrang, siehe get_live_config()
+    # Docstring) - für jeden ANDEREN Nutzer überschreibt get_user_live_config()
+    # diesen Wert ohnehin bedingungslos mit DEFAULT_USER_CONFIG (database.py),
+    # dieser Fallback hier ist für sie irrelevant.
+    #
+    # KORREKTUR (Deploy-Verifikation Owner-Account, 2026-08-11, siehe
+    # database.py::DEFAULT_CONFIG für die volle Begründung): Chunk 2a hatte
+    # hier versehentlich 'confirm' gesetzt, obwohl Daniels Account seit
+    # Chunk 1 explizit 'auto' ist - ein DB-Ausfall hätte ihn dadurch
+    # ausgerechnet im Fehlerfall in den Bestätigungs-Modus (= Bot-Stillstand)
+    # versetzt statt im gewohnten Automatik-Modus weiterlaufen zu lassen.
+    # Zurück auf 'auto', konsistent mit dem tatsächlichen Wert seines Accounts.
+    "EXECUTION_MODE":         (str,   "auto"),  # "auto" oder "confirm" (manuelle Bestätigung vor Entry-Trades)
     "PRICE_TOLERANCE_PCT":    (float, 0.02),
 }
 

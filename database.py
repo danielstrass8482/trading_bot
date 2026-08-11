@@ -397,19 +397,26 @@ DEFAULT_CONFIG = {
     "ALPACA_DRAIN_MODE":       ("true",   "Alpaca: Keine neuen Käufe, nur bestehende Positionen managen"),
     # Confirm-Tier (Chunk 1, 2026-08-07: nur Datenmodell/Settings, keine
     # Verhaltensänderung. Chunk 2a, 2026-08-11: main.run_entry_cycle liest
-    # EXECUTION_MODE jetzt tatsächlich, siehe confirm_execution.py). Default
-    # auf 'confirm' umgestellt (statt 'auto') - bewusster Sicherheits-Default
-    # für diese Zwischenphase: Chunk 2b (Bestätigungskanäle) und 2c (Preis-
-    # Re-Check/Timeout) fehlen noch, ein PENDING-Eintrag führt bis dahin zu
-    # KEINER Order (siehe confirm_execution.py-Moduldoc - das ist gewollt,
-    # kein Bug). Betrifft NUR neu geseedete bot_config-Zeilen (dieser
-    # Deploy-Zweig wurde in dieser Session nicht auf den VPS ausgerollt,
-    # siehe Aufgabe) - Daniels bereits bestehende, in Chunk 1 auf 'auto'
-    # gesetzte Live-Zeile bleibt bei einem künftigen Deploy unverändert
-    # 'auto', bis das bewusst geändert wird (kein automatischer Rückwärts-
-    # Effekt auf bereits existierende Werte, siehe init_db()-Seed-Logik:
-    # "nur fehlende Keys").
-    "EXECUTION_MODE":          ("confirm", "Trade-Ausführung: 'auto' (sofort) oder 'confirm' (manuelle Bestätigung vor Entry-Trades)"),
+    # EXECUTION_MODE jetzt tatsächlich, siehe confirm_execution.py).
+    #
+    # KORREKTUR (Deploy-Verifikation Owner-Account, 2026-08-11, siehe Aufgabe):
+    # Chunk 2a hatte diesen GLOBALEN Default versehentlich auf 'confirm'
+    # umgestellt, in der Annahme "sicherer Default für die Zwischenphase" -
+    # das verwechselte aber den Sicherheits-Bedarf NEUER/anderer Multi-
+    # Tenant-Nutzer (dafür bleibt DEFAULT_USER_CONFIG unten bewusst weiterhin
+    # 'confirm') mit dem des bereits etablierten Owners (Daniel,
+    # DEFAULT_USER_ID), der über get_user_live_config() 1:1 GENAU DIESE
+    # globale bot_config-Tabelle liest (siehe dortige Docstring) und dessen
+    # Account seit Chunk 1 (da9a3b3, 2026-08-07) nachweislich explizit
+    # 'auto' war. Ein FRISCH geseedetes bot_config (leere/zurückgesetzte DB,
+    # empirisch verifiziert im Zuge dieser Korrektur) hätte Daniel dadurch
+    # unbeabsichtigt in den Bestätigungs-Modus versetzt. Zurück auf 'auto' -
+    # zusätzlich abgesichert durch die einmalige, selbstheilende Migration
+    # _migrate_default_user_execution_mode_safety() weiter unten, die einen
+    # zum Migrationszeitpunkt bereits fälschlich auf 'confirm' stehenden
+    # Wert korrigiert, eine SPÄTERE bewusste manuelle Umstellung durch
+    # Daniel selbst (Einstellungen.tsx) aber nie wieder anfasst.
+    "EXECUTION_MODE":          ("auto",   "Trade-Ausführung: 'auto' (sofort) oder 'confirm' (manuelle Bestätigung vor Entry-Trades)"),
     "PRICE_TOLERANCE_PCT":     ("0.02",   "Erlaubte Preisabweichung ggü. Signal-Preis bei manueller Bestätigung, bevor der Trade verworfen wird"),
 }
 
@@ -526,10 +533,13 @@ DEFAULT_USER_CONFIG: dict = {
     "MAX_TRADES_PER_DAY":    (int,   2),
     "DAILY_LOSS_LIMIT_PCT":  (float, 0.05),
     # Confirm-Tier (Chunk 1, 2026-08-07; Default auf 'confirm' umgestellt in
-    # Chunk 2a, 2026-08-11): siehe DEFAULT_CONFIG oben für die volle
-    # Begründung - neu verbundene Nutzer starten damit im sicheren
-    # Bestätigungs-Modus statt im Sofort-Ausführungs-Modus, bis der
-    # komplette Confirm-Tier-Flow (2b/2c) steht.
+    # Chunk 2a, 2026-08-11) - gilt NUR für neu über den Connect-Flow
+    # verbundene Nutzer (user_bot_config), NICHT für Daniel/DEFAULT_USER_ID
+    # (der liest ausschließlich die globale bot_config-Tabelle, siehe
+    # DEFAULT_CONFIG oben - dortiger Default wurde im Zuge der Deploy-
+    # Verifikation 2026-08-11 auf 'auto' zurückkorrigiert). Bewusst weiterhin
+    # 'confirm' hier: ein neuer Kunde soll sicherheitshalber im
+    # Bestätigungs-Modus starten, bis er selbst aktiv auf 'auto' umstellt.
     "EXECUTION_MODE":        (str,   "confirm"),
     "PRICE_TOLERANCE_PCT":   (float, 0.02),
     # Ab hier: Aufgabe "Presets/Kapitalaufteilung/Guardrails pro Nutzer"
@@ -982,7 +992,38 @@ def init_db():
                     stunde_et=stunde, minute_et=minute, gewichtung=gewichtung, quelle="initial"
                 ))
         session.commit()
+    _migrate_default_user_execution_mode_safety()
     print("✅ Datenbank initialisiert.")
+
+
+def _migrate_default_user_execution_mode_safety():
+    """
+    Deploy-Verifikation Owner-Account (2026-08-11, siehe Aufgabe): garantiert
+    EINMALIG, dass Daniels (DEFAULT_USER_ID) globaler bot_config-Wert für
+    EXECUTION_MODE 'auto' ist - unabhängig davon, unter welchem historischen
+    DEFAULT_CONFIG-Dict-Wert die Zeile jemals geseedet wurde. Reiner Schutz
+    gegen die Möglichkeit, dass eine frühere Deploy-Reihenfolge (z.B. ein
+    Neuaufsetzen der DB, oder ein Deploy-Schritt, der Chunk 1 übersprungen
+    hätte) die Zeile mit dem zwischenzeitlich falschen Chunk-2a-Default
+    'confirm' geseedet haben könnte, statt sich rückwirkend auf einen nicht
+    mehr nachprüfbaren Deploy-Verlauf zu verlassen.
+
+    Läuft NUR EINMAL (BotState-Marker "execution_mode_auto_safety_applied"):
+    korrigiert einen zum Migrationszeitpunkt fälschlich auf etwas anderes als
+    'auto' stehenden Wert genau dieses eine Mal, überschreibt aber NIE eine
+    danach erfolgende bewusste manuelle Umstellung durch Daniel selbst (z.B.
+    über Einstellungen.tsx) - der Marker verhindert, dass dieser Fix bei
+    jedem künftigen Neustart erneut zuschlägt.
+    """
+    with get_session() as session:
+        if BotState.get(session, "execution_mode_auto_safety_applied"):
+            return
+        current = get_bot_config(session, "EXECUTION_MODE")
+        if current != "auto":
+            set_bot_config(session, "EXECUTION_MODE", "auto")
+            print(f"🔒 Deploy-Sicherheitsnetz: EXECUTION_MODE (Owner-Account) war '{current}', auf 'auto' korrigiert.")
+        BotState.set(session, "execution_mode_auto_safety_applied", "true")
+        session.commit()
 
 
 def _migrate_entry_time_slots_columns():
