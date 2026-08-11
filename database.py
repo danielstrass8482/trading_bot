@@ -812,6 +812,13 @@ class DailyLog(Base):
     daily_pnl      = Column(Float, default=0.0)
     trades_count   = Column(Integer, default=0)
     open_positions = Column(Integer, default=0)
+    # Kapitalfluss-Verzerrungs-Bugfix Chunk 2 (2026-08-11): NULL = Zeile vor
+    # der Formel-Umstellung geschrieben (bewusst nicht rückwirkend
+    # korrigiert/befüllt, siehe trading_shared.performance-Docstring),
+    # trading_shared.performance.FORMULA_VERSION_TWR = danach. Betrifft nicht
+    # portfolio_value selbst (roher Depotwert, formelunabhängig immer
+    # korrekt) - reine Metadaten für Frontend/künftige %-Zeitreihen.
+    formula_version = Column(String(20), nullable=True)
 
     __table_args__ = (
         UniqueConstraint('log_date', 'user_id', name='uq_daily_log_date_user'),
@@ -902,6 +909,7 @@ def init_db():
     _migrate_trades_time_exit_grace_columns()
     _migrate_trades_status_column_width()
     _migrate_daily_log_user_id_column()
+    _migrate_daily_log_formula_version_column()
     _migrate_current_weights_broker_column()
     _migrate_capital_allocations_user_id_column()
     _seed_saxo_token_from_env()
@@ -1166,6 +1174,18 @@ def _migrate_daily_log_user_id_column():
                 END IF;
             END $$;
         """))
+
+
+def _migrate_daily_log_formula_version_column():
+    """
+    Kapitalfluss-Verzerrungs-Bugfix Chunk 2 (2026-08-11, siehe
+    trading_shared.performance-Docstring). Rein additive Migration, KEIN
+    Backfill bestehender Zeilen (bewusster Mittelweg, siehe Aufgabe) - sie
+    bleiben NULL (= vor der Formel-Umstellung geschrieben). save_daily_
+    snapshot() setzt den Wert ab jetzt bei jedem Schreibzugriff.
+    """
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE daily_log ADD COLUMN IF NOT EXISTS formula_version VARCHAR(20)"))
 
 
 def _migrate_current_weights_broker_column():
@@ -1691,17 +1711,25 @@ def save_daily_snapshot(session: Session, user_id: int, portfolio_value: float):
     Snapshot/Tag, siehe DailyLog-Docstring). Aufrufer (main.run_entry_cycle)
     ruft dies jetzt für jeden verbundenen Nutzer einzeln auf.
     """
+    from trading_shared.performance import FORMULA_VERSION_TWR
+
     today = date.today()
     existing = session.query(DailyLog).filter_by(log_date=today, user_id=user_id).first()
     if existing:
         existing.portfolio_value = portfolio_value
+        # formula_version bei jedem Schreibzugriff mitziehen (nicht nur beim
+        # initialen INSERT) - siehe DailyLog-Docstring, markiert "zuletzt
+        # nach der Formel-Umstellung geschrieben", unabhängig davon ob die
+        # Zeile heute neu angelegt oder nur aktualisiert wurde.
+        existing.formula_version = FORMULA_VERSION_TWR
     else:
         session.add(DailyLog(
             log_date=today,
             user_id=user_id,
             portfolio_value=portfolio_value,
             trades_count=get_daily_trade_count(session, user_id),
-            open_positions=len(get_open_trades(session, user_id))
+            open_positions=len(get_open_trades(session, user_id)),
+            formula_version=FORMULA_VERSION_TWR,
         ))
 
 

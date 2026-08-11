@@ -1649,9 +1649,25 @@ def get_bot_performance(days: int = 30, user_id: int = DEFAULT_USER_ID) -> float
     Nutzerbindung). Nutzt den ältesten daily_log-Snapshot DIESES Nutzers
     innerhalb des Zeitraums als Startwert; None falls noch kein Snapshot in
     diesem Zeitraum existiert (z.B. Nutzer erst seit kurzem verbunden).
+
+    Kapitalfluss-Verzerrungs-Bugfix Chunk 2 (2026-08-11): verwendet jetzt
+    trading_shared.performance.compute_twr_performance_pct statt des
+    simplen (current-start)/start*100 - die alte Formel zählte jede
+    Einzahlung fälschlich als Trading-Gewinn mit (siehe
+    trading_shared.performance-Docstring für die volle Begründung/den live
+    bestätigten Saxo-Fall). net_deposits summiert alle capital_flows dieses
+    Nutzers, die NACH dem Start-Snapshot-Tag erfasst wurden - Flüsse AM
+    Snapshot-Tag selbst gelten als bereits im Startwert enthalten (daily_log
+    hat keine Uhrzeit, gröbere Granularität als eine untertägige Zuordnung
+    hergeben würde). Läuft rückwirkend korrekt für JEDES Zeitfenster, auch
+    eines, das vor dem Formel-Deploy beginnt - Chunk 1 hat die komplette
+    Kapitalfluss-Historie bereits synchronisiert (kein Teilzeitraum-Problem,
+    siehe Moduldoc).
     """
-    from datetime import date, timedelta
+    from datetime import date, timedelta, datetime
+    from sqlalchemy import func
     from database import DailyLog
+    from trading_shared.performance import compute_twr_performance_pct
 
     cutoff = date.today() - timedelta(days=days)
     with get_session() as session:
@@ -1659,11 +1675,18 @@ def get_bot_performance(days: int = 30, user_id: int = DEFAULT_USER_ID) -> float
             DailyLog.log_date >= cutoff, DailyLog.user_id == user_id
         ).order_by(DailyLog.log_date.asc()).first()
 
-    if not start_snapshot or start_snapshot.portfolio_value <= 0:
-        return None
+        if not start_snapshot or start_snapshot.portfolio_value <= 0:
+            return None
+
+        flows_since = datetime.combine(start_snapshot.log_date + timedelta(days=1), datetime.min.time())
+        net_deposits = session.query(func.coalesce(func.sum(CapitalFlow.amount), 0.0)).filter(
+            CapitalFlow.broker == "alpaca",
+            CapitalFlow.user_id == user_id,
+            CapitalFlow.occurred_at >= flows_since,
+        ).scalar()
 
     current_value = get_portfolio_value(user_id)
-    return round((current_value - start_snapshot.portfolio_value) / start_snapshot.portfolio_value * 100, 2)
+    return compute_twr_performance_pct(start_snapshot.portfolio_value, current_value, net_deposits)
 
 
 # Kapitalfluss-Erfassung Chunk 1 (2026-08-07): Alpacas Account-Activities-

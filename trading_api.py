@@ -315,11 +315,17 @@ def get_performance(user_id: int = Depends(get_current_user_id)):
     Endpoint für alle außer DEFAULT_USER_ID mit 403 gesperrt, weil log_date
     global eindeutig war (ein Snapshot/Tag für alle Nutzer) – jeder Nutzer
     sieht jetzt ausschließlich seine eigenen Snapshots/Stats.
+
+    formula_version (Kapitalfluss-Verzerrungs-Bugfix Chunk 2, 2026-08-11):
+    NULL für Zeilen vor der TWR-Formel-Umstellung, sonst
+    trading_shared.performance.FORMULA_VERSION_TWR - siehe DailyLog-
+    Docstring. portfolio_value selbst ist IMMER korrekt (roher Depotwert,
+    formelunabhängig), das Feld ist reine Metadaten fürs Frontend.
     """
     with get_session() as session:
         snapshots = session.execute(text("""
             SELECT log_date, portfolio_value, daily_pnl,
-                   trades_count
+                   trades_count, formula_version
             FROM daily_log
             WHERE user_id = :user_id
             ORDER BY log_date ASC
@@ -441,12 +447,20 @@ def get_benchmark(days: int = 30, user_id: int = Depends(get_current_user_id)):
     /api/performance-Fix, database.DailyLog hat eine user_id-Spalte) – jeder
     Nutzer sieht seine EIGENE Bot-Performance. Die Markt-Benchmarks (S&P 500/
     Nasdaq, get_benchmark_performance) bleiben bewusst global/marktweit,
-    keine Nutzerbindung nötig oder sinnvoll."""
+    keine Nutzerbindung nötig oder sinnvoll.
+
+    "bot" ist seit dem Kapitalfluss-Verzerrungs-Bugfix Chunk 2 (2026-08-11)
+    immer die TWR-Formel (siehe trading_shared.performance) - formula_
+    deploy_at gibt dem Frontend den exakten Umstellungszeitpunkt mit, ohne
+    ihn dort hart zu duplizieren (Performance.tsx nutzt ihn für einen
+    dezenten Hinweis, falls das gewählte Zeitfenster davor beginnt)."""
     from rule_engine import get_benchmark_performance
     from broker import get_bot_performance
+    from trading_shared.performance import FORMULA_DEPLOY_AT
     return {
         "bot": get_bot_performance(days=days, user_id=user_id),
         "benchmarks": get_benchmark_performance(days=days),
+        "formula_deploy_at": FORMULA_DEPLOY_AT.isoformat(),
     }
 
 

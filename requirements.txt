@@ -1,4 +1,4 @@
-trading_shared @ git+ssh://git@github-tradingshared/danielstrass8482/trading_shared.git@f215039
+trading_shared @ git+ssh://git@github-tradingshared/danielstrass8482/trading_shared.git@f86afcd
 anthropic>=0.25.0
 yfinance>=0.2.40
 pandas>=2.0.0
