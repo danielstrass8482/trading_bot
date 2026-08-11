@@ -198,14 +198,20 @@ def _pending_details_html(pending) -> str:
     # (siehe confirm_execution.update_pending_confirmation) - "zum
     # Signalzeitpunkt" wäre nach einer solchen Aktualisierung irreführend,
     # da es den ursprünglichen statt den aktuellen Wert suggeriert.
+    #
+    # ET statt UTC (Testfeedback 2026-08-11, Punkt 2): verifiziert war das
+    # vorher KEINE reine Beschriftungslücke, sondern eine echte Diskrepanz
+    # zum React-Dashboard (das wegen eines JS-Date-Parsing-Bugs ohnehin
+    # einen falschen, unbeschrifteten Wert zeigte) - siehe confirm_
+    # execution.format_et_datetime-Docstring für die volle Herleitung.
     score = _extract_score(pending.signal_payload)
     return f"""
         <p>Ticker: <b>{pending.ticker}</b></p>
         <p>Score: <b>{score if score is not None else '–'}</b></p>
         <p>Menge: <b>{pending.qty_or_amount}</b></p>
         <p>Preis (zuletzt aktualisiert): <b>${pending.signal_price:.2f}</b></p>
-        <p>Zuletzt aktualisiert: <b>{pending.signal_timestamp.strftime('%d.%m.%Y %H:%M')} UTC</b></p>
-        <p>Läuft ab (Handelsschluss): <b>{pending.expires_at.strftime('%d.%m.%Y %H:%M')} UTC</b></p>
+        <p>Zuletzt aktualisiert: <b>{confirm_execution.format_et_datetime(pending.signal_timestamp)}</b></p>
+        <p>Läuft ab (Handelsschluss): <b>{confirm_execution.format_et_datetime(pending.expires_at)}</b></p>
     """
 
 

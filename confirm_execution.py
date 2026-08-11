@@ -69,6 +69,7 @@ per expire_dropped_below_threshold(). compute_expiry() (Chunk 1, generisch
 minuten-basiert) bleibt in trading_shared für den noch ausstehenden
 Saxo-Folgeauftrag verfügbar, wird hier aber nicht mehr verwendet.
 """
+import json
 from datetime import datetime
 
 import pytz
@@ -103,6 +104,48 @@ def compute_market_close_expiry(now_utc: datetime) -> datetime:
     now_et = pytz.utc.localize(now_utc).astimezone(_ET_TZ)
     close_et = now_et.replace(hour=_MARKET_CLOSE_ET[0], minute=_MARKET_CLOSE_ET[1], second=0, microsecond=0)
     return close_et.astimezone(pytz.utc).replace(tzinfo=None)
+
+
+def format_et_datetime(dt: datetime) -> str:
+    """
+    Confirm-Tier-Testfeedback (2026-08-11, Zeitzone-Punkt): Zeitangaben in
+    Mail UND Bestätigungsseite (trading_api._pending_details_html, ruft
+    dies auf) jetzt konsistent in ET statt UTC. Grund: die verifizierte
+    Ist-Situation vorher war KEINE reine Beschriftungslücke, sondern eine
+    echte Diskrepanz zwischen zwei Oberflächen - die Mail/HTML-Seite zeigte
+    korrekt UTC (beschriftet), das React-Dashboard dagegen zeigte wegen
+    eines JS-Date-Parsing-Bugs (naive-UTC-ISO-String ohne "Z"-Suffix wird
+    von new Date() in einem NICHT-UTC-Browser als LOKALE statt UTC-Zeit
+    interpretiert, siehe trading_react/src/lib/format.ts::fmtEtDateTime)
+    einen um den Browser-UTC-Offset falschen, unbeschrifteten Wert - für
+    einen Europe/Berlin-Browser während CEST empirisch eine 2h-Abweichung.
+    Fix auf beiden Seiten: ET, da expires_at ohnehin ein Handelsschluss-
+    Konzept ist (siehe compute_market_close_expiry oben) - die
+    naheliegendste, kontextrichtige Referenz unabhängig vom Standort des
+    Nutzers, und identisch zur bereits bestehenden ET-Konvention im übrigen
+    Produkt (siehe trading_react/src/components/MarketStatus.tsx).
+
+    dt: naiver UTC-datetime (Konvention wie überall in diesem Modul).
+    """
+    return pytz.utc.localize(dt).astimezone(_ET_TZ).strftime("%d.%m.%Y %H:%M") + " ET"
+
+
+def _extract_score(signal_payload: str | None) -> int | None:
+    """
+    Score-Anzeige (Testfeedback 2026-08-11, Punkt 3: Score fehlte in der
+    Mail komplett, obwohl er seit Chunk 2d auf Dashboard/Bestätigungsseite
+    steht). Duplikat von trading_api._extract_score (bewusst, nicht
+    importiert - trading_api.py importiert umgekehrt von hier, ein
+    Rückimport wäre ein Zirkelimport; identisches Duplizierungsmuster wie
+    z.B. watchdog.ALPACA_HOURS/SAXO_EXCHANGES_HOURS, siehe dortiger
+    Docstring). None statt Exception bei fehlendem/kaputtem Payload.
+    """
+    if not signal_payload:
+        return None
+    try:
+        return json.loads(signal_payload).get("score")
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 STATUS_PENDING = "pending"
@@ -450,16 +493,27 @@ def send_confirmation_email(pending: PendingConfirmation) -> None:
 
     link = f"{APP_BASE_URL}/confirm/{pending.confirmation_token}"
     subject = f"⏳ Trading Bot – Bestätigung nötig: {pending.ticker}"
+    score = _extract_score(pending.signal_payload)
+    # Struktur/Ausrichtung (Testfeedback 2026-08-11, Punkt 3): Leerzeilen
+    # zwischen Kopf/Details/Aktion/Hinweis-Abschnitt, eingerückte + auf
+    # gleiche Breite ausgerichtete Labels statt der vorherigen einzeiligen
+    # Aneinanderreihung - bewusst weiterhin reiner Plain-Text (keine
+    # HTML-Mail, siehe Moduldoc), Ausrichtung per Leerzeichen funktioniert
+    # in jedem Mail-Client, der text/plain in einer Monospace-Schrift
+    # rendert (Standardverhalten in praktisch allen gängigen Clients).
+    # Score (NEU) + ET statt UTC (Testfeedback Punkt 2, siehe format_et_
+    # datetime-Docstring) ergänzt, sonst inhaltlich unverändert.
     body = f"""Trading Bot – Bestätigung nötig
 {'=' * 50}
 
 Ein Entry-Signal wartet auf deine Bestätigung:
 
-Ticker:      {pending.ticker}
-Menge:       {pending.qty_or_amount}
-Preis:       ${pending.signal_price:.2f}
-Zeitpunkt:   {pending.signal_timestamp.strftime('%d.%m.%Y %H:%M')} UTC
-Läuft ab:    {pending.expires_at.strftime('%d.%m.%Y %H:%M')} UTC
+  Ticker:        {pending.ticker}
+  Score:         {score if score is not None else '–'}/100
+  Menge:         {pending.qty_or_amount}
+  Preis:         ${pending.signal_price:.2f}
+  Aktualisiert:  {format_et_datetime(pending.signal_timestamp)}
+  Läuft ab:      {format_et_datetime(pending.expires_at)} (Handelsschluss)
 
 Bestätigen oder ablehnen (kein Login nötig):
 {link}

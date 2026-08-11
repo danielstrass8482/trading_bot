@@ -92,6 +92,27 @@ def get_pending(user_id, ticker):
         return row
 
 
+def push_expiry_into_future(user_id, ticker):
+    """
+    Testfeedback-Session (2026-08-11) - Bugfix in der Test-Infrastruktur
+    selbst: create_pending_confirmation()/update_pending_confirmation()
+    berechnen expires_at über compute_market_close_expiry(datetime.utcnow())
+    - ein Testlauf NACH 16:00 ET (z.B. abends in Europa) erzeugt dadurch
+    einen bereits abgelaufenen Eintrag, _resolve_confirmation() bricht dann
+    sofort mit "Bestätigung abgelaufen" ab, BEVOR der eigentlich zu testende
+    Preis-Re-Check-Pfad überhaupt erreicht wird (live beobachtet: Tests a-c
+    liefen noch vor Handelsschluss durch, d schlug nach Handelsschluss fehl -
+    keine Änderung an der eigentlich getesteten Logik, reine Testfragilität).
+    Testfälle, die NACH create_pending_confirmation() aktiv _resolve_
+    confirmation() aufrufen, müssen expires_at deshalb explizit in die
+    Zukunft setzen, unabhängig von der tatsächlichen Tageszeit beim Testlauf.
+    """
+    with get_session() as session:
+        row = session.query(PendingConfirmation).filter_by(user_id=user_id, ticker=ticker).first()
+        row.expires_at = datetime.utcnow() + timedelta(hours=2)
+        session.commit()
+
+
 # ─────────────────────────────────────────────
 # a) Ticker bleibt über mehrere Zyklen über der Schwelle -> Update, kein
 #    Duplikat, keine Mehrfach-Mail
@@ -219,6 +240,7 @@ def test_d_price_recheck_against_updated_basis_not_original():
         # der Aufgabe ("über Stunden aktualisierter Eintrag").
         main_module._execute_or_queue_entry(make_signal(ticker="NVDA", score=72, price=110.0), {}, USER_A)
 
+    push_expiry_into_future(USER_A, "NVDA")
     row = get_pending(USER_A, "NVDA")
     record("d) signal_price steht auf der aktualisierten Basis (110.0), NICHT dem Ursprungspreis (100.0)",
            row.signal_price == 110.0, f"got={row.signal_price}")
@@ -251,6 +273,7 @@ def test_d_price_recheck_against_updated_basis_not_original():
     with patch.object(confirm_execution, "send_email"), \
          patch.object(confirm_execution, "get_user_email", return_value="test@example.com"):
         main_module._execute_or_queue_entry(make_signal(ticker="AMD", score=70, price=50.0), {}, USER_A)
+    push_expiry_into_future(USER_A, "AMD")
     row2 = get_pending(USER_A, "AMD")
     with patch.object(trading_api, "_fetch_live_price", return_value=60.0), \
          patch.object(trading_api, "place_trade") as place_trade_mock2:
