@@ -1,6 +1,7 @@
 """
-confirm_execution.py – Interception-Logik für den manuellen Bestätigungs-Tier
-vor Entry-Trades (Confirm-Tier Chunk 2a, 2026-08-11).
+confirm_execution.py – Interception- und Bestätigungs-Logik für den
+manuellen Bestätigungs-Tier vor Entry-Trades (Confirm-Tier Chunk 2a+2b,
+2026-08-11).
 
 ARCHITEKTUR-VORGABE (Option C, mit dem Anwalt abgestimmt, siehe
 trading_shared/confirm_execution/__init__.py-Docstring aus Chunk 1):
@@ -8,10 +9,12 @@ physisch getrenntes Modul vom bestehenden Auto-Execution-Code. Dieses Modul
 importiert BEWUSST NICHTS aus broker.py (kein place_trade, kein
 _submit_order_idempotent, keine Alpaca-Order-Calls, kein calculate_quantity)
 und auch nicht aus rule_engine.py (keine Kopplung an die Signal-Engine,
-Übergabe erfolgt über primitive Werte statt eines SignalResult-Objekts) -
-die strukturelle Trennung muss für einen Auditor direkt im Code sichtbar
-sein, nicht nur über Konfiguration. Umgekehrt importiert broker.py nichts
-von hier.
+Übergabe erfolgt über primitive Werte/Dicts statt eines SignalResult-
+Objekts) - die strukturelle Trennung muss für einen Auditor direkt im Code
+sichtbar sein, nicht nur über Konfiguration. Umgekehrt importiert broker.py
+nichts von hier. notifications.py (SMTP-Utility, keine Order-Logik) und
+database.py (reine DB-/Config-Schicht) sind dagegen unproblematisch und
+werden hier verwendet.
 
 Entry-only: nur Trade-ENTRIES laufen über dieses Modul (siehe main.
 run_entry_cycle, der Aufrufer). Exit-Typen (SL/TP/Trailing/Time-Exit) bleiben
@@ -22,25 +25,39 @@ Baut auf trading_shared.confirm_execution (Chunk 1, 2026-08-07) auf - die
 Token-/Ablauf-Helfer dort waren bereits ORM-agnostisch für genau diesen
 Zweck vorbereitet.
 
-SCOPE Chunk 2a (NUR das hier, siehe Aufgabe): ein Entry-Signal landet als
-PENDING in database.PendingConfirmation, es wird KEIN Broker-Call ausgelöst.
-Kein Bestätigungskanal (E-Mail/Dashboard - Chunk 2b), kein Timeout-/Preis-
-Re-Check-Enforcement (Chunk 2c - expires_at wird hier bereits gesetzt, aber
-von NIEMANDEM ausgewertet). Das bedeutet: jedes Entry-Signal eines Nutzers
-mit EXECUTION_MODE='confirm' führt bis Chunk 2b/2c fertig ist zu KEINER
-tatsächlichen Order - das ist in dieser Zwischenphase gewollt (sicherer
-Zustand), kein Bug.
+Wer tatsächlich place_trade() aufruft: NICHT dieses Modul (s.o.) - das
+übernimmt trading_api.py (Chunk 2b), der HTTP-seitige Orchestrator, der
+sowohl dieses Modul als auch broker.py importieren darf (analog zu main.py,
+das für die Entry-Seite in Chunk 2a genau dieselbe Doppelrolle hat). Dieses
+Modul stellt dafür nur die atomare Status-Übergangs-Primitive (try_claim)
+und die reinen Lese-/Schreibfunktionen bereit.
+
+SCOPE Chunk 2b (NUR das hier, siehe Aufgabe): Email-Link + Dashboard-Queue
+als Bestätigungskanäle, Dedup gegen doppelte PENDING-Einträge/Mails, Race-
+Condition-sicherer Status-Übergang. Weiterhin NICHT Teil dieses Chunks
+(Chunk 2c): tatsächliche Timeout-Durchsetzung von expires_at (eine
+abgelaufene PENDING-Zeile bleibt bis dahin technisch bestätigbar) und der
+Preis-Re-Check gegen price_tolerance_pct_snapshot (eine Bestätigung führt
+aktuell unabhängig vom inzwischen vergangenen Kursverlauf zur Order).
 """
 from datetime import datetime
 
+from sqlalchemy import text
+
 from trading_shared.confirm_execution import generate_confirmation_token, compute_expiry
 
-from database import get_session, PendingConfirmation, get_user_live_config
+from database import get_session, PendingConfirmation, get_user_live_config, get_user_email
+from notifications import send_email
 
 # Platzhalter bis Chunk 2c den echten Timeout/Preis-Re-Check baut - der Wert
-# wird hier bereits in expires_at geschrieben (Spalte ist NOT NULL), aber
-# bis dahin von keinem Code ausgewertet/durchgesetzt.
+# wird hier bereits in expires_at geschrieben (Spalte ist NOT NULL) und im
+# Bestätigungs-Endpoint/der Mail angezeigt, aber bis dahin von keinem Code
+# durchgesetzt (eine abgelaufene PENDING-Zeile lässt sich noch bestätigen).
 DEFAULT_CONFIRMATION_TIMEOUT_MINUTES = 15
+
+STATUS_PENDING = "pending"
+STATUS_CONFIRMED = "confirmed"
+STATUS_REJECTED = "rejected"
 
 
 def is_confirm_mode(user_id: int) -> bool:
@@ -53,11 +70,28 @@ def is_confirm_mode(user_id: int) -> bool:
     return get_user_live_config(user_id).get("EXECUTION_MODE", "auto") == "confirm"
 
 
+def find_existing_pending(user_id: int, ticker: str, broker: str = "alpaca") -> PendingConfirmation | None:
+    """
+    Dedup-Check (Chunk 2b, Aufgabe Punkt 10): bevor main._execute_or_queue_
+    entry() einen neuen PENDING-Eintrag erzeugt, wird geprüft, ob für
+    denselben Ticker+Nutzer(+Broker) bereits einer offen ist. Verhindert
+    doppelte Einträge UND doppelte Mails, falls derselbe Kandidat über
+    mehrere Entry-Slots/Scans hinweg erneut ein Signal auslöst, solange die
+    vorherige Bestätigung noch aussteht.
+    """
+    with get_session() as session:
+        return session.query(PendingConfirmation).filter_by(
+            user_id=user_id, ticker=ticker, broker=broker, status=STATUS_PENDING
+        ).first()
+
+
 def create_pending_confirmation(
     user_id: int,
     ticker: str,
     quantity: float,
     signal_price: float,
+    signal_payload: dict | None = None,
+    llm_payload: dict | None = None,
     broker: str = "alpaca",
 ) -> PendingConfirmation:
     """
@@ -68,11 +102,21 @@ def create_pending_confirmation(
     bereits vorhandene, reine Rechenfunktionen ermittelt (Preisabruf/
     Kapital-Arithmetik, KEIN Order-Call) und hier nur noch persistiert.
 
+    signal_payload/llm_payload (Chunk 2b, NEU): der Aufrufer übergibt die
+    zur Signalerzeugung gehörenden SignalResult-/LLM-Felder als reine Dicts
+    (main.py serialisiert, dieses Modul bleibt dadurch weiterhin ohne
+    Kenntnis von rule_engine.SignalResult) - JSON-serialisiert gespeichert,
+    damit trading_api.py bei einer Bestätigung ein SignalResult
+    rekonstruieren und place_trade() unverändert aufrufen kann (siehe
+    PendingConfirmation-Docstring in database.py).
+
     price_tolerance_pct_snapshot friert den AKTUELL konfigurierten
     PRICE_TOLERANCE_PCT-Wert zum Signalzeitpunkt ein - Chunk 2c vergleicht
     später den dann aktuellen Marktpreis gegen signal_price innerhalb dieser
     Toleranz, bevor eine Bestätigung tatsächlich zu einer Order führt.
     """
+    import json as _json
+
     with get_session() as session:
         user_cfg = get_user_live_config(user_id)
         price_tolerance = float(user_cfg.get("PRICE_TOLERANCE_PCT", 0.02))
@@ -84,12 +128,118 @@ def create_pending_confirmation(
             qty_or_amount=quantity,
             signal_price=signal_price,
             signal_timestamp=now,
-            status="pending",
+            status=STATUS_PENDING,
             confirmation_token=generate_confirmation_token(),
             expires_at=compute_expiry(now, DEFAULT_CONFIRMATION_TIMEOUT_MINUTES),
             price_tolerance_pct_snapshot=price_tolerance,
+            signal_payload=_json.dumps(signal_payload, ensure_ascii=False) if signal_payload is not None else None,
+            llm_payload=_json.dumps(llm_payload, ensure_ascii=False) if llm_payload is not None else None,
         )
         session.add(pending)
         session.commit()
         session.refresh(pending)
         return pending
+
+
+def get_pending_by_token(token: str) -> PendingConfirmation | None:
+    """Lookup für den Email-Magic-Link-Kanal - der Token IST die Authentifizierung
+    (kryptografisch zufällig, 32 Bytes Entropie, siehe trading_shared.confirm_execution.
+    generate_confirmation_token), kein Login nötig."""
+    with get_session() as session:
+        return session.query(PendingConfirmation).filter_by(confirmation_token=token).first()
+
+
+def get_pending_by_id_for_user(pending_id: int, user_id: int) -> PendingConfirmation | None:
+    """
+    Ownership-gescopte Lookup für den Dashboard-Kanal - user_id kommt vom
+    Aufrufer (trading_api.py) IMMER aus dem JWT, nie aus dem Request-Body.
+    None, falls die Zeile nicht existiert ODER einem anderen Nutzer gehört -
+    beide Fälle sind für den Aufrufer ununterscheidbar (kein Leak, ob eine
+    fremde ID existiert).
+    """
+    with get_session() as session:
+        return session.query(PendingConfirmation).filter_by(id=pending_id, user_id=user_id).first()
+
+
+def list_pending_for_user(user_id: int) -> list[PendingConfirmation]:
+    """Alle offenen PENDING-Einträge EINES Nutzers für die Dashboard-Queue, neueste zuerst."""
+    with get_session() as session:
+        return session.query(PendingConfirmation).filter_by(
+            user_id=user_id, status=STATUS_PENDING
+        ).order_by(PendingConfirmation.created_at.desc()).all()
+
+
+def try_claim(pending_id: int, new_status: str) -> PendingConfirmation | None:
+    """
+    Atomarer Status-Übergang PENDING -> new_status (Chunk 2b, Aufgabe Punkt 5:
+    Race-Condition-Schutz, falls Email-Link und Dashboard-Klick fast
+    gleichzeitig eintreffen). Ein reines UPDATE ... WHERE status='pending'
+    ist ein Compare-and-Swap auf DB-Ebene: Postgres serialisiert
+    konkurrierende UPDATEs auf dieselbe Zeile über deren Row-Lock - die
+    zweite Transaktion wartet, bis die erste committet hat, sieht danach den
+    bereits geänderten status und trifft die WHERE-Bedingung nicht mehr
+    (0 betroffene Zeilen). Kein SELECT-dann-UPDATE nötig (das wäre eine
+    klassische TOCTOU-Lücke zwischen den zwei Schritten).
+
+    Gibt die aktualisierte Zeile zurück, falls DIESER Aufruf sie erfolgreich
+    von PENDING auf new_status gesetzt hat - sonst None (bereits von einem
+    anderen Request geclaimt, Zeile existiert nicht, oder war nie 'pending',
+    z.B. schon abgelehnt).
+    """
+    with get_session() as session:
+        result = session.execute(
+            text("""
+                UPDATE pending_confirmations
+                SET status = :new_status, resolved_at = :now
+                WHERE id = :id AND status = :pending_status
+            """),
+            {"new_status": new_status, "now": datetime.utcnow(), "id": pending_id, "pending_status": STATUS_PENDING},
+        )
+        session.commit()
+        if result.rowcount != 1:
+            return None
+        return session.query(PendingConfirmation).filter_by(id=pending_id).first()
+
+
+def send_confirmation_email(pending: PendingConfirmation) -> None:
+    """
+    Verschickt die Bestätigungs-Mail mit Magic-Link (Chunk 2b). Plain-Text,
+    stilkonsistent zu jeder anderen Mail in diesem Repo (notifications.
+    send_email/portfolio_os.notifier.send_email - beide ausschließlich
+    MIMEText(..., "plain")) statt eines neuen HTML-Templates.
+
+    Fehlt eine hinterlegte Adresse (get_user_email liefert None), wird NUR
+    geloggt statt eine Exception zu werfen - der Dashboard-Kanal bleibt für
+    diesen Nutzer trotzdem nutzbar, ein fehlender Email-Kanal darf den
+    gesamten Entry-Zyklus nicht zum Absturz bringen (identisches Prinzip wie
+    überall sonst in main.py: Fehler-Isolierung pro Nutzer).
+    """
+    from config import APP_BASE_URL
+
+    recipient = get_user_email(pending.user_id)
+    if not recipient:
+        print(f"⚠️  Nutzer {pending.user_id}: keine E-Mail-Adresse hinterlegt – Bestätigungs-Mail für "
+              f"{pending.ticker} (PENDING #{pending.id}) übersprungen (Dashboard-Kanal bleibt nutzbar).")
+        return
+
+    link = f"{APP_BASE_URL}/confirm/{pending.confirmation_token}"
+    subject = f"⏳ Trading Bot – Bestätigung nötig: {pending.ticker}"
+    body = f"""Trading Bot – Bestätigung nötig
+{'=' * 50}
+
+Ein Entry-Signal wartet auf deine Bestätigung:
+
+Ticker:      {pending.ticker}
+Menge:       {pending.qty_or_amount}
+Preis:       ${pending.signal_price:.2f}
+Zeitpunkt:   {pending.signal_timestamp.strftime('%d.%m.%Y %H:%M')} UTC
+Läuft ab:    {pending.expires_at.strftime('%d.%m.%Y %H:%M')} UTC
+
+Bestätigen oder ablehnen (kein Login nötig):
+{link}
+
+Der Trade wird NICHT ausgeführt, bis du ihn bestätigst. Du kannst
+Bestätigungen auch im Dashboard unter "Bestätigungen" sehen und bearbeiten.
+"""
+    send_email(subject, body, to=recipient)
+    print(f"📧 Nutzer {pending.user_id}: Bestätigungs-Mail für {pending.ticker} (PENDING #{pending.id}) an {recipient} gesendet.")

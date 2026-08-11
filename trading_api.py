@@ -34,9 +34,10 @@ from broker import (
     get_effective_max_capital_total_bot, get_or_seed_capital_allocations,
     CAPITAL_ALLOCATION_CATEGORIES,
     get_portfolio_value, get_alpaca_account_snapshot, count_trading_days,
-    get_pause_status,
+    get_pause_status, place_trade, GuardrailViolation,
 )
-from rule_engine import get_market_regime
+from rule_engine import get_market_regime, SignalResult
+import confirm_execution
 import yfinance as yf
 
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
@@ -145,6 +146,139 @@ async def saxo_callback(code: str = None, error: str = None):
             </body></html>
         """)
     return {"error": "Kein Code erhalten"}
+
+
+# ══════════════════════════════════════════════════════════════════
+# CONFIRM-TIER CHUNK 2b (2026-08-11) – Bestätigungskanäle
+# ══════════════════════════════════════════════════════════════════
+# Zwei Kanäle für dieselbe pending_confirmations-Zeile: der Email-Magic-Link
+# unten (öffentlich, KEIN Login - der Token selbst ist die Authentifizierung,
+# analog zu /saxo/callback oben) und die Dashboard-Queue weiter unten
+# (hinter dem protected-Router, user_id kommt aus dem JWT). Dieses Modul
+# importiert bewusst SOWOHL confirm_execution ALS AUCH broker.place_trade -
+# genau die Orchestrator-Rolle, die main.py auf der Entry-Seite in Chunk 2a
+# schon hat (siehe dortige Docstring). confirm_execution.py selbst bleibt
+# unverändert frei von jedem broker.py-Import.
+
+_CONFIRM_PAGE_STYLE = (
+    "background:#161412;color:#f0ede8;font-family:Inter,sans-serif;"
+    "padding:2rem;max-width:32rem;margin:0 auto;"
+)
+
+
+def _confirm_html(inner: str) -> HTMLResponse:
+    """Gemeinsamer Rahmen für alle Confirm-Tier-HTML-Antworten - identisches
+    Farbschema wie /saxo/callback oben (einzige bisherige öffentliche HTML-Seite
+    dieses Service, siehe Aufgabe Punkt 1: Stilkonsistenz)."""
+    return HTMLResponse(content=f'<html><body style="{_CONFIRM_PAGE_STYLE}">{inner}</body></html>')
+
+
+def _pending_details_html(pending) -> str:
+    return f"""
+        <p>Ticker: <b>{pending.ticker}</b></p>
+        <p>Menge: <b>{pending.qty_or_amount}</b></p>
+        <p>Preis zum Signalzeitpunkt: <b>${pending.signal_price:.2f}</b></p>
+        <p>Zeitpunkt: <b>{pending.signal_timestamp.strftime('%d.%m.%Y %H:%M')} UTC</b></p>
+        <p>Läuft ab: <b>{pending.expires_at.strftime('%d.%m.%Y %H:%M')} UTC</b></p>
+    """
+
+
+def _resolve_confirmation(pending, action: str) -> dict:
+    """
+    Gemeinsame Bestätigungs-/Ablehnungs-Logik für BEIDE Kanäle (Email-Token
+    und Dashboard/JWT) - stellt sicher, dass Race-Condition-Schutz (try_claim)
+    und Order-Ausführung für beide identisch laufen, keine duplizierte Logik.
+
+    action='confirm': atomarer Claim auf 'confirmed' (siehe confirm_execution.
+    try_claim - Race-Condition-Schutz, Aufgabe Punkt 5), danach Rekonstruktion
+    von SignalResult/llm_result aus den in Chunk 2b hinterlegten JSON-
+    Payloads und EIN unveränderter place_trade()-Aufruf (identisch zum
+    Auto-Pfad). action='reject': atomarer Claim auf 'rejected', KEINE
+    Order-Ausführung.
+
+    Gibt {"ok": bool, "message": str, "trade_id": int|None} zurück - nie
+    eine Exception (Guardrail-/Ausführungsfehler NACH erfolgreicher
+    Bestätigung werden als message zurückgegeben, die Zeile bleibt
+    'confirmed' stehen - die Bestätigungsabsicht selbst war gültig, nur die
+    Ausführung ist gescheitert; siehe Aufgabe für den offenen Punkt "was
+    passiert bei Ausführungsfehler nach Bestätigung", hier bewusst sichtbar
+    statt stillschweigend verworfen).
+    """
+    new_status = confirm_execution.STATUS_CONFIRMED if action == "confirm" else confirm_execution.STATUS_REJECTED
+    claimed = confirm_execution.try_claim(pending.id, new_status)
+    if claimed is None:
+        return {"ok": False, "message": "Bereits bearbeitet (z.B. über den anderen Kanal) oder nicht mehr gültig.", "trade_id": None}
+
+    if action == "reject":
+        return {"ok": True, "message": "Abgelehnt – es wird keine Order platziert.", "trade_id": None}
+
+    if not claimed.signal_payload:
+        return {"ok": False, "message": "Bestätigt, aber keine Signal-Daten hinterlegt (technischer Fehler) – keine Order platziert.", "trade_id": None}
+
+    try:
+        signal_data = json.loads(claimed.signal_payload)
+        llm_result = json.loads(claimed.llm_payload) if claimed.llm_payload else {}
+        signal = SignalResult(**signal_data)
+        trade = place_trade(signal, llm_result, claimed.user_id)
+    except GuardrailViolation as gv:
+        return {"ok": False, "message": f"Bestätigt, aber ein Guardrail hat die Order verhindert: {gv}", "trade_id": None}
+    except Exception as e:
+        return {"ok": False, "message": f"Bestätigt, aber ein unerwarteter Fehler ist aufgetreten: {e}", "trade_id": None}
+
+    if trade is None:
+        return {"ok": False, "message": "Bestätigt, aber die Order konnte nicht platziert werden (z.B. kein Kapital mehr verfügbar) – bitte im Dashboard prüfen.", "trade_id": None}
+    return {"ok": True, "message": f"Order platziert (Trade #{trade.id}).", "trade_id": trade.id}
+
+
+@app.get("/api/confirm-execution/{token}")
+def get_confirmation_page(token: str):
+    """
+    Öffentliche Bestätigungsseite (Magic Link aus der Email, siehe
+    confirm_execution.send_confirmation_email) - KEIN Login nötig, der Token
+    selbst ist die Authentifizierung (32 Byte Zufall, siehe trading_shared.
+    confirm_execution.generate_confirmation_token). Zeigt die Trade-Details
+    und zwei Formulare (Bestätigen/Ablehnen, reine HTML-POST-Forms - kein
+    JavaScript nötig, funktioniert auch in restriktiven Email-Client-
+    Browsern).
+    """
+    pending = confirm_execution.get_pending_by_token(token)
+    if pending is None:
+        return _confirm_html('<h2 style="color:#e05252">Link ungültig</h2><p>Dieser Bestätigungs-Link existiert nicht (mehr).</p>')
+
+    if pending.status != confirm_execution.STATUS_PENDING:
+        status_label = {"confirmed": "bereits bestätigt", "rejected": "bereits abgelehnt", "expired": "abgelaufen"}.get(pending.status, pending.status)
+        return _confirm_html(f'<h2 style="color:#c9a252">Bereits bearbeitet</h2>{_pending_details_html(pending)}<p>Status: <b>{status_label}</b></p>')
+
+    return _confirm_html(f"""
+        <h2 style="color:#c9a252">⏳ Bestätigung nötig</h2>
+        {_pending_details_html(pending)}
+        <form method="POST" action="/api/confirm-execution/{token}/confirm" style="display:inline">
+            <button type="submit" style="background:#3a9e6c;color:#fff;border:none;padding:0.6rem 1.2rem;border-radius:6px;margin-right:0.5rem;cursor:pointer;">Bestätigen</button>
+        </form>
+        <form method="POST" action="/api/confirm-execution/{token}/reject" style="display:inline">
+            <button type="submit" style="background:#8a3a3a;color:#fff;border:none;padding:0.6rem 1.2rem;border-radius:6px;cursor:pointer;">Ablehnen</button>
+        </form>
+    """)
+
+
+@app.post("/api/confirm-execution/{token}/confirm")
+def post_confirm_execution(token: str):
+    pending = confirm_execution.get_pending_by_token(token)
+    if pending is None:
+        return _confirm_html('<h2 style="color:#e05252">Link ungültig</h2><p>Dieser Bestätigungs-Link existiert nicht (mehr).</p>')
+    result = _resolve_confirmation(pending, "confirm")
+    color = "#3a9e6c" if result["ok"] else "#e05252"
+    return _confirm_html(f'<h2 style="color:{color}">{"✅ Bestätigt" if result["ok"] else "⚠️ Hinweis"}</h2><p>{result["message"]}</p>')
+
+
+@app.post("/api/confirm-execution/{token}/reject")
+def post_reject_execution(token: str):
+    pending = confirm_execution.get_pending_by_token(token)
+    if pending is None:
+        return _confirm_html('<h2 style="color:#e05252">Link ungültig</h2><p>Dieser Bestätigungs-Link existiert nicht (mehr).</p>')
+    result = _resolve_confirmation(pending, "reject")
+    color = "#3a9e6c" if result["ok"] else "#e05252"
+    return _confirm_html(f'<h2 style="color:{color}">{"🚫 Abgelehnt" if result["ok"] else "⚠️ Hinweis"}</h2><p>{result["message"]}</p>')
 
 
 @protected.get("/api/overview")
@@ -919,6 +1053,42 @@ def update_entry_learning_mode(body: dict, user_id: int = Depends(get_current_us
         set_bot_config(session, "ENTRY_LEARNING_MODE", "true" if body.get("lernmodus") else "false")
         session.commit()
     return {"ok": True}
+
+
+# Confirm-Tier Chunk 2b: Dashboard-Kanal (Kanal 2, siehe /api/confirm-
+# execution/{token} oben für Kanal 1). user_id kommt hier IMMER aus dem JWT
+# (Depends(get_current_user_id), Router-weite Dependency) - niemals aus dem
+# Request-Body oder einem URL-Parameter (Aufgabe Punkt 3). Ownership wird
+# über confirm_execution.get_pending_by_id_for_user() erzwungen - eine ID,
+# die einem ANDEREN Nutzer gehört, ist für den Aufrufer nicht von einer
+# nicht-existenten ID unterscheidbar (kein Leak).
+@protected.get("/api/pending-confirmations")
+def list_pending_confirmations(user_id: int = Depends(get_current_user_id)):
+    rows = confirm_execution.list_pending_for_user(user_id)
+    return [
+        {
+            "id": r.id, "ticker": r.ticker, "qty_or_amount": r.qty_or_amount,
+            "signal_price": r.signal_price, "signal_timestamp": r.signal_timestamp.isoformat(),
+            "expires_at": r.expires_at.isoformat(), "broker": r.broker,
+        }
+        for r in rows
+    ]
+
+
+@protected.post("/api/pending-confirmations/{pending_id}/confirm")
+def confirm_pending_confirmation(pending_id: int, user_id: int = Depends(get_current_user_id)):
+    pending = confirm_execution.get_pending_by_id_for_user(pending_id, user_id)
+    if pending is None:
+        raise HTTPException(status_code=404, detail="Nicht gefunden")
+    return _resolve_confirmation(pending, "confirm")
+
+
+@protected.post("/api/pending-confirmations/{pending_id}/reject")
+def reject_pending_confirmation(pending_id: int, user_id: int = Depends(get_current_user_id)):
+    pending = confirm_execution.get_pending_by_id_for_user(pending_id, user_id)
+    if pending is None:
+        raise HTTPException(status_code=404, detail="Nicht gefunden")
+    return _resolve_confirmation(pending, "reject")
 
 
 app.include_router(protected)

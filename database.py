@@ -631,6 +631,20 @@ class PendingConfirmation(Base):
     price_tolerance_pct_snapshot = Column(Float, nullable=False)
     created_at                   = Column(DateTime, default=datetime.utcnow)
     resolved_at                  = Column(DateTime, nullable=True)
+    # Chunk 2b (2026-08-11, siehe confirm_execution.py-Moduldoc): bei
+    # Bestätigung muss broker.place_trade(signal, llm_result, user_id) exakt
+    # wie beim ursprünglichen Auto-Entry aufgerufen werden können - Chunk 1s
+    # Schema deckte nur Anzeige-Felder ab (Ticker/Menge/Preis), nicht die
+    # vollen SignalResult-/LLM-Daten, die place_trade() tatsächlich braucht
+    # (stop_loss/take_profit/direction/instrument_type/score/atr/sl_pct/
+    # tp_pct/sector/score_breakdown bzw. sentiment_score/summary/risks).
+    # Als JSON-Text gespeichert (identisches Muster wie Trade.score_breakdown/
+    # Trade.llm_risks) statt einzelner Spalten je Feld - hält das Schema
+    # schlank und muss nicht bei jeder künftigen SignalResult-Erweiterung
+    # migriert werden. Nullable, da Chunk 1 bereits eine bestehende Tabelle
+    # ohne diese Spalten angelegt hat (additive Migration, siehe unten).
+    signal_payload                = Column(Text, nullable=True)
+    llm_payload                   = Column(Text, nullable=True)
 
 
 class CapitalFlow(Base):
@@ -935,6 +949,7 @@ def init_db():
     _migrate_daily_log_user_id_column()
     _migrate_daily_log_formula_version_column()
     _migrate_daily_position_snapshot_user_id_column()
+    _migrate_pending_confirmations_payload_columns()
     _migrate_current_weights_broker_column()
     _migrate_capital_allocations_user_id_column()
     _seed_saxo_token_from_env()
@@ -1227,6 +1242,19 @@ def _migrate_daily_position_snapshot_user_id_column():
         conn.execute(text("ALTER TABLE daily_position_snapshot ADD COLUMN IF NOT EXISTS user_id INTEGER"))
         conn.execute(text("UPDATE daily_position_snapshot SET user_id = :uid WHERE user_id IS NULL"), {"uid": DEFAULT_USER_ID})
         conn.execute(text("ALTER TABLE daily_position_snapshot ALTER COLUMN user_id SET NOT NULL"))
+
+
+def _migrate_pending_confirmations_payload_columns():
+    """
+    Confirm-Tier Chunk 2b (2026-08-11, siehe PendingConfirmation-Docstring).
+    Rein additiv, kein Backfill nötig - jede Bestandszeile stammt aus Chunk
+    2a (main._execute_or_queue_entry), wo noch keine Bestätigung möglich war;
+    NULL bleibt hier einfach "kann nicht mehr automatisch bestätigt werden",
+    kein Datenverlust-Risiko.
+    """
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE pending_confirmations ADD COLUMN IF NOT EXISTS signal_payload TEXT"))
+        conn.execute(text("ALTER TABLE pending_confirmations ADD COLUMN IF NOT EXISTS llm_payload TEXT"))
 
 
 def _migrate_current_weights_broker_column():

@@ -76,6 +76,12 @@ SAXO_AUTH_BASE_URL = "https://live.logonvalidation.net"
 SAXO_TOKEN_URL     = f"{SAXO_AUTH_BASE_URL}/token"
 SAXO_API_BASE_URL  = "https://gateway.saxobank.com/openapi/"
 
+# Confirm-Tier (Chunk 2b, 2026-08-11): Basis-URL für den Magic-Link in der
+# Bestätigungs-Mail (siehe confirm_execution.send_confirmation_email) - gleiches
+# Muster wie SAXO_REDIRECT_URI oben, Default auf die produktive trading_react-
+# Domain.
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://app.ai-tradingbot.de")
+
 # Nur für den EINMALIGEN initialen DB-Seed genutzt (siehe
 # database._seed_saxo_token_from_env), direkt nach dem manuellen OAuth
 # Authorization Code Flow. Sollten aus .env wieder entfernt werden, sobald

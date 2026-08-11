@@ -6,6 +6,7 @@ Ablauf: VIX-Check → Watchlist scannen → Guardrails → LLM → Trade
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime
+import dataclasses
 import math
 import pytz
 from sqlalchemy import text
@@ -117,6 +118,18 @@ def _execute_or_queue_entry(signal, llm_result: dict, user_id: int):
     if not confirm_execution.is_confirm_mode(user_id):
         return place_trade(signal, llm_result, user_id)
 
+    # Dedup (Chunk 2b, Aufgabe Punkt 10): derselbe Kandidat kann über mehrere
+    # Entry-Slots/Scans hinweg erneut ein Signal auslösen (z.B. weiterhin
+    # über der Schwelle bewertet), solange die vorherige Bestätigung noch
+    # nicht bearbeitet wurde - ohne diesen Check gäbe es einen neuen PENDING-
+    # Eintrag UND eine neue Mail pro Slot für denselben, längst schon zur
+    # Bestätigung vorgemerkten Trade.
+    existing = confirm_execution.find_existing_pending(user_id, signal.ticker)
+    if existing is not None:
+        print(f"   ⏳ Nutzer {user_id}: {signal.ticker} hat bereits eine offene Bestätigung "
+              f"(PENDING #{existing.id}) – kein Duplikat erzeugt.")
+        return None
+
     preview_qty = calculate_quantity(
         signal.current_price, get_user_live_config(user_id)["MAX_CAPITAL_PER_TRADE"]
     )
@@ -125,12 +138,20 @@ def _execute_or_queue_entry(signal, llm_result: dict, user_id: int):
               f"auch nur eine Bruchteil-Aktie (Confirm-Tier-Vorschau).")
         return None
 
+    # signal_payload/llm_payload (Chunk 2b): vollständige Momentaufnahme via
+    # dataclasses.asdict() statt Feld-für-Feld-Auswahl - robuster gegen
+    # künftige SignalResult-Erweiterungen (place_trade() bräuchte sie dann
+    # automatisch mit, ohne dass dieser Aufrufer angepasst werden muss).
+    # llm_result ist bereits ein reines, JSON-serialisierbares Dict (siehe
+    # llm_analyst.analyze_with_llm), wird unverändert übernommen.
     pending = confirm_execution.create_pending_confirmation(
         user_id=user_id, ticker=signal.ticker,
         quantity=preview_qty, signal_price=signal.current_price,
+        signal_payload=dataclasses.asdict(signal), llm_payload=llm_result,
     )
     print(f"   ⏳ Nutzer {user_id}: {signal.ticker} wartet auf Bestätigung "
           f"(Confirm-Tier, PENDING #{pending.id}) – KEINE Order platziert.")
+    confirm_execution.send_confirmation_email(pending)
     return None
 
 
