@@ -13,7 +13,7 @@ from sqlalchemy import text
 from config import (
     LONG_WATCHLIST, ACTIVE_SHORT_INSTRUMENTS, VOLATILE_WATCHLIST,
     PROFIT_ALERT_TARGET, MAX_CAPITAL_TOTAL, TRADING_MODE, DEFAULT_USER_ID,
-    validate_config, get_live_config,
+    ALERT_EMAIL, validate_config, get_live_config,
 )
 from database import (
     init_db, get_session, save_daily_snapshot, BotState, ScanLog,
@@ -21,6 +21,7 @@ from database import (
     get_open_trades, FairValueCache, BotHeartbeat,
     save_position_snapshot, get_previous_position_snapshot,
     get_user_live_config, get_connected_alpaca_users, get_total_capital_in_trades,
+    get_user_email,
 )
 from notifications import send_email
 from rule_engine import scan_watchlist_parallel, check_vix, get_market_regime, get_benchmark_performance
@@ -57,23 +58,36 @@ def _get_current_price_for_snapshot(ticker: str, fallback: float) -> float:
         return fallback
 
 
-def capture_daily_position_snapshot():
+def _nearest_entry_slot_label(session, dt_et) -> str:
     """
-    Speichert den Tages-Snapshot aller offenen Positionen + Gesamt-Portfoliowert
-    (siehe database.DailyPositionSnapshot) – Scheduler-Job 16:05 ET, kurz NACH
-    dem letzten Monitoring-Zyklus des Tages (run_monitoring_cycle läuft bis
-    16:00 ET, siehe main(): CronTrigger(hour="9-16", ...)). Dient gleichzeitig
-    als "Vortag-Endstand" UND als Vergleichsbasis für die Tages-Mail des
-    nächsten Tages (siehe send_daily_summary_email) – ein Snapshot-Job deckt
-    beides ab, kein separater Morgen-Snapshot nötig.
+    Ordnet einen Trade-Zeitpunkt (ET) dem nächstgelegenen konfigurierten
+    Entry-Slot zu (analog zu trading_bot_saxo/trading_api_saxo._slot_label).
+    Genutzt von send_daily_summary_email() für die per-Nutzer-Trades-Liste
+    statt eines JOINs über scan_log.trade_id (Multi-Tenant-Fix, 2026-08-11):
+    log_scan_results() hält je Ticker/Slot nur EINEN trade_id-Wert
+    (executed_trades_by_ticker ist ein einfaches ticker->trade_id-Dict) - kaufen
+    zwei Nutzer denselben Ticker im selben Slot, überschreibt der zweite den
+    ersten im Dict, scan_log verliert also den ersten trade_id komplett. Ein
+    JOIN über scan_log.trade_id wäre für den überschriebenen Nutzer lossy;
+    die direkte Zeit-zu-Slot-Zuordnung über trades.created_at ist dagegen für
+    JEDEN Trade unabhängig korrekt, unabhängig davon was sonst noch in
+    scan_log steht.
     """
-    et_tz = pytz.timezone("America/New_York")
-    today = datetime.now(et_tz).date()
-    portfolio_value = get_portfolio_value()
+    slots = get_active_entry_time_slots(session)
+    if not slots:
+        return "?"
+    minutes = dt_et.hour * 60 + dt_et.minute
+    closest = min(slots, key=lambda s: abs((s.stunde_et * 60 + s.minute_et) - minutes))
+    return f"{closest.stunde_et:02d}:{closest.minute_et:02d}"
+
+
+def _capture_daily_position_snapshot_for_user(user_id: int, today) -> None:
+    """Ein Nutzer-Snapshot – siehe capture_daily_position_snapshot()."""
+    portfolio_value = get_portfolio_value(user_id)
 
     positions = []
     with get_session() as session:
-        for trade in get_open_trades(session):
+        for trade in get_open_trades(session, user_id):
             # Fix 2026-07-31: entry_price ist None, solange die Kauf-Order
             # noch WAITING_FILL ist (siehe broker.place_trade/
             # _reconcile_pending_entry_fill) - PnL lässt sich dafür noch nicht
@@ -101,99 +115,83 @@ def capture_daily_position_snapshot():
                 "unrealized_pnl_pct": (current_price - trade.entry_price) / trade.entry_price * 100,
             })
 
-        save_position_snapshot(session, today, portfolio_value, positions)
+        save_position_snapshot(session, today, portfolio_value, positions, user_id=user_id)
         session.commit()
 
-    print(f"📸 Positions-Snapshot gespeichert ({today}): {len(positions)} offene Position(en), "
-          f"Portfolio-Wert ${portfolio_value:.2f}")
+    print(f"📸 Nutzer {user_id}: Positions-Snapshot gespeichert ({today}): {len(positions)} offene "
+          f"Position(en), Portfolio-Wert ${portfolio_value:.2f}")
 
 
-def send_daily_summary_email():
+def capture_daily_position_snapshot():
     """
-    Verschickt EINE Tages-Zusammenfassung nach Handelsschluss (Scheduler-Job
-    16:10 ET, siehe main() – 5 Min nach capture_daily_position_snapshot, damit
-    der Vorabend-Vergleich auf einem bereits geschriebenen Snapshot aufbaut).
-    Zeigt pro Slot die tatsächlich ausgeführten Trades im Detail (Ticker,
-    Entry, SL/TP je Preis+%, Kapital, Menge) bzw. bei tradefreien Slots einen
-    kurzen Grund, sowie einen Vorabend-vs-Heute-Vergleich aller offenen
-    Positionen und des Gesamt-Portfoliowerts (siehe database.
-    DailyPositionSnapshot/get_previous_position_snapshot).
+    Speichert den Tages-Snapshot aller offenen Positionen + Gesamt-Portfoliowert
+    JEDES verbundenen Nutzers (siehe database.DailyPositionSnapshot) –
+    Scheduler-Job 16:05 ET, kurz NACH dem letzten Monitoring-Zyklus des Tages
+    (run_monitoring_cycle läuft bis 16:00 ET, siehe main():
+    CronTrigger(hour="9-16", ...)). Dient gleichzeitig als "Vortag-Endstand"
+    UND als Vergleichsbasis für die Tages-Mail des nächsten Tages (siehe
+    send_daily_summary_email) – ein Snapshot-Job deckt beides ab, kein
+    separater Morgen-Snapshot nötig.
+
+    Multi-Tenant-Fix (2026-08-11): lief bis dahin als einzelner globaler Job
+    nur für Daniel (DEFAULT_USER_ID implizit über get_portfolio_value()/
+    get_open_trades()). Jetzt analog zu capital_flows_sync_job() eine
+    Schleife über get_connected_user_ids() mit Fehler-Isolierung pro
+    Nutzer – ein fehlgeschlagener Snapshot (z.B. abgelaufene persönliche
+    Alpaca-Keys) darf die Snapshots der anderen Nutzer nicht verhindern.
     """
     et_tz = pytz.timezone("America/New_York")
     today = datetime.now(et_tz).date()
 
+    for uid in get_connected_user_ids():
+        try:
+            _capture_daily_position_snapshot_for_user(uid, today)
+        except Exception as e:
+            print(f"🚨 Nutzer {uid}: Positions-Snapshot fehlgeschlagen ({e}) – andere Nutzer nicht betroffen.")
+
+
+def _send_daily_summary_email_for_user(user_id: int, today, slots_heute, no_trade_reasons) -> None:
+    """
+    Baut+verschickt die Tages-Mail EINES Nutzers – siehe
+    send_daily_summary_email() für slots_heute/no_trade_reasons (geteilter
+    Markt-Scan, für jeden Nutzer identisch, siehe dortige Begründung).
+
+    Alles andere hier ist strikt auf user_id gescoped: eigene Trades (über
+    _nearest_entry_slot_label statt der kollisionsanfälligen scan_log.
+    trade_id-Zuordnung, siehe dortige Docstring), eigene offene Positionen,
+    eigener Portfolio-Wert, eigener Vorabend-Vergleich, eigene 30-Tage-
+    Performance, eigener Pause-Status.
+    """
+    recipient = ALERT_EMAIL if user_id == DEFAULT_USER_ID else get_user_email(user_id)
+    if not recipient:
+        print(f"⚠️  Nutzer {user_id}: keine E-Mail-Adresse in pos_users hinterlegt – Tages-Mail übersprungen.")
+        return
+
     with get_session() as session:
-        slots_heute = session.execute(text("""
-            SELECT slot_et,
-                   COUNT(*) as gescannt,
-                   SUM(CASE WHEN score >= 65 THEN 1 ELSE 0 END) as ueber_65,
-                   SUM(CASE WHEN trade_executed THEN 1 ELSE 0 END) as trades,
-                   ROUND(AVG(score)::numeric, 1) as avg_score
-            FROM scan_log
-            WHERE DATE(scan_time AT TIME ZONE 'America/New_York') = :today
-              AND score > 0
-            GROUP BY slot_et
-            ORDER BY slot_et
-        """), {"today": today}).fetchall()
+        own_trade_rows = session.execute(text("""
+            SELECT ticker, entry_price, stop_loss, take_profit, sl_pct, tp_pct,
+                   capital_used, quantity, created_at
+            FROM trades
+            WHERE user_id = :uid
+              AND DATE(created_at AT TIME ZONE 'America/New_York') = :today
+            ORDER BY created_at
+        """), {"uid": user_id, "today": today}).fetchall()
 
-        trade_rows = session.execute(text("""
-            SELECT sl.slot_et, sl.ticker, t.entry_price, t.stop_loss, t.take_profit,
-                   t.sl_pct, t.tp_pct, t.capital_used, t.quantity
-            FROM scan_log sl
-            JOIN trades t ON t.id = sl.trade_id
-            WHERE DATE(sl.scan_time AT TIME ZONE 'America/New_York') = :today
-              AND sl.trade_executed = true
-            ORDER BY sl.slot_et, sl.ticker
-        """), {"today": today}).fetchall()
-
+        et_tz = pytz.timezone("America/New_York")
         trades_by_slot: dict = {}
-        for row in trade_rows:
-            trades_by_slot.setdefault(row.slot_et, []).append(row)
-
-        # Grund fürs Ausbleiben eines Trades je tradefreiem Slot: entweder kein
-        # Signal über Schwellwert, oder der bestbewertete freigegebene Kandidat
-        # wurde von einem Guardrail geblockt (siehe run_entry_cycle).
-        no_trade_reasons: dict = {}
-        for slot in slots_heute:
-            if slot.trades:
-                continue
-            if not slot.ueber_65:
-                no_trade_reasons[slot.slot_et] = f"Kein Signal über Schwellwert (Ø Score {slot.avg_score})"
-                continue
-            reason_row = session.execute(text("""
-                SELECT guardrail_reason FROM scan_log
-                WHERE slot_et = :slot_et
-                  AND DATE(scan_time AT TIME ZONE 'America/New_York') = :today
-                  AND score >= 65
-                ORDER BY score DESC LIMIT 1
-            """), {"slot_et": slot.slot_et, "today": today}).fetchone()
-            no_trade_reasons[slot.slot_et] = (
-                reason_row.guardrail_reason if reason_row and reason_row.guardrail_reason
-                else "Kein Trade ausgeführt (Grund nicht ermittelbar)"
-            )
+        for row in own_trade_rows:
+            created_et = row.created_at.replace(tzinfo=pytz.utc).astimezone(et_tz) if row.created_at.tzinfo is None \
+                else row.created_at.astimezone(et_tz)
+            trades_by_slot.setdefault(_nearest_entry_slot_label(session, created_et), []).append(row)
 
         open_trades = session.execute(text("""
             SELECT id, ticker, entry_price, quantity, capital_used
-            FROM trades WHERE status = 'OPEN'
-        """)).fetchall()
+            FROM trades WHERE status = 'OPEN' AND user_id = :uid
+        """), {"uid": user_id}).fetchall()
 
-        # Pause-Sichtbarkeit in der Tages-Mail (AUFGABE 2, 2026-08-06): erfasst
-        # sowohl das bereits bestehende Tagesverlustlimit als auch den neuen
-        # Verlustserie-Cooldown. guardrail_reason wird von run_entry_cycle für
-        # JEDEN durch check_guardrails() geblockten Kandidaten in scan_log
-        # geschrieben (siehe log_scan_results) – damit lässt sich auch ein
-        # inzwischen bereits wieder abgelaufener Cooldown noch rückblickend
-        # für "heute" erkennen (siehe pause_hits_today unten).
-        pause_hits_today = session.execute(text("""
-            SELECT DISTINCT guardrail_reason FROM scan_log
-            WHERE DATE(scan_time AT TIME ZONE 'America/New_York') = :today
-              AND (guardrail_reason LIKE 'Tägliches Verlustlimit erreicht%'
-                   OR guardrail_reason LIKE 'Verlustserie-Cooldown aktiv%')
-        """), {"today": today}).fetchall()
+        prev_snapshot = get_previous_position_snapshot(session, today, user_id=user_id)
 
-        prev_snapshot = get_previous_position_snapshot(session, today)
-
-    portfolio_value = get_portfolio_value()
+    portfolio_value = get_portfolio_value(user_id)
 
     subject = f"📊 Trading Bot – Tageszusammenfassung {today.strftime('%d.%m.%Y')}"
 
@@ -214,12 +212,17 @@ Portfolio-Wert heute Abend: ${portfolio_value:.2f}
     else:
         body += "Erster Tag mit Snapshot-Tracking, Vergleich ab morgen verfügbar.\n"
 
-    # Pause-Hinweis (AUFGABE 2, 2026-08-06): kombiniert den aktuellen
-    # Pause-Zustand (get_pause_status, z.B. falls der Cooldown noch bis nach
-    # Mail-Versand läuft) mit heute im Tagesverlauf aufgetretenen Treffern
-    # (pause_hits_today, deckt auch einen inzwischen schon wieder
-    # abgelaufenen Verlustserie-Cooldown ab).
-    pause_status = get_pause_status()
+    # Pause-Hinweis (AUFGABE 2, 2026-08-06, angepasst 2026-08-11): nutzt jetzt
+    # AUSSCHLIESSLICH get_pause_status(user_id) - der frühere zusätzliche
+    # pause_hits_today-Blick in scan_log.guardrail_reason ist entfallen, weil
+    # dieses Feld je Ticker/Slot nur EINEN Wert trägt (analog zum trade_id-
+    # Problem in _nearest_entry_slot_label) und bei mehreren Nutzern nicht
+    # zuverlässig DIESEM Nutzer zugeordnet werden kann - ein "wurde heute
+    # erreicht"-Hinweis hätte fälschlich für einen Nutzer erscheinen können,
+    # dessen eigenes Limit nie erreicht wurde. get_pause_status(user_id)
+    # bleibt die zuverlässige, korrekt gescopte Quelle für den AKTUELLEN
+    # Pause-Zustand.
+    pause_status = get_pause_status(user_id)
     pause_notes = set()
     for r in pause_status["reasons"]:
         if r["reason"] == "daily_loss_limit":
@@ -229,11 +232,6 @@ Portfolio-Wert heute Abend: ${portfolio_value:.2f}
                 f"Verlustserie-Cooldown aktiv ({r['consecutive_losses']} Verluste in Folge) – "
                 f"pausiert bis {r['until']}."
             )
-    for row in pause_hits_today:
-        if row.guardrail_reason.startswith("Tägliches Verlustlimit erreicht"):
-            pause_notes.add("Tagesverlust-Limit wurde heute erreicht.")
-        elif row.guardrail_reason.startswith("Verlustserie-Cooldown aktiv"):
-            pause_notes.add("Verlustserie-Cooldown wurde heute ausgelöst.")
     if pause_notes:
         body += "\n⚠️ BOT PAUSIERT\n"
         for note in sorted(pause_notes):
@@ -264,10 +262,39 @@ Slot {slot.slot_et} ET (gescannt: {slot.gescannt}, über Schwellwert: {slot.uebe
                     f"Kapital ${t.capital_used:.2f} | Menge {t.quantity:.4f}\n"
                 )
         else:
-            body += f"  Kein Trade – {no_trade_reasons.get(slot.slot_et, 'Kein Trade ausgeführt')}\n"
+            # no_trade_reasons ist der geteilte Scan-Grund (siehe send_daily_
+            # summary_email-Docstring) - für die meisten Fälle (kein Signal
+            # über Schwellwert, Slot-Cap) für jeden Nutzer identisch gültig;
+            # bei einem kapitalabhängigen Guardrail kann er von DIESES
+            # Nutzers tatsächlichem individuellem Grund abweichen.
+            body += f"  Kein eigener Trade – {no_trade_reasons.get(slot.slot_et, 'Kein Trade ausgeführt')}\n"
 
-    trades_heute = sum(s.trades for s in slots_heute)
-    body += f"\nGESAMT HEUTE\nTrades ausgeführt: {trades_heute}\n"
+    # Absicherung: ein eigener Trade, dessen per Zeit ermittelter Slot in
+    # slots_heute NICHT vorkommt (z.B. kein/kaum scan_log für diesen Slot
+    # heute), würde sonst kommentarlos aus der Mail verschwinden, obwohl er
+    # tatsächlich existiert - trades_by_slot bleibt die eigentliche Quelle
+    # der Wahrheit (direkt aus trades, siehe Docstring oben), slots_heute nur
+    # die Anzeige-Gruppierung.
+    extra_slots = sorted(set(trades_by_slot) - {s.slot_et for s in slots_heute})
+    for slot_et in extra_slots:
+        body += f"\nSlot {slot_et} ET:\n"
+        for t in trades_by_slot[slot_et]:
+            if t.entry_price is None:
+                body += (
+                    f"  {t.ticker}: Kauf-Order noch nicht gefüllt (wartet auf Fill-Bestätigung) | "
+                    f"Kapital reserviert ${t.capital_used:.2f} | Menge {t.quantity:.4f}\n"
+                )
+                continue
+            sl_pct = t.sl_pct * 100 if t.sl_pct is not None else (t.entry_price - t.stop_loss) / t.entry_price * 100
+            tp_pct = t.tp_pct * 100 if t.tp_pct is not None else (t.take_profit - t.entry_price) / t.entry_price * 100
+            body += (
+                f"  {t.ticker}: Entry ${t.entry_price:.2f} | "
+                f"SL ${t.stop_loss:.2f} (-{sl_pct:.1f}%) | TP ${t.take_profit:.2f} (+{tp_pct:.1f}%) | "
+                f"Kapital ${t.capital_used:.2f} | Menge {t.quantity:.4f}\n"
+            )
+
+    trades_heute = len(own_trade_rows)
+    body += f"\nGESAMT HEUTE\nEigene Trades ausgeführt: {trades_heute}\n"
 
     body += "\nOFFENE POSITIONEN – TAGESVERGLEICH\n"
     if open_trades:
@@ -296,7 +323,9 @@ Slot {slot.slot_et} ET (gescannt: {slot.gescannt}, über Schwellwert: {slot.uebe
         body += "  Keine offenen Positionen\n"
 
     # Performance-Vergleich vs. Benchmarks (siehe Feature Benchmark-Vergleich)
-    bot_performance = get_bot_performance(days=30)
+    # - bot_performance ist user_id-gescoped, benchmarks (S&P 500/Nasdaq)
+    # bleiben bewusst marktweit/global (keine Nutzerbindung möglich/nötig).
+    bot_performance = get_bot_performance(days=30, user_id=user_id)
     benchmarks = get_benchmark_performance(days=30)
     if bot_performance is not None:
         sp500 = benchmarks.get("S&P 500")
@@ -308,8 +337,86 @@ S&P 500:   {f'{sp500:+.2f}%' if sp500 is not None else 'N/A'}
 Nasdaq:    {f'{nasdaq:+.2f}%' if nasdaq is not None else 'N/A'}
 """
 
-    send_email(subject, body)
-    print(f"✅ Tages-E-Mail gesendet ({len(slots_heute)} Slots)")
+    send_email(subject, body, to=recipient)
+    print(f"✅ Nutzer {user_id}: Tages-E-Mail gesendet an {recipient} ({len(slots_heute)} Slots)")
+
+
+def send_daily_summary_email():
+    """
+    Verschickt JEDEM verbundenen Nutzer seine EIGENE Tages-Zusammenfassung
+    nach Handelsschluss (Scheduler-Job 16:10 ET, siehe main() – 5 Min nach
+    capture_daily_position_snapshot, damit der Vorabend-Vergleich auf einem
+    bereits geschriebenen Snapshot aufbaut). Zeigt pro Slot die tatsächlich
+    ausgeführten EIGENEN Trades im Detail (Ticker, Entry, SL/TP je Preis+%,
+    Kapital, Menge) bzw. bei tradefreien Slots einen kurzen Grund, sowie
+    einen Vorabend-vs-Heute-Vergleich der EIGENEN offenen Positionen und des
+    EIGENEN Gesamt-Portfoliowerts (siehe database.DailyPositionSnapshot/
+    get_previous_position_snapshot).
+
+    Multi-Tenant-Fix (2026-08-11): lief bis dahin als einzelner globaler Job
+    nur für Daniel, IMMER an ALERT_EMAIL. Jetzt eine Schleife über
+    get_connected_user_ids() (analog capital_flows_sync_job/capture_daily_
+    position_snapshot), jeder Nutzer bekommt eine eigene Mail an seine
+    eigene, in pos_users hinterlegte Adresse (get_user_email) - AUSSER
+    Daniel (DEFAULT_USER_ID), der weiterhin unverändert an ALERT_EMAIL geht
+    (er hat nie eigene Keys/E-Mail über den Connect-Flow hinterlegt, siehe
+    get_connected_alpaca_users-Docstring).
+
+    slots_heute/no_trade_reasons (Markt-Scan-Übersicht: gescannt/über
+    Schwellwert/Ø Score je Slot) werden EINMAL für alle Nutzer geladen -
+    derselbe geteilte Signal-Scan wie in scan_log seit jeher (siehe dessen
+    Docstring: "läuft zentral EINMAL pro Ticker/Slot ... nicht sensibel"),
+    keine Nutzerbindung nötig oder sinnvoll. Welche TRADES daraus tatsächlich
+    wurden, wird dagegen pro Nutzer separat und korrekt aus der trades-
+    Tabelle ermittelt (siehe _send_daily_summary_email_for_user).
+    """
+    et_tz = pytz.timezone("America/New_York")
+    today = datetime.now(et_tz).date()
+
+    with get_session() as session:
+        slots_heute = session.execute(text("""
+            SELECT slot_et,
+                   COUNT(*) as gescannt,
+                   SUM(CASE WHEN score >= 65 THEN 1 ELSE 0 END) as ueber_65,
+                   SUM(CASE WHEN trade_executed THEN 1 ELSE 0 END) as trades,
+                   ROUND(AVG(score)::numeric, 1) as avg_score
+            FROM scan_log
+            WHERE DATE(scan_time AT TIME ZONE 'America/New_York') = :today
+              AND score > 0
+            GROUP BY slot_et
+            ORDER BY slot_et
+        """), {"today": today}).fetchall()
+
+        # Grund fürs Ausbleiben eines Trades je tradefreiem Slot: entweder kein
+        # Signal über Schwellwert, oder der bestbewertete freigegebene Kandidat
+        # wurde von einem Guardrail geblockt (siehe run_entry_cycle). Geteilter
+        # Scan-Grund (siehe Docstring oben) - kann für einen individuellen
+        # Nutzer leicht abweichen, wenn dessen Guardrail-Treffer unterschiedlich
+        # war.
+        no_trade_reasons: dict = {}
+        for slot in slots_heute:
+            if slot.trades:
+                continue
+            if not slot.ueber_65:
+                no_trade_reasons[slot.slot_et] = f"Kein Signal über Schwellwert (Ø Score {slot.avg_score})"
+                continue
+            reason_row = session.execute(text("""
+                SELECT guardrail_reason FROM scan_log
+                WHERE slot_et = :slot_et
+                  AND DATE(scan_time AT TIME ZONE 'America/New_York') = :today
+                  AND score >= 65
+                ORDER BY score DESC LIMIT 1
+            """), {"slot_et": slot.slot_et, "today": today}).fetchone()
+            no_trade_reasons[slot.slot_et] = (
+                reason_row.guardrail_reason if reason_row and reason_row.guardrail_reason
+                else "Kein Trade ausgeführt (Grund nicht ermittelbar)"
+            )
+
+    for uid in get_connected_user_ids():
+        try:
+            _send_daily_summary_email_for_user(uid, today, slots_heute, no_trade_reasons)
+        except Exception as e:
+            print(f"🚨 Nutzer {uid}: Tages-Mail fehlgeschlagen ({e}) – andere Nutzer nicht betroffen.")
 
 
 def generate_morning_market_brief() -> str:

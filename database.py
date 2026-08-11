@@ -834,12 +834,22 @@ class DailyPositionSnapshot(Base):
     FOLGENDEN Tages (ein Job reicht, kein separater Morgen-Snapshot nötig).
     Pro Tag immer mindestens eine Zeile mit ticker=NULL (Portfolio-Total, auch
     an Tagen ganz ohne offene Positionen), plus eine Zeile je offener Position.
+
+    user_id (Multi-Tenant-Snapshot/-Mail-Fix, 2026-08-11): war bis dahin
+    komplett fehlend - capture_daily_position_snapshot()/send_daily_summary_
+    email() liefen als einzelner globaler Cron-Job nur für Daniel, siehe
+    _migrate_daily_position_snapshot_user_id_column. Additive Migration,
+    analog zu DailyLog.user_id (2026-08-04): bestehende Zeilen (ausnahmslos
+    Daniels eigene) wandern auf DEFAULT_USER_ID, KEIN Unique-Constraint nötig
+    (diese Tabelle hatte nie eines - pro Snapshot-Tag können bereits mehrere
+    Zeilen existieren, eine je offener Position plus die Total-Zeile).
     """
     __tablename__ = "daily_position_snapshot"
 
     id                 = Column(Integer, primary_key=True, autoincrement=True)
     snapshot_date       = Column(Date, nullable=False)   # ET-Handelstag
     snapshot_time       = Column(DateTime, default=datetime.utcnow)
+    user_id             = Column(Integer, nullable=False, default=DEFAULT_USER_ID)
     ticker              = Column(String(10), nullable=True)  # NULL = Portfolio-Total-Zeile
     trade_id            = Column(Integer, nullable=True)     # FK trades.id, nur bei Ticker-Zeilen
     quantity            = Column(Float, nullable=True)
@@ -847,7 +857,7 @@ class DailyPositionSnapshot(Base):
     price               = Column(Float, nullable=True)       # Kurs zum Snapshot-Zeitpunkt
     unrealized_pnl      = Column(Float, nullable=True)
     unrealized_pnl_pct  = Column(Float, nullable=True)
-    portfolio_value     = Column(Float, nullable=False)   # Gesamtwert, auf jeder Zeile eines Snapshots identisch
+    portfolio_value     = Column(Float, nullable=False)   # Gesamtwert, auf jeder Zeile EINES Nutzer-Snapshots identisch
 
 
 class EntryTimeSlot(Base):
@@ -910,6 +920,7 @@ def init_db():
     _migrate_trades_status_column_width()
     _migrate_daily_log_user_id_column()
     _migrate_daily_log_formula_version_column()
+    _migrate_daily_position_snapshot_user_id_column()
     _migrate_current_weights_broker_column()
     _migrate_capital_allocations_user_id_column()
     _seed_saxo_token_from_env()
@@ -1186,6 +1197,22 @@ def _migrate_daily_log_formula_version_column():
     """
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE daily_log ADD COLUMN IF NOT EXISTS formula_version VARCHAR(20)"))
+
+
+def _migrate_daily_position_snapshot_user_id_column():
+    """
+    Multi-Tenant-Snapshot/-Mail-Fix (2026-08-11, siehe DailyPositionSnapshot-
+    Docstring). Additive Migration, analog zu _migrate_daily_log_user_id_
+    column: Spalte ergänzen, bestehende Zeilen (ausnahmslos Daniels eigene,
+    da capture_daily_position_snapshot() bis dahin nur für ihn lief) auf
+    DEFAULT_USER_ID zurückschreiben, NOT NULL setzen. KEIN Unique-Constraint
+    nötig - diese Tabelle hatte nie eines (mehrere Zeilen pro Snapshot-Tag
+    sind das normale Format: eine je offener Position plus die Total-Zeile).
+    """
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE daily_position_snapshot ADD COLUMN IF NOT EXISTS user_id INTEGER"))
+        conn.execute(text("UPDATE daily_position_snapshot SET user_id = :uid WHERE user_id IS NULL"), {"uid": DEFAULT_USER_ID})
+        conn.execute(text("ALTER TABLE daily_position_snapshot ALTER COLUMN user_id SET NOT NULL"))
 
 
 def _migrate_current_weights_broker_column():
@@ -1733,46 +1760,64 @@ def save_daily_snapshot(session: Session, user_id: int, portfolio_value: float):
         ))
 
 
-def save_position_snapshot(session: Session, snapshot_date, portfolio_value: float, positions: list[dict]):
+def save_position_snapshot(
+    session: Session, snapshot_date, portfolio_value: float, positions: list[dict],
+    user_id: int = DEFAULT_USER_ID,
+):
     """
-    Schreibt den Tages-Positions-Snapshot (siehe DailyPositionSnapshot).
-    Idempotent: löscht zuerst evtl. bereits vorhandene Zeilen für
-    snapshot_date (z.B. bei einem manuell wiederholten Testlauf am selben
-    Tag), bevor neu geschrieben wird. positions: Liste von Dicts mit
-    ticker/trade_id/quantity/entry_price/price/unrealized_pnl/
-    unrealized_pnl_pct (siehe main.capture_daily_position_snapshot).
+    Schreibt den Tages-Positions-Snapshot EINES Nutzers (siehe
+    DailyPositionSnapshot). Idempotent: löscht zuerst evtl. bereits
+    vorhandene Zeilen DIESES Nutzers für snapshot_date (z.B. bei einem
+    manuell wiederholten Testlauf am selben Tag), bevor neu geschrieben
+    wird. positions: Liste von Dicts mit ticker/trade_id/quantity/
+    entry_price/price/unrealized_pnl/unrealized_pnl_pct (siehe main.
+    capture_daily_position_snapshot).
+
+    KRITISCH (Multi-Tenant-Snapshot-Fix, 2026-08-11): das DELETE ist jetzt
+    auf user_id=user_id gescoped - vorher (nur Daniel) löschte ein erneuter
+    Aufruf für denselben Tag lediglich seine eigenen alten Zeilen. Ohne
+    diesen Filter würde ein zweiter Nutzer, der capture_daily_position_
+    snapshot() für sich selbst durchläuft, JEDEM anderen Nutzer dessen
+    bereits geschriebenen Snapshot für denselben Tag löschen (DELETE
+    filterte bisher nur nach snapshot_date).
     """
-    session.query(DailyPositionSnapshot).filter_by(snapshot_date=snapshot_date).delete()
+    session.query(DailyPositionSnapshot).filter_by(snapshot_date=snapshot_date, user_id=user_id).delete()
     now = datetime.utcnow()
     session.add(DailyPositionSnapshot(
-        snapshot_date=snapshot_date, snapshot_time=now,
+        snapshot_date=snapshot_date, snapshot_time=now, user_id=user_id,
         ticker=None, trade_id=None, portfolio_value=portfolio_value,
     ))
     for p in positions:
         session.add(DailyPositionSnapshot(
-            snapshot_date=snapshot_date, snapshot_time=now, portfolio_value=portfolio_value,
+            snapshot_date=snapshot_date, snapshot_time=now, user_id=user_id, portfolio_value=portfolio_value,
             ticker=p["ticker"], trade_id=p["trade_id"], quantity=p["quantity"],
             entry_price=p["entry_price"], price=p["price"],
             unrealized_pnl=p["unrealized_pnl"], unrealized_pnl_pct=p["unrealized_pnl_pct"],
         ))
 
 
-def get_previous_position_snapshot(session: Session, before_date) -> dict | None:
+def get_previous_position_snapshot(session: Session, before_date, user_id: int = DEFAULT_USER_ID) -> dict | None:
     """
-    Liest den letzten gespeicherten Positions-Snapshot VOR before_date
-    (typischerweise "heute", ET-Datum) – dient als Vorabend-Vergleichsbasis
-    für die Tages-Mail (siehe main.send_daily_summary_email). Gibt None
-    zurück, wenn noch nie ein Snapshot gespeichert wurde (allererster Lauf
-    seit Einführung des Features – Mail zeigt dann einen Hinweis statt
-    eines Vergleichs).
+    Liest den letzten gespeicherten Positions-Snapshot EINES Nutzers VOR
+    before_date (typischerweise "heute", ET-Datum) – dient als Vorabend-
+    Vergleichsbasis für die Tages-Mail (siehe main.send_daily_summary_email).
+    Gibt None zurück, wenn noch nie ein Snapshot für DIESEN Nutzer
+    gespeichert wurde (allererster Lauf seit Einführung des Features, oder
+    ein gerade erst verbundener zweiter Nutzer – Mail zeigt dann einen
+    Hinweis statt eines Vergleichs).
+
+    Multi-Tenant-Fix (2026-08-11): beide Queries jetzt auf user_id=user_id
+    gescoped - vorher (nur Daniel) fand die MAX(snapshot_date)-Suche
+    zwangsläufig immer nur seine eigenen Zeilen, weil es keine anderen gab.
     """
     last_date = session.query(func.max(DailyPositionSnapshot.snapshot_date)).filter(
-        DailyPositionSnapshot.snapshot_date < before_date
+        DailyPositionSnapshot.snapshot_date < before_date,
+        DailyPositionSnapshot.user_id == user_id,
     ).scalar()
     if last_date is None:
         return None
 
-    rows = session.query(DailyPositionSnapshot).filter_by(snapshot_date=last_date).all()
+    rows = session.query(DailyPositionSnapshot).filter_by(snapshot_date=last_date, user_id=user_id).all()
     total_row = next((r for r in rows if r.ticker is None), None)
     return {
         "snapshot_date": last_date,
@@ -1867,6 +1912,24 @@ def get_connected_alpaca_users() -> list[dict]:
             "WHERE alpaca_api_key_encrypted IS NOT NULL AND status = 'active'"
         )).fetchall()
     return [{"id": r[0], "email": r[1], "alpaca_mode": r[2] or "paper"} for r in rows]
+
+
+def get_user_email(user_id: int) -> str | None:
+    """
+    E-Mail-Adresse EINES Nutzers aus pos_users (Multi-Tenant-Snapshot/-Mail-
+    Fix, 2026-08-11, siehe main.send_daily_summary_email) - rohes SQL wie
+    get_alpaca_api_for_user()/get_connected_alpaca_users() (pos_users
+    "gehört" portfolio_os, kein eigenes ORM-Modell hier). None falls der
+    Nutzer nicht existiert oder keine E-Mail hinterlegt hat (sollte bei
+    einem regulär über portfolio_os registrierten Account nicht vorkommen,
+    Aufrufer behandelt es trotzdem defensiv statt eine Mail an "None" zu
+    versuchen).
+    """
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT email FROM pos_users WHERE id = :uid"
+        ), {"uid": user_id}).fetchone()
+    return row[0] if row and row[0] else None
 
 
 def get_user_live_config(user_id: int) -> dict:

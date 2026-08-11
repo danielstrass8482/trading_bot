@@ -46,7 +46,7 @@ def _smtp_login_utf8(server, user, password):
         raise smtplib.SMTPAuthenticationError(code, resp)
 
 
-def send_email(subject: str, body: str):
+def send_email(subject: str, body: str, to: str | None = None):
     """
     Verschickt eine E-Mail via smtplib (Standardbibliothek, kein externes Package).
     Fallback: Ohne ALERT_EMAIL oder SMTP-Zugangsdaten wird nur in die Logs
@@ -57,29 +57,38 @@ def send_email(subject: str, body: str):
     (Timeout), greift ein Fallback auf SMTP_FALLBACK_PORT (Standard: 2525),
     der von Railway nicht blockiert wird. SMTP_HOST ist konfigurierbar,
     sodass später auf einen eigenen Mailserver umgestellt werden kann.
+
+    to (Multi-Tenant-Snapshot/-Mail-Fix, 2026-08-11): optionaler Empfänger,
+    Default weiterhin ALERT_EMAIL (Daniel) - alle bisherigen Aufrufer
+    (Fehler-Alerts, Marktbriefing, Watchdog etc.) bleiben dadurch unverändert
+    an ihn adressiert. Nur main.send_daily_summary_email() übergibt hier
+    künftig die individuelle pos_users.email eines verbundenen Nutzers (siehe
+    database.get_user_email), damit jeder Nutzer seine eigene Tages-Mail an
+    seine eigene Adresse bekommt statt an Daniels.
     """
-    if not ALERT_EMAIL or not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+    recipient = to or ALERT_EMAIL
+    if not recipient or not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
         print(f"📧 [E-Mail nicht konfiguriert – nur Log] {subject}\n{body}")
         return
 
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = SMTP_USER
-    msg["To"] = ALERT_EMAIL
+    msg["To"] = recipient
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid()
 
     try:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
             _smtp_login_utf8(server, SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(SMTP_USER, [ALERT_EMAIL], msg.as_string())
+            server.sendmail(SMTP_USER, [recipient], msg.as_string())
         print(f"📧 E-Mail versendet: {subject} (Port {SMTP_PORT})")
     except (TimeoutError, OSError) as e:
         print(f"⚠️  SMTP Port {SMTP_PORT} nicht erreichbar ({e}) – Fallback auf Port {SMTP_FALLBACK_PORT}")
         try:
             with smtplib.SMTP(SMTP_HOST, SMTP_FALLBACK_PORT, timeout=SMTP_TIMEOUT) as server:
                 _smtp_login_utf8(server, SMTP_USER, SMTP_PASSWORD)
-                server.sendmail(SMTP_USER, [ALERT_EMAIL], msg.as_string())
+                server.sendmail(SMTP_USER, [recipient], msg.as_string())
             print(f"📧 E-Mail versendet: {subject} (Port {SMTP_FALLBACK_PORT})")
         except Exception as fallback_e:
             print(f"⚠️  E-Mail-Versand fehlgeschlagen (Fallback Port {SMTP_FALLBACK_PORT}): {fallback_e}")
