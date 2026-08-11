@@ -116,6 +116,17 @@ def _execute_or_queue_entry(signal, llm_result: dict, user_id: int):
     ausgeführt).
     """
     if not confirm_execution.is_confirm_mode(user_id):
+        # Deploy-Verifikation Owner-Account (2026-08-11): einmalig sichtbarer,
+        # gezielt grep-barer Log-Beweis dafür, dass ein echter Entry-Kandidat
+        # diesen Dispatch-Punkt für den Owner im Auto-Modus erreicht UND
+        # place_trade() aufgerufen wird - unabhängig von der DB-Wert-Prüfung
+        # (bot_config.EXECUTION_MODE), die nur den KONFIGURIERTEN Zustand
+        # zeigt, nicht das TATSÄCHLICHE Laufzeitverhalten. Kein neuer
+        # Automatismus/Mail-Versand, nur eine Log-Zeile für
+        # `grep "CONFIRM-TIER PROOF"`.
+        if user_id == DEFAULT_USER_ID:
+            print(f"🔎 CONFIRM-TIER PROOF: Entry-Dispatch erreicht für Owner (user_id={user_id}), "
+                  f"EXECUTION_MODE=auto, place_trade() wird aufgerufen ({signal.ticker}).")
         return place_trade(signal, llm_result, user_id)
 
     # Dedup (Chunk 2b, Aufgabe Punkt 10): derselbe Kandidat kann über mehrere
