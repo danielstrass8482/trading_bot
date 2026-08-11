@@ -13,7 +13,8 @@ from config import (
     MAX_CAPITAL_TOTAL, MAX_CAPITAL_PER_TRADE,
     STOP_LOSS_PCT, TAKE_PROFIT_PCT, MIN_SIGNAL_SCORE,
     VIX_PAUSE_THRESHOLD, TRADING_MODE, LONG_WATCHLIST,
-    ACTIVE_SHORT_INSTRUMENTS, PROFIT_ALERT_TARGET, get_live_config
+    ACTIVE_SHORT_INSTRUMENTS, PROFIT_ALERT_TARGET, get_live_config,
+    DEFAULT_USER_ID,
 )
 from database import (
     init_db, get_session, get_open_trades, get_total_pnl,
@@ -347,7 +348,12 @@ with tab2:
     st.markdown('<div class="section-label">Alle Trades</div>', unsafe_allow_html=True)
 
     with get_session() as session:
-        all_trades = session.query(Trade).order_by(Trade.created_at.desc()).all()
+        # Fix (Multi-Tenant-Datenleck, 2026-08-11, siehe TAB-4-Fix oben):
+        # war ebenfalls ungefiltert, zeigte das komplette Trade-Log ALLER
+        # verbundenen Nutzer statt nur Daniels eigenes.
+        all_trades = session.query(Trade).filter(
+            Trade.user_id == DEFAULT_USER_ID
+        ).order_by(Trade.created_at.desc()).all()
 
     if not all_trades:
         st.info("Noch keine Trades. Der Bot startet täglich um 09:00 ET.")
@@ -489,9 +495,21 @@ with tab4:
     st.markdown('<div class="section-label">Portfolio-Entwicklung</div>', unsafe_allow_html=True)
 
     with get_session() as session:
-        snapshots = session.query(DailyLog).order_by(DailyLog.log_date.asc()).all()
+        # Fix (Multi-Tenant-Datenleck, gefunden bei der daily_log-Analyse
+        # 2026-08-11): beide Queries liefen bisher OHNE user_id-Filter, im
+        # Gegensatz zu jeder anderen Query in diesem Dashboard (get_open_
+        # trades/get_total_pnl/etc. defaulten alle implizit auf
+        # DEFAULT_USER_ID = Daniel, siehe deren Docstrings). Seit dem
+        # Multi-Tenant-Handelsloop (2026-07-30) können mehrere Nutzer eigene
+        # Trades/daily_log-Snapshots haben – ungefiltert landeten hier ALLE
+        # Nutzer gemischt in Daniels privatem Admin-Dashboard (Streamlit,
+        # kein Auth/Session-Konzept, daher explizit auf DEFAULT_USER_ID
+        # verdrahtet statt auf einen "aktuellen Nutzer").
+        snapshots = session.query(DailyLog).filter(
+            DailyLog.user_id == DEFAULT_USER_ID
+        ).order_by(DailyLog.log_date.asc()).all()
         closed_trades = session.query(Trade).filter(
-            Trade.status.in_(CLOSED_STATUSES)
+            Trade.status.in_(CLOSED_STATUSES), Trade.user_id == DEFAULT_USER_ID
         ).all()
 
     if not snapshots:
