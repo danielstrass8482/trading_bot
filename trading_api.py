@@ -183,51 +183,105 @@ def _pending_details_html(pending) -> str:
     """
 
 
-def _resolve_confirmation(pending, action: str) -> dict:
+def _fetch_live_price(ticker: str, fallback: float) -> float:
+    """
+    Live-Preis für den Preis-Re-Check bei Bestätigung (Chunk 2c) - identisches
+    Muster wie bereits an anderer Stelle in dieser Datei verwendet (siehe
+    get_trade_history/get_overview: yf.Ticker(...).fast_info.get("lastPrice",
+    fallback)), hier als kleiner Helfer extrahiert, weil jetzt mehrfach
+    gebraucht.
+    """
+    try:
+        price = yf.Ticker(ticker).fast_info.get("lastPrice")
+        return float(price) if price else fallback
+    except Exception:
+        return fallback
+
+
+def _resolve_confirmation(pending, action: str, ack_price: float | None = None) -> dict:
     """
     Gemeinsame Bestätigungs-/Ablehnungs-Logik für BEIDE Kanäle (Email-Token
-    und Dashboard/JWT) - stellt sicher, dass Race-Condition-Schutz (try_claim)
-    und Order-Ausführung für beide identisch laufen, keine duplizierte Logik.
+    und Dashboard/JWT) - stellt sicher, dass Race-Condition-Schutz (try_claim),
+    Timeout-Durchsetzung, Preis-Re-Check und Order-Ausführung für beide
+    identisch laufen, keine duplizierte Logik (Chunk 2a/2b/2c).
 
-    action='confirm': atomarer Claim auf 'confirmed' (siehe confirm_execution.
-    try_claim - Race-Condition-Schutz, Aufgabe Punkt 5), danach Rekonstruktion
-    von SignalResult/llm_result aus den in Chunk 2b hinterlegten JSON-
-    Payloads und EIN unveränderter place_trade()-Aufruf (identisch zum
-    Auto-Pfad). action='reject': atomarer Claim auf 'rejected', KEINE
-    Order-Ausführung.
+    Reihenfolge (Chunk 2c):
+    1. Timeout zuerst, für BEIDE Aktionen - siehe confirm_execution.
+       expire_overdue-Docstring für den Race-sicheren Ablauf gegen den
+       parallel laufenden Hintergrundjob.
+    2. action='reject': atomarer Claim auf REJECTED, keine weitere Prüfung.
+    3. action='confirm', OHNE ack_price (erster Klick): Live-Preis abrufen,
+       gegen price_tolerance_pct_snapshot prüfen. Außerhalb der Toleranz:
+       KEIN Claim, KEINE Statusänderung - needs_reconfirmation=True mit
+       altem/neuem Preis, die Zeile bleibt PENDING für den zweiten Klick.
+    4. action='confirm', MIT ack_price (zweiter, expliziter Klick nach einer
+       gezeigten Preisänderung): kein erneuter Toleranz-Vergleich (sonst bei
+       weiter laufendem Kurs eine potenziell endlose Re-Bestätigungs-
+       Schleife) - der Nutzer hat diesen konkreten Preis gerade gesehen und
+       explizit akzeptiert, damit direkt ausführen.
+    5. Claim auf CONFIRMED, dann place_trade() mit dem tatsächlich
+       verwendeten Preis (frischer Live-Preis bzw. ack_price) statt des
+       ggf. inzwischen veralteten Signalzeitpunkt-Preises. Schlägt das fehl
+       (Exception/Guardrail/kein Trade-Objekt), wechselt die Zeile über
+       confirm_execution.mark_failed() auf FAILED mit Grund - bleibt NICHT
+       mehr fälschlich auf CONFIRMED stehen.
 
-    Gibt {"ok": bool, "message": str, "trade_id": int|None} zurück - nie
-    eine Exception (Guardrail-/Ausführungsfehler NACH erfolgreicher
-    Bestätigung werden als message zurückgegeben, die Zeile bleibt
-    'confirmed' stehen - die Bestätigungsabsicht selbst war gültig, nur die
-    Ausführung ist gescheitert; siehe Aufgabe für den offenen Punkt "was
-    passiert bei Ausführungsfehler nach Bestätigung", hier bewusst sichtbar
-    statt stillschweigend verworfen).
+    Gibt {"ok": bool, "message": str, "trade_id": int|None,
+    "needs_reconfirmation": bool, ggf. "old_price"/"new_price"/
+    "deviation_pct"} zurück - nie eine Exception.
     """
-    new_status = confirm_execution.STATUS_CONFIRMED if action == "confirm" else confirm_execution.STATUS_REJECTED
-    claimed = confirm_execution.try_claim(pending.id, new_status)
-    if claimed is None:
-        return {"ok": False, "message": "Bereits bearbeitet (z.B. über den anderen Kanal) oder nicht mehr gültig.", "trade_id": None}
+    if datetime.utcnow() > pending.expires_at:
+        confirm_execution.try_claim(pending.id, confirm_execution.STATUS_EXPIRED)
+        return {"ok": False, "message": "Bestätigung abgelaufen.", "trade_id": None, "needs_reconfirmation": False}
 
     if action == "reject":
-        return {"ok": True, "message": "Abgelehnt – es wird keine Order platziert.", "trade_id": None}
+        claimed = confirm_execution.try_claim(pending.id, confirm_execution.STATUS_REJECTED)
+        if claimed is None:
+            return {"ok": False, "message": "Bereits bearbeitet (z.B. über den anderen Kanal) oder nicht mehr gültig.", "trade_id": None, "needs_reconfirmation": False}
+        return {"ok": True, "message": "Abgelehnt – es wird keine Order platziert.", "trade_id": None, "needs_reconfirmation": False}
+
+    if ack_price is None:
+        live_price = _fetch_live_price(pending.ticker, pending.signal_price)
+        deviation = abs(live_price - pending.signal_price) / pending.signal_price if pending.signal_price else 0.0
+        if deviation > pending.price_tolerance_pct_snapshot:
+            return {
+                "ok": False, "trade_id": None, "needs_reconfirmation": True,
+                "old_price": pending.signal_price, "new_price": live_price,
+                "deviation_pct": round(deviation * 100, 2),
+                "message": (
+                    f"Preis hat sich seit dem Signal um {deviation * 100:.1f}% geändert "
+                    f"(${pending.signal_price:.2f} → ${live_price:.2f}) – bitte erneut bestätigen."
+                ),
+            }
+        execution_price = live_price
+    else:
+        execution_price = ack_price
+
+    claimed = confirm_execution.try_claim(pending.id, confirm_execution.STATUS_CONFIRMED)
+    if claimed is None:
+        return {"ok": False, "message": "Bereits bearbeitet (z.B. über den anderen Kanal) oder nicht mehr gültig.", "trade_id": None, "needs_reconfirmation": False}
 
     if not claimed.signal_payload:
-        return {"ok": False, "message": "Bestätigt, aber keine Signal-Daten hinterlegt (technischer Fehler) – keine Order platziert.", "trade_id": None}
+        confirm_execution.mark_failed(claimed.id, "Keine Signal-Daten hinterlegt (technischer Fehler)")
+        return {"ok": False, "message": "Bestätigt, aber keine Signal-Daten hinterlegt (technischer Fehler) – keine Order platziert.", "trade_id": None, "needs_reconfirmation": False}
 
     try:
         signal_data = json.loads(claimed.signal_payload)
+        signal_data["current_price"] = execution_price  # Chunk 2c: frischer Preis statt des ggf. veralteten Signalzeitpunkt-Preises
         llm_result = json.loads(claimed.llm_payload) if claimed.llm_payload else {}
         signal = SignalResult(**signal_data)
         trade = place_trade(signal, llm_result, claimed.user_id)
     except GuardrailViolation as gv:
-        return {"ok": False, "message": f"Bestätigt, aber ein Guardrail hat die Order verhindert: {gv}", "trade_id": None}
+        confirm_execution.mark_failed(claimed.id, f"Guardrail: {gv}")
+        return {"ok": False, "message": f"Bestätigt, aber ein Guardrail hat die Order verhindert: {gv}", "trade_id": None, "needs_reconfirmation": False}
     except Exception as e:
-        return {"ok": False, "message": f"Bestätigt, aber ein unerwarteter Fehler ist aufgetreten: {e}", "trade_id": None}
+        confirm_execution.mark_failed(claimed.id, str(e))
+        return {"ok": False, "message": f"Bestätigt, aber ein unerwarteter Fehler ist aufgetreten: {e}", "trade_id": None, "needs_reconfirmation": False}
 
     if trade is None:
-        return {"ok": False, "message": "Bestätigt, aber die Order konnte nicht platziert werden (z.B. kein Kapital mehr verfügbar) – bitte im Dashboard prüfen.", "trade_id": None}
-    return {"ok": True, "message": f"Order platziert (Trade #{trade.id}).", "trade_id": trade.id}
+        confirm_execution.mark_failed(claimed.id, "place_trade() lieferte kein Trade-Objekt (z.B. kein Kapital mehr verfügbar)")
+        return {"ok": False, "message": "Bestätigt, aber die Order konnte nicht platziert werden (z.B. kein Kapital mehr verfügbar) – bitte im Dashboard prüfen.", "trade_id": None, "needs_reconfirmation": False}
+    return {"ok": True, "message": f"Order platziert (Trade #{trade.id}).", "trade_id": trade.id, "needs_reconfirmation": False}
 
 
 @app.get("/api/confirm-execution/{token}")
@@ -246,8 +300,12 @@ def get_confirmation_page(token: str):
         return _confirm_html('<h2 style="color:#e05252">Link ungültig</h2><p>Dieser Bestätigungs-Link existiert nicht (mehr).</p>')
 
     if pending.status != confirm_execution.STATUS_PENDING:
-        status_label = {"confirmed": "bereits bestätigt", "rejected": "bereits abgelehnt", "expired": "abgelaufen"}.get(pending.status, pending.status)
-        return _confirm_html(f'<h2 style="color:#c9a252">Bereits bearbeitet</h2>{_pending_details_html(pending)}<p>Status: <b>{status_label}</b></p>')
+        status_label = {
+            "confirmed": "bereits bestätigt", "rejected": "bereits abgelehnt",
+            "expired": "abgelaufen", "failed": "bestätigt, aber Ausführung fehlgeschlagen",
+        }.get(pending.status, pending.status)
+        extra = f"<p>Grund: {pending.failure_reason}</p>" if pending.status == "failed" and pending.failure_reason else ""
+        return _confirm_html(f'<h2 style="color:#c9a252">Bereits bearbeitet</h2>{_pending_details_html(pending)}<p>Status: <b>{status_label}</b></p>{extra}')
 
     return _confirm_html(f"""
         <h2 style="color:#c9a252">⏳ Bestätigung nötig</h2>
@@ -262,11 +320,35 @@ def get_confirmation_page(token: str):
 
 
 @app.post("/api/confirm-execution/{token}/confirm")
-def post_confirm_execution(token: str):
+def post_confirm_execution(token: str, ack_price: Optional[float] = None):
+    """
+    ack_price (Chunk 2c, optionaler Query-Parameter): fehlt beim ersten Klick
+    ("Bestätigen" auf der Übersichtsseite). Weicht der dann live abgerufene
+    Preis zu stark vom Signalzeitpunkt-Preis ab (siehe _resolve_confirmation),
+    wird HIER eine Re-Bestätigungsseite mit dem neuen Preis gerendert, deren
+    Formular denselben Endpoint erneut aufruft, diesmal MIT ack_price - das
+    ist der explizite zweite Bestätigungs-Schritt aus der Aufgabe.
+    """
     pending = confirm_execution.get_pending_by_token(token)
     if pending is None:
         return _confirm_html('<h2 style="color:#e05252">Link ungültig</h2><p>Dieser Bestätigungs-Link existiert nicht (mehr).</p>')
-    result = _resolve_confirmation(pending, "confirm")
+    result = _resolve_confirmation(pending, "confirm", ack_price=ack_price)
+
+    if result.get("needs_reconfirmation"):
+        return _confirm_html(f"""
+            <h2 style="color:#c9a252">⚠️ Preis hat sich geändert</h2>
+            <p>Ticker: <b>{pending.ticker}</b></p>
+            <p>Preis zum Signalzeitpunkt: <b>${result['old_price']:.2f}</b></p>
+            <p>Aktueller Preis: <b>${result['new_price']:.2f}</b></p>
+            <p>Abweichung: <b>{result['deviation_pct']:.1f}%</b></p>
+            <form method="POST" action="/api/confirm-execution/{token}/confirm?ack_price={result['new_price']}" style="display:inline">
+                <button type="submit" style="background:#3a9e6c;color:#fff;border:none;padding:0.6rem 1.2rem;border-radius:6px;margin-right:0.5rem;cursor:pointer;">Trotzdem bestätigen</button>
+            </form>
+            <form method="POST" action="/api/confirm-execution/{token}/reject" style="display:inline">
+                <button type="submit" style="background:#8a3a3a;color:#fff;border:none;padding:0.6rem 1.2rem;border-radius:6px;cursor:pointer;">Ablehnen</button>
+            </form>
+        """)
+
     color = "#3a9e6c" if result["ok"] else "#e05252"
     return _confirm_html(f'<h2 style="color:{color}">{"✅ Bestätigt" if result["ok"] else "⚠️ Hinweis"}</h2><p>{result["message"]}</p>')
 
@@ -1075,12 +1157,33 @@ def list_pending_confirmations(user_id: int = Depends(get_current_user_id)):
     ]
 
 
+# Chunk 2c: Verlauf ALLER Status (PENDING/CONFIRMED/REJECTED/EXPIRED/FAILED)
+# für die Dashboard-Historie - separater Endpoint statt den obigen zu
+# erweitern, damit dessen Vertrag (nur aktuell handlungsfähige PENDING-
+# Zeilen) unverändert bleibt.
+@protected.get("/api/pending-confirmations/history")
+def list_confirmation_history(user_id: int = Depends(get_current_user_id)):
+    rows = confirm_execution.list_recent_for_user(user_id)
+    return [
+        {
+            "id": r.id, "ticker": r.ticker, "qty_or_amount": r.qty_or_amount,
+            "signal_price": r.signal_price, "signal_timestamp": r.signal_timestamp.isoformat(),
+            "expires_at": r.expires_at.isoformat(), "broker": r.broker,
+            "status": r.status, "failure_reason": r.failure_reason,
+            "resolved_at": r.resolved_at.isoformat() if r.resolved_at else None,
+        }
+        for r in rows
+    ]
+
+
 @protected.post("/api/pending-confirmations/{pending_id}/confirm")
-def confirm_pending_confirmation(pending_id: int, user_id: int = Depends(get_current_user_id)):
+def confirm_pending_confirmation(pending_id: int, ack_price: Optional[float] = None, user_id: int = Depends(get_current_user_id)):
+    """ack_price: siehe post_confirm_execution (Email-Kanal) - identisches
+    Zwei-Klick-Prinzip für den Dashboard-Kanal, siehe _resolve_confirmation."""
     pending = confirm_execution.get_pending_by_id_for_user(pending_id, user_id)
     if pending is None:
         raise HTTPException(status_code=404, detail="Nicht gefunden")
-    return _resolve_confirmation(pending, "confirm")
+    return _resolve_confirmation(pending, "confirm", ack_price=ack_price)
 
 
 @protected.post("/api/pending-confirmations/{pending_id}/reject")

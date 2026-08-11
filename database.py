@@ -645,6 +645,11 @@ class PendingConfirmation(Base):
     # ohne diese Spalten angelegt hat (additive Migration, siehe unten).
     signal_payload                = Column(Text, nullable=True)
     llm_payload                   = Column(Text, nullable=True)
+    # Chunk 2c (2026-08-11, siehe confirm_execution.py-Moduldoc): FAILED-
+    # Status ("bestätigt, aber Ausführung gescheitert") braucht einen Ort für
+    # den Grund (GuardrailViolation-Text, Exception-Nachricht, o.ä.) - sonst
+    # sähe der Nutzer im Dashboard nur "fehlgeschlagen" ohne jede Erklärung.
+    failure_reason                = Column(Text, nullable=True)
 
 
 class CapitalFlow(Base):
@@ -950,6 +955,7 @@ def init_db():
     _migrate_daily_log_formula_version_column()
     _migrate_daily_position_snapshot_user_id_column()
     _migrate_pending_confirmations_payload_columns()
+    _migrate_pending_confirmations_failure_reason_column()
     _migrate_current_weights_broker_column()
     _migrate_capital_allocations_user_id_column()
     _seed_saxo_token_from_env()
@@ -1255,6 +1261,12 @@ def _migrate_pending_confirmations_payload_columns():
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE pending_confirmations ADD COLUMN IF NOT EXISTS signal_payload TEXT"))
         conn.execute(text("ALTER TABLE pending_confirmations ADD COLUMN IF NOT EXISTS llm_payload TEXT"))
+
+
+def _migrate_pending_confirmations_failure_reason_column():
+    """Confirm-Tier Chunk 2c (2026-08-11) - additiv, siehe PendingConfirmation-Docstring."""
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE pending_confirmations ADD COLUMN IF NOT EXISTS failure_reason TEXT"))
 
 
 def _migrate_current_weights_broker_column():

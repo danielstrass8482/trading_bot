@@ -1181,6 +1181,24 @@ def saxo_token_refresh_job():
         print(f"⚠️  Saxo Token-Refresh-Job fehlgeschlagen: {e}")
 
 
+def expire_pending_confirmations_job():
+    """
+    Confirm-Tier Chunk 2c (2026-08-11): proaktive Timeout-Durchsetzung für
+    pending_confirmations, unabhängig von Handelszeiten und unabhängig davon,
+    ob ein Nutzer je auf den Bestätigungs-Link klickt oder die Dashboard-
+    Queue öffnet (siehe confirm_execution.expire_overdue-Docstring). Der
+    Check bei einem tatsächlichen Bestätigungsversuch (trading_api.
+    _resolve_confirmation) bleibt zusätzlich bestehen - deckt die Lücke
+    zwischen zwei Job-Läufen ab, kein Duplikat.
+    """
+    try:
+        n = confirm_execution.expire_overdue()
+        if n:
+            print(f"⏰ {n} abgelaufene Bestätigung(en) auf EXPIRED gesetzt.")
+    except Exception as e:
+        print(f"⚠️  expire_pending_confirmations_job fehlgeschlagen: {e}")
+
+
 def main():
     """Startet den Scheduler."""
     print("🚀 Trading Bot startet...")
@@ -1340,6 +1358,17 @@ def main():
         CronTrigger(minute="*/10", timezone=et_tz),
         id="saxo_token_refresh",
         name="Saxo Token Refresh (proaktiv)",
+        replace_existing=True
+    )
+
+    # Confirm-Tier Chunk 2c: alle 5 Minuten, unabhängig von Handelszeiten -
+    # eine Bestätigung kann bis kurz vor/nach Handelsschluss offen sein
+    # (DEFAULT_CONFIRMATION_TIMEOUT_MINUTES=15, siehe confirm_execution.py).
+    scheduler.add_job(
+        expire_pending_confirmations_job,
+        CronTrigger(minute="*/5", timezone=et_tz),
+        id="expire_pending_confirmations",
+        name="Confirm-Tier: abgelaufene Bestätigungen (proaktiv)",
         replace_existing=True
     )
 

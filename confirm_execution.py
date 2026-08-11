@@ -1,6 +1,6 @@
 """
 confirm_execution.py – Interception- und Bestätigungs-Logik für den
-manuellen Bestätigungs-Tier vor Entry-Trades (Confirm-Tier Chunk 2a+2b,
+manuellen Bestätigungs-Tier vor Entry-Trades (Confirm-Tier Chunk 2a+2b+2c,
 2026-08-11).
 
 ARCHITEKTUR-VORGABE (Option C, mit dem Anwalt abgestimmt, siehe
@@ -32,13 +32,16 @@ das für die Entry-Seite in Chunk 2a genau dieselbe Doppelrolle hat). Dieses
 Modul stellt dafür nur die atomare Status-Übergangs-Primitive (try_claim)
 und die reinen Lese-/Schreibfunktionen bereit.
 
-SCOPE Chunk 2b (NUR das hier, siehe Aufgabe): Email-Link + Dashboard-Queue
-als Bestätigungskanäle, Dedup gegen doppelte PENDING-Einträge/Mails, Race-
-Condition-sicherer Status-Übergang. Weiterhin NICHT Teil dieses Chunks
-(Chunk 2c): tatsächliche Timeout-Durchsetzung von expires_at (eine
-abgelaufene PENDING-Zeile bleibt bis dahin technisch bestätigbar) und der
-Preis-Re-Check gegen price_tolerance_pct_snapshot (eine Bestätigung führt
-aktuell unabhängig vom inzwischen vergangenen Kursverlauf zur Order).
+SCOPE Chunk 2c (2026-08-11, NUR das hier zusätzlich zu 2a/2b, siehe
+Aufgabe): tatsächliche Timeout-Durchsetzung von expires_at (proaktiver
+Hintergrundjob expire_overdue() UND ein Check bei jedem Bestätigungs-
+versuch, siehe trading_api._resolve_confirmation), Preis-Re-Check gegen
+price_tolerance_pct_snapshot (mit explizitem Re-Bestätigungs-Schritt bei
+Abweichung, ebenfalls in trading_api._resolve_confirmation - der Preisabruf
+selbst braucht yfinance, lebt daher bewusst dort, nicht hier, siehe unten),
+und ein eigener FAILED-Status für eine Bestätigung, deren place_trade()-
+Aufruf danach scheitert (mark_failed(), inkl. Grund in failure_reason).
+Die fünf erreichbaren Status: PENDING, CONFIRMED, REJECTED, EXPIRED, FAILED.
 """
 from datetime import datetime
 
@@ -58,6 +61,8 @@ DEFAULT_CONFIRMATION_TIMEOUT_MINUTES = 15
 STATUS_PENDING = "pending"
 STATUS_CONFIRMED = "confirmed"
 STATUS_REJECTED = "rejected"
+STATUS_EXPIRED = "expired"
+STATUS_FAILED = "failed"
 
 
 def is_confirm_mode(user_id: int) -> bool:
@@ -199,6 +204,65 @@ def try_claim(pending_id: int, new_status: str) -> PendingConfirmation | None:
         if result.rowcount != 1:
             return None
         return session.query(PendingConfirmation).filter_by(id=pending_id).first()
+
+
+def mark_failed(pending_id: int, reason: str) -> None:
+    """
+    Chunk 2c: eine bereits CONFIRMED-Zeile (der atomare Claim ist zu diesem
+    Zeitpunkt längst erfolgreich abgeschlossen, siehe try_claim) wechselt auf
+    FAILED, falls der anschließende place_trade()-Aufruf (in trading_api.py,
+    außerhalb dieses Moduls) scheitert - Exception, Guardrail-Ablehnung oder
+    kein Trade-Objekt zurückgegeben. KEIN try_claim-Schutz nötig: an diesem
+    Punkt hält bereits garantiert nur EIN Aufrufer die Zeile (er hat sie
+    gerade selbst erfolgreich von PENDING auf CONFIRMED geclaimt), ein reines
+    UPDATE genügt. reason wird auf 500 Zeichen gekappt (Exception-Texte
+    können beliebig lang werden, failure_reason ist für eine kurze
+    Nutzer-verständliche Erklärung gedacht, nicht für einen vollen Trace).
+    """
+    with get_session() as session:
+        session.execute(
+            text("UPDATE pending_confirmations SET status = :status, failure_reason = :reason, resolved_at = :now WHERE id = :id"),
+            {"status": STATUS_FAILED, "reason": (reason or "")[:500], "now": datetime.utcnow(), "id": pending_id},
+        )
+        session.commit()
+
+
+def expire_overdue() -> int:
+    """
+    Chunk 2c: proaktiver Hintergrundjob (siehe main.py-Scheduler-Registrierung)
+    setzt ALLE PENDING-Zeilen, deren expires_at bereits vergangen ist, atomar
+    auf EXPIRED - Timeout muss unabhängig davon greifen, ob der Nutzer je auf
+    den Link klickt oder die Dashboard-Queue öffnet. Reines bulk UPDATE...
+    WHERE (kein SELECT-dann-UPDATE, identisches Prinzip wie try_claim): läuft
+    dieser Job zeitgleich mit einem echten Bestätigungsversuch für dieselbe
+    Zeile, gewinnt schlicht, wer zuerst committet - der jeweils andere sieht
+    danach status != 'pending' und greift korrekt nicht mehr (der explizite
+    Expiry-Check in trading_api._resolve_confirmation ist daher kein
+    Duplikat, sondern deckt die Lücke zwischen zwei Job-Läufen ab).
+
+    Gibt die Anzahl abgelaufener Zeilen zurück (für Logging).
+    """
+    with get_session() as session:
+        result = session.execute(
+            text("UPDATE pending_confirmations SET status = :expired, resolved_at = :now "
+                 "WHERE status = :pending_status AND expires_at < :now"),
+            {"expired": STATUS_EXPIRED, "pending_status": STATUS_PENDING, "now": datetime.utcnow()},
+        )
+        session.commit()
+        return result.rowcount
+
+
+def list_recent_for_user(user_id: int, limit: int = 20) -> list[PendingConfirmation]:
+    """
+    Chunk 2c: Verlauf ALLER Status (PENDING/CONFIRMED/REJECTED/EXPIRED/
+    FAILED) für die Dashboard-Historie - im Gegensatz zu list_pending_for_
+    user() oben, das bewusst NUR die aktuell noch handlungsfähigen PENDING-
+    Zeilen liefert (für die Bestätigen/Ablehnen-Buttons).
+    """
+    with get_session() as session:
+        return session.query(PendingConfirmation).filter_by(user_id=user_id).order_by(
+            PendingConfirmation.created_at.desc()
+        ).limit(limit).all()
 
 
 def send_confirmation_email(pending: PendingConfirmation) -> None:
