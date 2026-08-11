@@ -173,13 +173,39 @@ def _confirm_html(inner: str) -> HTMLResponse:
     return HTMLResponse(content=f'<html><body style="{_CONFIRM_PAGE_STYLE}">{inner}</body></html>')
 
 
+def _extract_score(signal_payload: Optional[str]) -> Optional[int]:
+    """
+    Score-Anzeige (Confirm-Tier Chunk 2d, Aufgabe Punkt 5): score selbst hat
+    keine eigene Spalte in pending_confirmations, steckt aber bereits im
+    JSON-serialisierten signal_payload (dataclasses.asdict(signal), siehe
+    main._execute_or_queue_entry) - hier nur ausgelesen, kein Re-Fetch nötig.
+    None statt Exception, falls payload fehlt/kaputt (z.B. sehr alte
+    Bestandszeilen aus der Zeit vor Chunk 2b) - Anzeige zeigt dann "–" statt
+    die Seite abstürzen zu lassen.
+    """
+    if not signal_payload:
+        return None
+    try:
+        return json.loads(signal_payload).get("score")
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 def _pending_details_html(pending) -> str:
+    # Beschriftung "zuletzt aktualisiert" statt "zum Signalzeitpunkt" (Chunk
+    # 2d): signal_price/signal_timestamp/Score werden jetzt bei jedem
+    # Re-Scan aktualisiert, solange der Kandidat über der Schwelle bleibt
+    # (siehe confirm_execution.update_pending_confirmation) - "zum
+    # Signalzeitpunkt" wäre nach einer solchen Aktualisierung irreführend,
+    # da es den ursprünglichen statt den aktuellen Wert suggeriert.
+    score = _extract_score(pending.signal_payload)
     return f"""
         <p>Ticker: <b>{pending.ticker}</b></p>
+        <p>Score: <b>{score if score is not None else '–'}</b></p>
         <p>Menge: <b>{pending.qty_or_amount}</b></p>
-        <p>Preis zum Signalzeitpunkt: <b>${pending.signal_price:.2f}</b></p>
-        <p>Zeitpunkt: <b>{pending.signal_timestamp.strftime('%d.%m.%Y %H:%M')} UTC</b></p>
-        <p>Läuft ab: <b>{pending.expires_at.strftime('%d.%m.%Y %H:%M')} UTC</b></p>
+        <p>Preis (zuletzt aktualisiert): <b>${pending.signal_price:.2f}</b></p>
+        <p>Zuletzt aktualisiert: <b>{pending.signal_timestamp.strftime('%d.%m.%Y %H:%M')} UTC</b></p>
+        <p>Läuft ab (Handelsschluss): <b>{pending.expires_at.strftime('%d.%m.%Y %H:%M')} UTC</b></p>
     """
 
 
@@ -1191,15 +1217,29 @@ def update_entry_learning_mode(body: dict, user_id: int = Depends(get_current_us
 # nicht-existenten ID unterscheidbar (kein Leak).
 @protected.get("/api/pending-confirmations")
 def list_pending_confirmations(user_id: int = Depends(get_current_user_id)):
+    """
+    Absteigend nach Score sortiert (Confirm-Tier Chunk 2d, Aufgabe Punkt 6) -
+    der stärkste Kandidat steht oben, unabhängig davon wann sein PENDING-
+    Eintrag zuletzt aktualisiert wurde (list_pending_for_user() selbst
+    ordnet nach created_at, das reicht seit Chunk 2d nicht mehr, da ein
+    länger laufender, mehrfach aktualisierter Eintrag sonst am Alter statt
+    an seiner aktuellen Stärke gemessen würde). score kommt aus signal_
+    payload (siehe _extract_score) - Einträge ganz ohne Score (kaputtes/
+    fehlendes Payload) fallen ans Ende statt die Sortierung zum Absturz zu
+    bringen.
+    """
     rows = confirm_execution.list_pending_for_user(user_id)
-    return [
+    entries = [
         {
             "id": r.id, "ticker": r.ticker, "qty_or_amount": r.qty_or_amount,
             "signal_price": r.signal_price, "signal_timestamp": r.signal_timestamp.isoformat(),
             "expires_at": r.expires_at.isoformat(), "broker": r.broker,
+            "score": _extract_score(r.signal_payload),
         }
         for r in rows
     ]
+    entries.sort(key=lambda e: e["score"] if e["score"] is not None else -1, reverse=True)
+    return entries
 
 
 # Chunk 2c: Verlauf ALLER Status (PENDING/CONFIRMED/REJECTED/EXPIRED/FAILED)
@@ -1216,6 +1256,7 @@ def list_confirmation_history(user_id: int = Depends(get_current_user_id)):
             "expires_at": r.expires_at.isoformat(), "broker": r.broker,
             "status": r.status, "failure_reason": r.failure_reason,
             "resolved_at": r.resolved_at.isoformat() if r.resolved_at else None,
+            "score": _extract_score(r.signal_payload),
         }
         for r in rows
     ]

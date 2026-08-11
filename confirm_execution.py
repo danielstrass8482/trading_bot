@@ -42,21 +42,68 @@ selbst braucht yfinance, lebt daher bewusst dort, nicht hier, siehe unten),
 und ein eigener FAILED-Status für eine Bestätigung, deren place_trade()-
 Aufruf danach scheitert (mark_failed(), inkl. Grund in failure_reason).
 Die fünf erreichbaren Status: PENDING, CONFIRMED, REJECTED, EXPIRED, FAILED.
+
+SCOPE Chunk 2d (2026-08-11, NUR Alpaca - Saxo bewusst als Paritäts-
+Folgeauftrag zurückgestellt, siehe main.py-Docstring): das starre
+15-Minuten-Fenster aus Chunk 1/2a war zu kurz - ein Nutzer, der nicht
+sofort reagiert, konnte seine Slots faktisch nie füllen. Neues Modell:
+  - expires_at ist jetzt der Handelsschluss DESSELBEN Handelstages
+    (16:00 ET, siehe compute_market_close_expiry) statt Signal-Zeitpunkt +
+    15 Minuten.
+  - Der bisherige Dedup-Mechanismus aus Chunk 2b (find_existing_pending(),
+    per main._execute_or_queue_entry() bislang genutzt um NICHTS zu tun
+    außer den Duplikat-Versuch zu verwerfen) wird jetzt zum Update-
+    Mechanismus: solange ein Kandidat bei einem Re-Scan weiterhin über der
+    Schwelle liegt, aktualisiert update_pending_confirmation() den
+    bestehenden Eintrag mit dem aktuellsten Preis/Score/Payload/Toleranz-
+    Snapshot - KEIN neuer Eintrag, KEINE neue Mail (nur bei der
+    allerersten Erzeugung in create_pending_confirmation()).
+  - expire_dropped_below_threshold() (NEU) läuft proaktiv, sobald ein
+    Kandidat bei einem Re-Scan NICHT MEHR über der Schwelle liegt - der
+    Eintrag läuft dann sofort ab, statt bis zum Handelsschluss/Timeout zu
+    warten (ein noch offenstehender Bestätigungslink für einen längst
+    nicht mehr qualifizierenden Kandidaten wäre irreführend).
+Ein PENDING-Eintrag läuft damit NUR noch ab durch: (a) Handelsschluss
+desselben Tages, (b) Nutzeraktion (bestätigt/abgelehnt), oder (c) proaktiv
+per expire_dropped_below_threshold(). compute_expiry() (Chunk 1, generisch
+minuten-basiert) bleibt in trading_shared für den noch ausstehenden
+Saxo-Folgeauftrag verfügbar, wird hier aber nicht mehr verwendet.
 """
 from datetime import datetime
 
+import pytz
 from sqlalchemy import text
 
-from trading_shared.confirm_execution import generate_confirmation_token, compute_expiry
+from trading_shared.confirm_execution import generate_confirmation_token
 
 from database import get_session, PendingConfirmation, get_user_live_config, get_user_email
 from notifications import send_email
 
-# Platzhalter bis Chunk 2c den echten Timeout/Preis-Re-Check baut - der Wert
-# wird hier bereits in expires_at geschrieben (Spalte ist NOT NULL) und im
-# Bestätigungs-Endpoint/der Mail angezeigt, aber bis dahin von keinem Code
-# durchgesetzt (eine abgelaufene PENDING-Zeile lässt sich noch bestätigen).
-DEFAULT_CONFIRMATION_TIMEOUT_MINUTES = 15
+# Handelsschluss NYSE/Nasdaq für expires_at (Chunk 2d) - bewusst eine lokale
+# Kopie statt Cross-Import aus watchdog.ALPACA_HOURS (identisches Prinzip
+# wie die dortige SAXO_EXCHANGES_HOURS-Duplizierung, siehe deren Docstring:
+# beide Bots sind getrennte Deployments mit eigenem venv). Bei einer
+# künftigen Änderung der NYSE-Handelszeiten hier UND in watchdog.py
+# manuell mitziehen.
+_ET_TZ = pytz.timezone("America/New_York")
+_MARKET_CLOSE_ET = (16, 0)
+
+
+def compute_market_close_expiry(now_utc: datetime) -> datetime:
+    """
+    Confirm-Tier Chunk 2d: expires_at = Handelsschluss (16:00 ET) DESSELBEN
+    Kalendertages wie `now_utc` (naiv, UTC rein/raus - identische Konvention
+    wie überall sonst in diesem Modul/database.py, z.B. datetime.utcnow()).
+    Keine Feiertags-/Vorzeitig-Schließung-Erkennung (wie auch sonst nirgends
+    in diesem Repo für die Entry-Slot-Planung, siehe main.schedule_entry_
+    jobs - reine Mon-Fr-Cron-Trigger ohne Börsenkalender) - bewusst
+    konsistent zum bestehenden Präzisionsniveau, kein neuer Sonderfall nur
+    für dieses Feature.
+    """
+    now_et = pytz.utc.localize(now_utc).astimezone(_ET_TZ)
+    close_et = now_et.replace(hour=_MARKET_CLOSE_ET[0], minute=_MARKET_CLOSE_ET[1], second=0, microsecond=0)
+    return close_et.astimezone(pytz.utc).replace(tzinfo=None)
+
 
 STATUS_PENDING = "pending"
 STATUS_CONFIRMED = "confirmed"
@@ -77,12 +124,17 @@ def is_confirm_mode(user_id: int) -> bool:
 
 def find_existing_pending(user_id: int, ticker: str, broker: str = "alpaca") -> PendingConfirmation | None:
     """
-    Dedup-Check (Chunk 2b, Aufgabe Punkt 10): bevor main._execute_or_queue_
-    entry() einen neuen PENDING-Eintrag erzeugt, wird geprüft, ob für
-    denselben Ticker+Nutzer(+Broker) bereits einer offen ist. Verhindert
-    doppelte Einträge UND doppelte Mails, falls derselbe Kandidat über
-    mehrere Entry-Slots/Scans hinweg erneut ein Signal auslöst, solange die
-    vorherige Bestätigung noch aussteht.
+    Lookup-Check (Chunk 2b, seit Chunk 2d umgewidmet): bevor main._execute_
+    or_queue_entry() einen neuen PENDING-Eintrag erzeugt, wird geprüft, ob
+    für denselben Ticker+Nutzer(+Broker) bereits einer offen ist.
+
+    Chunk 2b: fand einer sich bereits ein Duplikat-Versuch wurde schlicht
+    verworfen (reiner Dedup, verhinderte nur doppelte Einträge/Mails).
+    Chunk 2d: der Aufrufer nutzt einen Treffer jetzt aktiv, um den
+    bestehenden Eintrag per update_pending_confirmation() zu aktualisieren
+    (aktuellster Preis/Score/Payload) statt ihn unangetastet zu lassen -
+    diese Funktion selbst bleibt unverändert ein reiner Lookup, nur die
+    Bedeutung eines Treffers für den Aufrufer hat sich geändert.
     """
     with get_session() as session:
         return session.query(PendingConfirmation).filter_by(
@@ -119,6 +171,15 @@ def create_pending_confirmation(
     PRICE_TOLERANCE_PCT-Wert zum Signalzeitpunkt ein - Chunk 2c vergleicht
     später den dann aktuellen Marktpreis gegen signal_price innerhalb dieser
     Toleranz, bevor eine Bestätigung tatsächlich zu einer Order führt.
+    Chunk 2d: dieser Snapshot UND signal_price werden bei jedem Re-Scan, in
+    dem der Kandidat weiterhin über der Schwelle liegt, per
+    update_pending_confirmation() aktualisiert (siehe dort) - hier nur die
+    Werte zum allerersten Signal-Zeitpunkt.
+
+    expires_at (Chunk 2d, vorher Signal-Zeitpunkt + 15 Minuten): jetzt der
+    Handelsschluss DESSELBEN Handelstages (siehe compute_market_close_
+    expiry) - ein Nutzer, der nicht sofort reagiert, konnte seine Slots
+    vorher faktisch nie füllen.
     """
     import json as _json
 
@@ -135,7 +196,7 @@ def create_pending_confirmation(
             signal_timestamp=now,
             status=STATUS_PENDING,
             confirmation_token=generate_confirmation_token(),
-            expires_at=compute_expiry(now, DEFAULT_CONFIRMATION_TIMEOUT_MINUTES),
+            expires_at=compute_market_close_expiry(now),
             price_tolerance_pct_snapshot=price_tolerance,
             signal_payload=_json.dumps(signal_payload, ensure_ascii=False) if signal_payload is not None else None,
             llm_payload=_json.dumps(llm_payload, ensure_ascii=False) if llm_payload is not None else None,
@@ -144,6 +205,107 @@ def create_pending_confirmation(
         session.commit()
         session.refresh(pending)
         return pending
+
+
+def update_pending_confirmation(
+    pending: PendingConfirmation,
+    quantity: float,
+    signal_price: float,
+    signal_payload: dict | None = None,
+    llm_payload: dict | None = None,
+) -> PendingConfirmation | None:
+    """
+    Confirm-Tier Chunk 2d: aktualisiert einen bereits offenen PENDING-
+    Eintrag mit dem aktuellsten Preis/Menge/Score/Payload, statt (Chunk 2b-
+    Verhalten) den Re-Scan-Treffer nur zu verwerfen. KEINE neue Mail (nur
+    create_pending_confirmation() verschickt eine, siehe main._execute_or_
+    queue_entry) und KEIN neuer confirmation_token - der bereits
+    verschickte Link bleibt gültig und zeigt beim Öffnen live die hier
+    aktualisierten Werte (die Bestätigungsseite liest direkt aus der DB).
+
+    price_tolerance_pct_snapshot wird HIER MIT dem aktuell konfigurierten
+    PRICE_TOLERANCE_PCT neu gesetzt (Aufgabe Punkt 4) - konsistent dazu,
+    dass auch signal_price/Score aktuell gehalten werden: der spätere
+    Preis-Re-Check bei Bestätigung (Chunk 2c, trading_api._resolve_
+    confirmation) vergleicht dadurch automatisch gegen die zuletzt
+    aktualisierte Basis, nicht gegen den ursprünglichen Signalpreis.
+
+    expires_at wird ebenfalls neu berechnet (identischer Handelstag ->
+    faktisch derselbe Wert, reiner Konsistenz-/Robustheitsgrund).
+
+    Reines UPDATE ... WHERE status='pending' (identisches CAS-Prinzip wie
+    try_claim/expire_overdue) - falls die Zeile zwischen dem find_existing_
+    pending()-Lookup des Aufrufers und diesem Aufruf bereits final bearbeitet
+    wurde (bestätigt/abgelehnt/abgelaufen), betrifft das UPDATE 0 Zeilen und
+    diese Funktion gibt None zurück; der Aufrufer erzeugt dann stattdessen
+    einen frischen Eintrag (der Ticker qualifiziert sich ja gerade jetzt
+    wieder), siehe main._execute_or_queue_entry.
+    """
+    import json as _json
+
+    with get_session() as session:
+        user_cfg = get_user_live_config(pending.user_id)
+        price_tolerance = float(user_cfg.get("PRICE_TOLERANCE_PCT", 0.02))
+        now = datetime.utcnow()
+        result = session.execute(
+            text("""
+                UPDATE pending_confirmations
+                SET qty_or_amount = :qty, signal_price = :price, signal_timestamp = :now,
+                    price_tolerance_pct_snapshot = :tolerance, expires_at = :expires_at,
+                    signal_payload = :signal_payload, llm_payload = :llm_payload
+                WHERE id = :id AND status = :pending_status
+            """),
+            {
+                "qty": quantity, "price": signal_price, "now": now,
+                "tolerance": price_tolerance, "expires_at": compute_market_close_expiry(now),
+                "signal_payload": _json.dumps(signal_payload, ensure_ascii=False) if signal_payload is not None else None,
+                "llm_payload": _json.dumps(llm_payload, ensure_ascii=False) if llm_payload is not None else None,
+                "id": pending.id, "pending_status": STATUS_PENDING,
+            },
+        )
+        session.commit()
+        if result.rowcount != 1:
+            return None
+        return session.query(PendingConfirmation).filter_by(id=pending.id).first()
+
+
+def expire_dropped_below_threshold(user_id: int, still_qualifying_tickers: set[str]) -> list[str]:
+    """
+    Confirm-Tier Chunk 2d (Aufgabe Punkt 2, zweite Hälfte): ein PENDING-
+    Eintrag, dessen Ticker bei einem Re-Scan NICHT MEHR über der (globalen,
+    für alle Nutzer identischen MIN_SIGNAL_SCORE-)Schwelle liegt, muss nicht
+    bis zum Handelsschluss/Timeout warten - der Kandidat existiert aus
+    Bot-Sicht ab jetzt nicht mehr, ein weiter offenstehender Bestätigungs-
+    link dafür wäre irreführend. still_qualifying_tickers: die Ticker-Menge,
+    die in DIESEM Zyklus weiterhin über der Schwelle liegt (signal.approved,
+    siehe main.run_entry_cycle) - bewusst NUR score-basiert, nicht
+    guardrail-basiert (ein Guardrail wie MAX_OPEN_POSITIONS kann sich
+    unabhängig vom Score ändern und ist nicht Teil dieses Kriteriums, siehe
+    Aufgabe).
+
+    Reines bulk UPDATE...WHERE pro betroffener Zeile (identisches CAS-
+    Prinzip wie try_claim/expire_overdue) - ein zeitgleicher
+    Bestätigungsversuch für dieselbe Zeile geht dadurch nicht verloren,
+    gewinnt einfach wer zuerst committet.
+
+    Gibt die Ticker der tatsächlich abgelaufenen Einträge zurück (Logging).
+    """
+    with get_session() as session:
+        candidates = session.query(PendingConfirmation).filter_by(
+            user_id=user_id, status=STATUS_PENDING
+        ).all()
+        to_expire = [p for p in candidates if p.ticker not in still_qualifying_tickers]
+        expired_tickers = []
+        for p in to_expire:
+            result = session.execute(
+                text("UPDATE pending_confirmations SET status = :expired, resolved_at = :now "
+                     "WHERE id = :id AND status = :pending_status"),
+                {"expired": STATUS_EXPIRED, "now": datetime.utcnow(), "id": p.id, "pending_status": STATUS_PENDING},
+            )
+            if result.rowcount == 1:
+                expired_tickers.append(p.ticker)
+        session.commit()
+        return expired_tickers
 
 
 def get_pending_by_token(token: str) -> PendingConfirmation | None:

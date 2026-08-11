@@ -89,6 +89,11 @@ def _execute_or_queue_entry(signal, llm_result: dict, user_id: int):
     2026-08-11) - entweder eine echte Order (bisheriges Verhalten,
     EXECUTION_MODE='auto') ODER ein PENDING-Eintrag zur späteren Bestätigung
     (EXECUTION_MODE='confirm', siehe database.DEFAULT_USER_CONFIG/Chunk 1).
+    Confirm-Pfad seit Chunk 2d (2026-08-11, NUR Alpaca): liegt für diesen
+    Ticker bereits ein offener PENDING-Eintrag vor, wird er mit dem
+    aktuellsten Preis/Score aktualisiert statt (Chunk 2b-Verhalten) den
+    Re-Scan-Treffer nur zu verwerfen - siehe confirm_execution.update_
+    pending_confirmation für die volle Begründung.
 
     Architektur (mit dem Anwalt abgestimmt, Option C): confirm_execution.py
     ist physisch vom Auto-Execution-Pfad (broker.py) getrennt - importiert
@@ -129,32 +134,51 @@ def _execute_or_queue_entry(signal, llm_result: dict, user_id: int):
                   f"EXECUTION_MODE=auto, place_trade() wird aufgerufen ({signal.ticker}).")
         return place_trade(signal, llm_result, user_id)
 
-    # Dedup (Chunk 2b, Aufgabe Punkt 10): derselbe Kandidat kann über mehrere
-    # Entry-Slots/Scans hinweg erneut ein Signal auslösen (z.B. weiterhin
-    # über der Schwelle bewertet), solange die vorherige Bestätigung noch
-    # nicht bearbeitet wurde - ohne diesen Check gäbe es einen neuen PENDING-
-    # Eintrag UND eine neue Mail pro Slot für denselben, längst schon zur
-    # Bestätigung vorgemerkten Trade.
-    existing = confirm_execution.find_existing_pending(user_id, signal.ticker)
-    if existing is not None:
-        print(f"   ⏳ Nutzer {user_id}: {signal.ticker} hat bereits eine offene Bestätigung "
-              f"(PENDING #{existing.id}) – kein Duplikat erzeugt.")
-        return None
-
-    preview_qty = calculate_quantity(
-        signal.current_price, get_user_live_config(user_id)["MAX_CAPITAL_PER_TRADE"]
-    )
-    if preview_qty <= 0:
-        print(f"   ❌ Nutzer {user_id}: {signal.ticker} übersprungen – kein Kapital für "
-              f"auch nur eine Bruchteil-Aktie (Confirm-Tier-Vorschau).")
-        return None
-
     # signal_payload/llm_payload (Chunk 2b): vollständige Momentaufnahme via
     # dataclasses.asdict() statt Feld-für-Feld-Auswahl - robuster gegen
     # künftige SignalResult-Erweiterungen (place_trade() bräuchte sie dann
     # automatisch mit, ohne dass dieser Aufrufer angepasst werden muss).
     # llm_result ist bereits ein reines, JSON-serialisierbares Dict (siehe
-    # llm_analyst.analyze_with_llm), wird unverändert übernommen.
+    # llm_analyst.analyze_with_llm), wird unverändert übernommen. Vor dem
+    # Dedup-Check berechnet (Chunk 2d), da der Update-Pfad unten dieselbe
+    # frische Vorschau-Menge braucht wie der Neuerzeugungs-Pfad.
+    preview_qty = calculate_quantity(
+        signal.current_price, get_user_live_config(user_id)["MAX_CAPITAL_PER_TRADE"]
+    )
+
+    # Update statt Dedup-Verwerfung (Chunk 2d, ersetzt das bisherige Chunk-
+    # 2b-Verhalten): derselbe Kandidat kann über mehrere Entry-Slots/Scans
+    # hinweg erneut ein Signal auslösen, solange die vorherige Bestätigung
+    # noch nicht bearbeitet wurde. Vorher (Chunk 2b) wurde ein solcher
+    # Re-Scan-Treffer nur verworfen (kein Duplikat, aber auch keine
+    # Aktualisierung) - jetzt wird der bestehende Eintrag mit dem
+    # aktuellsten Preis/Score/Payload aktualisiert (KEIN neuer Eintrag,
+    # KEINE neue Mail, siehe update_pending_confirmation-Docstring), damit
+    # ein Nutzer, der erst Stunden später reagiert, trotzdem den aktuellen
+    # Zustand sieht/bestätigt statt eines veralteten Signalzeitpunkts.
+    existing = confirm_execution.find_existing_pending(user_id, signal.ticker)
+    if existing is not None:
+        updated = confirm_execution.update_pending_confirmation(
+            existing, quantity=preview_qty, signal_price=signal.current_price,
+            signal_payload=dataclasses.asdict(signal), llm_payload=llm_result,
+        )
+        if updated is not None:
+            print(f"   🔄 Nutzer {user_id}: {signal.ticker} PENDING #{existing.id} aktualisiert "
+                  f"(Preis ${signal.current_price:.2f}, Score {signal.score}) – weiterhin keine "
+                  f"Order, keine neue Mail.")
+            return None
+        # Race-Fall: die Zeile wurde zwischen dem obigen Lookup und dem
+        # Update-Versuch bereits final bearbeitet (bestätigt/abgelehnt/
+        # abgelaufen, z.B. durch den zeitgleich laufenden expire_overdue()-
+        # Job oder einen Klick des Nutzers) - fällt bewusst durch zur
+        # Neuerzeugung unten, als wäre es ein frischer Kandidat (der Ticker
+        # qualifiziert sich ja gerade jetzt wieder).
+
+    if preview_qty <= 0:
+        print(f"   ❌ Nutzer {user_id}: {signal.ticker} übersprungen – kein Kapital für "
+              f"auch nur eine Bruchteil-Aktie (Confirm-Tier-Vorschau).")
+        return None
+
     pending = confirm_execution.create_pending_confirmation(
         user_id=user_id, ticker=signal.ticker,
         quantity=preview_qty, signal_price=signal.current_price,
@@ -881,6 +905,25 @@ def run_entry_cycle(slot: EntryTimeSlot):
             user_guardrail_reasons = {}
             user_trades_in_slot = 0
             verlustlimit_alert_gesendet = False
+
+            # Confirm-Tier Chunk 2d (Aufgabe Punkt 2, zweite Hälfte, NUR
+            # Alpaca): proaktives Expire VOR der Kandidaten-Schleife unten -
+            # ein PENDING-Eintrag, dessen Ticker in DIESEM Zyklus nicht mehr
+            # über der Schwelle liegt, läuft sofort ab statt bis zum
+            # Handelsschluss/Timeout zu warten. `approved` ist bereits die
+            # score-gefilterte Kandidatenliste dieses Zyklus (siehe Schritt 4
+            # oben) - bewusst score-basiert, nicht guardrail-basiert (ein
+            # Guardrail-Zustand wie MAX_OPEN_POSITIONS ist kein Ablauf-
+            # Kriterium für eine bereits wartende Bestätigung, siehe Aufgabe).
+            # is_confirm_mode()-Gate spart die Query für Auto-Modus-Nutzer,
+            # die ohnehin nie PENDING-Einträge haben.
+            if confirm_execution.is_confirm_mode(user_id):
+                expired_tickers = confirm_execution.expire_dropped_below_threshold(
+                    user_id, {s.ticker for s in approved}
+                )
+                for t in expired_tickers:
+                    print(f"   ⌛ Nutzer {user_id}: {t} nicht mehr über der Schwelle – "
+                          f"offene Bestätigung proaktiv abgelaufen.")
 
             for signal in approved:
                 if user_trades_in_slot >= user_erlaubt:
