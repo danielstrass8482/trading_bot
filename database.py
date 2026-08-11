@@ -395,9 +395,21 @@ DEFAULT_CONFIG = {
     "EARNINGS_BUFFER_DAYS":    ("3",      "Tage vor Earnings in denen nicht gekauft wird"),
     "ACTIVE_BROKER":           ("alpaca", "Aktiver Broker für neue Trades: alpaca / ibkr"),
     "ALPACA_DRAIN_MODE":       ("true",   "Alpaca: Keine neuen Käufe, nur bestehende Positionen managen"),
-    # Confirm-Tier (Chunk 1, 2026-08-07): Datenmodell/Settings nur, noch
-    # keine Verhaltensänderung – kein bestehender Code liest diese Keys.
-    "EXECUTION_MODE":          ("auto",   "Trade-Ausführung: 'auto' (sofort) oder 'confirm' (manuelle Bestätigung vor Entry-Trades)"),
+    # Confirm-Tier (Chunk 1, 2026-08-07: nur Datenmodell/Settings, keine
+    # Verhaltensänderung. Chunk 2a, 2026-08-11: main.run_entry_cycle liest
+    # EXECUTION_MODE jetzt tatsächlich, siehe confirm_execution.py). Default
+    # auf 'confirm' umgestellt (statt 'auto') - bewusster Sicherheits-Default
+    # für diese Zwischenphase: Chunk 2b (Bestätigungskanäle) und 2c (Preis-
+    # Re-Check/Timeout) fehlen noch, ein PENDING-Eintrag führt bis dahin zu
+    # KEINER Order (siehe confirm_execution.py-Moduldoc - das ist gewollt,
+    # kein Bug). Betrifft NUR neu geseedete bot_config-Zeilen (dieser
+    # Deploy-Zweig wurde in dieser Session nicht auf den VPS ausgerollt,
+    # siehe Aufgabe) - Daniels bereits bestehende, in Chunk 1 auf 'auto'
+    # gesetzte Live-Zeile bleibt bei einem künftigen Deploy unverändert
+    # 'auto', bis das bewusst geändert wird (kein automatischer Rückwärts-
+    # Effekt auf bereits existierende Werte, siehe init_db()-Seed-Logik:
+    # "nur fehlende Keys").
+    "EXECUTION_MODE":          ("confirm", "Trade-Ausführung: 'auto' (sofort) oder 'confirm' (manuelle Bestätigung vor Entry-Trades)"),
     "PRICE_TOLERANCE_PCT":     ("0.02",   "Erlaubte Preisabweichung ggü. Signal-Preis bei manueller Bestätigung, bevor der Trade verworfen wird"),
 }
 
@@ -513,10 +525,12 @@ DEFAULT_USER_CONFIG: dict = {
     "MAX_OPEN_POSITIONS":    (int,   3),
     "MAX_TRADES_PER_DAY":    (int,   2),
     "DAILY_LOSS_LIMIT_PCT":  (float, 0.05),
-    # Confirm-Tier (Chunk 1, 2026-08-07): siehe DEFAULT_CONFIG oben für die
-    # volle Begründung. Default 'auto'/0.02 hält jeden bestehenden Nutzer
-    # unverändert im heutigen Sofort-Ausführungs-Verhalten.
-    "EXECUTION_MODE":        (str,   "auto"),
+    # Confirm-Tier (Chunk 1, 2026-08-07; Default auf 'confirm' umgestellt in
+    # Chunk 2a, 2026-08-11): siehe DEFAULT_CONFIG oben für die volle
+    # Begründung - neu verbundene Nutzer starten damit im sicheren
+    # Bestätigungs-Modus statt im Sofort-Ausführungs-Modus, bis der
+    # komplette Confirm-Tier-Flow (2b/2c) steht.
+    "EXECUTION_MODE":        (str,   "confirm"),
     "PRICE_TOLERANCE_PCT":   (float, 0.02),
     # Ab hier: Aufgabe "Presets/Kapitalaufteilung/Guardrails pro Nutzer"
     # (2026-08-08) – vorher NUR in der globalen bot_config, siehe DEFAULT_

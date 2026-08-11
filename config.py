@@ -431,9 +431,14 @@ _LIVE_CONFIG_SPEC = {
     "EARNINGS_BUFFER_DAYS":    (int,   EARNINGS_BUFFER_DAYS),
     "ACTIVE_BROKER":           (str,   "alpaca"),  # "alpaca" oder "ibkr" (siehe broker.get_broker)
     "ALPACA_DRAIN_MODE":       (str,   "false"),   # "true" = keine neuen Alpaca-Käufe, nur bestehende Positionen managen
-    # Confirm-Tier (Chunk 1, 2026-08-07): Datenmodell/Settings, noch ohne
-    # Verhaltensänderung (siehe database.py::DEFAULT_CONFIG/DEFAULT_USER_CONFIG).
-    "EXECUTION_MODE":         (str,   "auto"),     # "auto" oder "confirm" (manuelle Bestätigung vor Entry-Trades)
+    # Confirm-Tier (Chunk 1, 2026-08-07; main.run_entry_cycle liest den Wert
+    # tatsächlich seit Chunk 2a, 2026-08-11, siehe confirm_execution.py).
+    # 'confirm' als Fail-Safe-Fallback (greift nur, falls die DB nicht
+    # erreichbar ist ODER kein bot_config-Wert existiert, siehe get_live_
+    # config()-Docstring) - konsistent zum neuen Seed-Default in database.py
+    # DEFAULT_CONFIG/DEFAULT_USER_CONFIG: lieber ein verpasster Auto-Trade als
+    # ein ungewollter, während dieser Zwischenphase (Chunk 2b/2c fehlen noch).
+    "EXECUTION_MODE":         (str,   "confirm"),  # "auto" oder "confirm" (manuelle Bestätigung vor Entry-Trades)
     "PRICE_TOLERANCE_PCT":    (float, 0.02),
 }
 

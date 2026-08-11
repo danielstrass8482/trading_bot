@@ -31,8 +31,9 @@ from broker import (
     check_guardrails, check_position_consistency, GuardrailViolation,
     get_alpaca_account_snapshot, get_effective_max_capital_total_bot,
     get_effective_max_capital_total_bot_costbasis, get_pause_status,
-    sync_capital_flows,
+    sync_capital_flows, calculate_quantity,
 )
+import confirm_execution
 from backlook import run_backlook
 from fair_value import update_fair_value_cache, get_undervalued_tickers
 from saxo_client import get_valid_access_token
@@ -79,6 +80,58 @@ def _nearest_entry_slot_label(session, dt_et) -> str:
     minutes = dt_et.hour * 60 + dt_et.minute
     closest = min(slots, key=lambda s: abs((s.stunde_et * 60 + s.minute_et) - minutes))
     return f"{closest.stunde_et:02d}:{closest.minute_et:02d}"
+
+
+def _execute_or_queue_entry(signal, llm_result: dict, user_id: int):
+    """
+    Entry-Dispatch für EINEN freigegebenen Kandidaten (Confirm-Tier Chunk 2a,
+    2026-08-11) - entweder eine echte Order (bisheriges Verhalten,
+    EXECUTION_MODE='auto') ODER ein PENDING-Eintrag zur späteren Bestätigung
+    (EXECUTION_MODE='confirm', siehe database.DEFAULT_USER_CONFIG/Chunk 1).
+
+    Architektur (mit dem Anwalt abgestimmt, Option C): confirm_execution.py
+    ist physisch vom Auto-Execution-Pfad (broker.py) getrennt - importiert
+    dort bewusst nichts (kein place_trade, kein Order-Call). Dieser
+    Dispatcher hier lebt bewusst in main.py (dem neutralen Orchestrator, der
+    ohnehin schon beide Seiten kennt) statt in einem der beiden Module -
+    weder confirm_execution.py noch broker.py importieren sich gegenseitig.
+
+    quantity im Confirm-Pfad kommt über die bereits bestehende, reine
+    Rechenfunktion calculate_quantity() (kein Order-Call) - identische
+    Formel wie in place_trade(), aber ohne dessen zusätzlichen Live-Cash-
+    Realitätscheck (AUFGABE 4), da hier noch keine Order stattfindet, nur
+    eine Vorschau-Menge für die spätere Bestätigung.
+
+    Guardrails wurden vom Aufrufer (run_entry_cycle) bereits vor diesem
+    Aufruf geprüft, gelten identisch für beide Pfade. place_trade() prüft
+    sie im Auto-Pfad intern nochmal (Sicherheitsnetz) und kann daher
+    GuardrailViolation werfen - das propagiert hier unverändert nach oben
+    (identisch zum bisherigen Verhalten vor Chunk 2a).
+
+    Rückgabe: das Trade-Objekt bei echter Order-Ausführung (auto-Modus,
+    unverändert), sonst None (confirm-Modus: PENDING erzeugt, ODER kein
+    Kapital für auch nur eine Bruchteil-Aktie verfügbar - in beiden Fällen
+    kein tatsächlicher Trade, der Aufrufer zählt das korrekt nicht als
+    ausgeführt).
+    """
+    if not confirm_execution.is_confirm_mode(user_id):
+        return place_trade(signal, llm_result, user_id)
+
+    preview_qty = calculate_quantity(
+        signal.current_price, get_user_live_config(user_id)["MAX_CAPITAL_PER_TRADE"]
+    )
+    if preview_qty <= 0:
+        print(f"   ❌ Nutzer {user_id}: {signal.ticker} übersprungen – kein Kapital für "
+              f"auch nur eine Bruchteil-Aktie (Confirm-Tier-Vorschau).")
+        return None
+
+    pending = confirm_execution.create_pending_confirmation(
+        user_id=user_id, ticker=signal.ticker,
+        quantity=preview_qty, signal_price=signal.current_price,
+    )
+    print(f"   ⏳ Nutzer {user_id}: {signal.ticker} wartet auf Bestätigung "
+          f"(Confirm-Tier, PENDING #{pending.id}) – KEINE Order platziert.")
+    return None
 
 
 def _capture_daily_position_snapshot_for_user(user_id: int, today) -> None:
@@ -866,10 +919,13 @@ def run_entry_cycle(slot: EntryTimeSlot):
                     for r in llm_result["risks"]:
                         print(f"   ⚠️  {r}")
 
-                # Trade platzieren (Guardrails werden intern nochmal geprüft – Sicherheitsnetz
-                # falls sich der Zustand zwischen Vor-Check und Order-Platzierung ändert).
+                # Trade platzieren ODER (Confirm-Tier, Chunk 2a) zur Bestätigung
+                # vormerken - siehe _execute_or_queue_entry(). Guardrails werden
+                # bei einer echten Order intern nochmal geprüft (Sicherheitsnetz
+                # falls sich der Zustand zwischen Vor-Check und Order-Platzierung
+                # ändert) - das kann weiterhin GuardrailViolation werfen.
                 try:
-                    trade = place_trade(signal, llm_result, user_id)
+                    trade = _execute_or_queue_entry(signal, llm_result, user_id)
                     if trade:
                         user_executed_trades.append(trade)
                         user_trades_in_slot += 1  # Nur hier erhöhen – ein echter Trade wurde ausgeführt
