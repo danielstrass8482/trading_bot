@@ -6,13 +6,15 @@ Identische Schnittstelle für beide Modi – nur die URL ändert sich.
 import os
 import uuid
 import pytz
+from contextlib import contextmanager
 from datetime import datetime, timedelta
+from sqlalchemy import text
 from config import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL,
     TRADING_MODE, get_live_config, DEFAULT_USER_ID, MAX_CAPITAL_TOTAL,
 )
 from database import (
-    get_session, Trade, get_open_trades,
+    get_session, Trade, get_open_trades, engine,
     get_daily_trade_count, get_total_capital_in_trades,
     get_total_pnl, get_daily_pnl, close_trade, BotState,
     get_alpaca_api_for_user, PendingOrderAttempt,
@@ -654,6 +656,60 @@ def _reconcile_pending_entry_attempt(client, ticker: str, user_id: int = DEFAULT
     return existing
 
 
+# Namespace-Konstante für den Guardrail-Lock unten (siehe _user_trade_guardrail_
+# lock) – beliebig gewählt, aber fest, damit dieser Lock-Key-Raum nicht mit
+# einem etwaigen künftigen anderen pg_advisory_lock-Nutzer in diesem Prozess
+# kollidiert (Postgres-Advisory-Locks sind global pro DB, nicht pro Tabelle/
+# Feature namensraumgetrennt).
+_TRADE_GUARDRAIL_LOCK_NAMESPACE = 894613
+
+
+@contextmanager
+def _user_trade_guardrail_lock(user_id: int):
+    """
+    Race-Condition-Fix (2026-08-13): check_guardrails() (Tageslimit/max.
+    offene Positionen – reine SELECTs, kein Lock) und die eigentliche
+    Trade-Anlage (session.add(Trade)/commit ganz am Ende von place_trade())
+    liefen bisher in ZWEI GETRENNTEN Transaktionen mit einem teils
+    sekundenlangen Fenster dazwischen (Alpaca-Order-Platzierung + bis zu
+    3x 1s Fill-Polling). Zwei parallele place_trade()-Aufrufe für DENSELBEN
+    Nutzer (z.B. schnelles Bestätigen mehrerer unterschiedlicher Confirm-
+    Tier-Einträge kurz hintereinander – confirm_execution.try_claim()
+    schützt dort nur die EINZELNE PendingConfirmation-Zeile vor Doppel-
+    Ausführung, nicht den GLOBALEN Tageslimit-/Positionslimit-Zähler)
+    konnten beide denselben, vom jeweils anderen noch nicht erhöhten
+    Zählerstand lesen und beide durchkommen. Gemeldeter Vorfall: 3
+    ausgeführte Trades bei MAX_TRADES_PER_DAY=2, die Ablehnung ("3 von 2")
+    kam erst nach der dritten Order.
+
+    Postgres SESSION-Advisory-Lock (bewusst NICHT pg_advisory_xact_lock,
+    da check_guardrails() und der finale INSERT in unterschiedlichen
+    get_session()-Blöcken/Transaktionen laufen, also keine einzelne
+    Transaktion die gesamte place_trade()-Dauer umspannt) auf
+    (Namespace, user_id) – serialisiert konkurrierende place_trade()-
+    Aufrufe für DENSELBEN Nutzer vollständig (auch über den Alpaca-
+    Netzwerk-Call hinweg: der zweite Aufrufer wartet, bis der erste seinen
+    Trade committet oder mit einer GuardrailViolation/None abbricht, sieht
+    danach den korrekt erhöhten Zählerstand). Verschiedene Nutzer blockieren
+    sich gegenseitig NICHT (unterschiedlicher Lock-Key) – kein Cross-Tenant-
+    Delay. Lock/Unlock laufen explizit auf derselben rohen Connection
+    (nicht über den ORM-Session-Pool, dessen Connections zwischen den
+    einzelnen get_session()-Blöcken innerhalb von place_trade() wechseln
+    können).
+    """
+    conn = engine.connect()
+    try:
+        conn.execute(text("SELECT pg_advisory_lock(:ns, :uid)"),
+                     {"ns": _TRADE_GUARDRAIL_LOCK_NAMESPACE, "uid": user_id})
+        yield
+    finally:
+        try:
+            conn.execute(text("SELECT pg_advisory_unlock(:ns, :uid)"),
+                         {"ns": _TRADE_GUARDRAIL_LOCK_NAMESPACE, "uid": user_id})
+        finally:
+            conn.close()
+
+
 def place_trade(signal: SignalResult, llm_result: dict, user_id: int = DEFAULT_USER_ID) -> Trade | None:
     """
     Führt Trade aus (Paper oder Live), für EINEN Nutzer (Multi-Tenant-
@@ -663,7 +719,19 @@ def place_trade(signal: SignalResult, llm_result: dict, user_id: int = DEFAULT_U
     2. Order bei Alpaca platzieren (oder Paper-Simulation)
     3. Trade in DB loggen (mit user_id)
     Gibt Trade-Objekt zurück oder None bei Fehler.
+
+    Race-Condition-Fix (2026-08-13): die gesamte Funktion läuft jetzt hinter
+    _user_trade_guardrail_lock(user_id) – siehe dortige Docstring für den
+    genauen Vorfall/die Begründung. Dünner Wrapper statt Inline-`with`, um
+    den bestehenden Funktionskörper nicht komplett neu einrücken zu müssen.
     """
+    with _user_trade_guardrail_lock(user_id):
+        return _place_trade_locked(signal, llm_result, user_id)
+
+
+def _place_trade_locked(signal: SignalResult, llm_result: dict, user_id: int = DEFAULT_USER_ID) -> Trade | None:
+    """Eigentliche place_trade()-Implementierung – läuft IMMER innerhalb von
+    _user_trade_guardrail_lock, niemals direkt aufrufen."""
     # Guardrails zuerst – keine Ausnahmen
     check_guardrails(signal, user_id)  # Wirft GuardrailViolation bei Verstoß
 
