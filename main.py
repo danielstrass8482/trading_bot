@@ -259,17 +259,29 @@ def capture_daily_position_snapshot():
             print(f"🚨 Nutzer {uid}: Positions-Snapshot fehlgeschlagen ({e}) – andere Nutzer nicht betroffen.")
 
 
-def _send_daily_summary_email_for_user(user_id: int, today, slots_heute, no_trade_reasons) -> None:
+def _send_daily_summary_email_for_user(user_id: int, today, slots_heute) -> None:
     """
     Baut+verschickt die Tages-Mail EINES Nutzers – siehe
-    send_daily_summary_email() für slots_heute/no_trade_reasons (geteilter
-    Markt-Scan, für jeden Nutzer identisch, siehe dortige Begründung).
+    send_daily_summary_email() für slots_heute (geteilter Markt-Scan-
+    Überblick gescannt/über Schwellwert/Ø Score, für jeden Nutzer identisch,
+    siehe dortige Begründung – enthält keinen Guardrail-Text, daher unkritisch
+    geteilt).
 
     Alles andere hier ist strikt auf user_id gescoped: eigene Trades (über
     _nearest_entry_slot_label statt der kollisionsanfälligen scan_log.
     trade_id-Zuordnung, siehe dortige Docstring), eigene offene Positionen,
     eigener Portfolio-Wert, eigener Vorabend-Vergleich, eigene 30-Tage-
     Performance, eigener Pause-Status.
+
+    Multi-Tenant-Datenleck-Fix (2026-08-12, gleiche Bug-Klasse wie der
+    scan_log-guardrail_reason-Leak vom 2026-08-11, siehe a6e32b9/e7dcd3a):
+    no_trade_reasons wurde bisher EINMAL global (höchstbewerteter Kandidat
+    über ALLE Nutzer hinweg) in send_daily_summary_email() berechnet und an
+    JEDEN Nutzer weitergereicht – ein Nutzer konnte so den guardrail_reason-
+    Text aus einem FREMDEN Account in seiner eigenen Mail sehen (Guardrails
+    sind seit dem 08-11-Fix pro Nutzer unterschiedliche scan_log-Zeilen).
+    Wird jetzt hier, pro Nutzer und mit user_id-Filter auf scan_log, lokal
+    berechnet statt als Parameter übergeben.
     """
     recipient = ALERT_EMAIL if user_id == DEFAULT_USER_ID else get_user_email(user_id)
     if not recipient:
@@ -292,6 +304,26 @@ def _send_daily_summary_email_for_user(user_id: int, today, slots_heute, no_trad
             created_et = row.created_at.replace(tzinfo=pytz.utc).astimezone(et_tz) if row.created_at.tzinfo is None \
                 else row.created_at.astimezone(et_tz)
             trades_by_slot.setdefault(_nearest_entry_slot_label(session, created_et), []).append(row)
+
+        no_trade_reasons: dict = {}
+        for slot in slots_heute:
+            if slot.slot_et in trades_by_slot:
+                continue
+            if not slot.ueber_65:
+                no_trade_reasons[slot.slot_et] = f"Kein Signal über Schwellwert (Ø Score {slot.avg_score})"
+                continue
+            reason_row = session.execute(text("""
+                SELECT guardrail_reason FROM scan_log
+                WHERE user_id = :uid
+                  AND slot_et = :slot_et
+                  AND DATE(scan_time AT TIME ZONE 'America/New_York') = :today
+                  AND score >= 65
+                ORDER BY score DESC LIMIT 1
+            """), {"uid": user_id, "slot_et": slot.slot_et, "today": today}).fetchone()
+            no_trade_reasons[slot.slot_et] = (
+                reason_row.guardrail_reason if reason_row and reason_row.guardrail_reason
+                else "Kein Trade ausgeführt (Grund nicht ermittelbar)"
+            )
 
         open_trades = session.execute(text("""
             SELECT id, ticker, entry_price, quantity, capital_used
@@ -371,11 +403,8 @@ Slot {slot.slot_et} ET (gescannt: {slot.gescannt}, über Schwellwert: {slot.uebe
                     f"Kapital ${t.capital_used:.2f} | Menge {t.quantity:.4f}\n"
                 )
         else:
-            # no_trade_reasons ist der geteilte Scan-Grund (siehe send_daily_
-            # summary_email-Docstring) - für die meisten Fälle (kein Signal
-            # über Schwellwert, Slot-Cap) für jeden Nutzer identisch gültig;
-            # bei einem kapitalabhängigen Guardrail kann er von DIESES
-            # Nutzers tatsächlichem individuellem Grund abweichen.
+            # no_trade_reasons ist jetzt pro Nutzer aus dessen EIGENEN
+            # scan_log-Zeilen berechnet (s.o.), kein geteilter Text mehr.
             body += f"  Kein eigener Trade – {no_trade_reasons.get(slot.slot_et, 'Kein Trade ausgeführt')}\n"
 
     # Absicherung: ein eigener Trade, dessen per Zeit ermittelter Slot in
@@ -471,13 +500,12 @@ def send_daily_summary_email():
     (er hat nie eigene Keys/E-Mail über den Connect-Flow hinterlegt, siehe
     get_connected_alpaca_users-Docstring).
 
-    slots_heute/no_trade_reasons (Markt-Scan-Übersicht: gescannt/über
-    Schwellwert/Ø Score je Slot) werden EINMAL für alle Nutzer geladen -
-    derselbe geteilte Signal-Scan wie in scan_log seit jeher (siehe dessen
-    Docstring: "läuft zentral EINMAL pro Ticker/Slot ... nicht sensibel"),
-    keine Nutzerbindung nötig oder sinnvoll. Welche TRADES daraus tatsächlich
-    wurden, wird dagegen pro Nutzer separat und korrekt aus der trades-
-    Tabelle ermittelt (siehe _send_daily_summary_email_for_user).
+    slots_heute (Markt-Scan-Übersicht: gescannt/über Schwellwert/Ø Score je
+    Slot) wird EINMAL für alle Nutzer geladen - reine, nicht Konto-bezogene
+    Markt-Aggregate (kein guardrail_reason). Welche TRADES daraus tatsächlich
+    wurden UND aus welchem Grund ein Slot tradefrei blieb, wird dagegen pro
+    Nutzer separat und korrekt aus trades/scan_log ermittelt (Datenleck-Fix
+    2026-08-12, siehe _send_daily_summary_email_for_user-Docstring).
     """
     et_tz = pytz.timezone("America/New_York")
     today = datetime.now(et_tz).date()
@@ -496,34 +524,19 @@ def send_daily_summary_email():
             ORDER BY slot_et
         """), {"today": today}).fetchall()
 
-        # Grund fürs Ausbleiben eines Trades je tradefreiem Slot: entweder kein
-        # Signal über Schwellwert, oder der bestbewertete freigegebene Kandidat
-        # wurde von einem Guardrail geblockt (siehe run_entry_cycle). Geteilter
-        # Scan-Grund (siehe Docstring oben) - kann für einen individuellen
-        # Nutzer leicht abweichen, wenn dessen Guardrail-Treffer unterschiedlich
-        # war.
-        no_trade_reasons: dict = {}
-        for slot in slots_heute:
-            if slot.trades:
-                continue
-            if not slot.ueber_65:
-                no_trade_reasons[slot.slot_et] = f"Kein Signal über Schwellwert (Ø Score {slot.avg_score})"
-                continue
-            reason_row = session.execute(text("""
-                SELECT guardrail_reason FROM scan_log
-                WHERE slot_et = :slot_et
-                  AND DATE(scan_time AT TIME ZONE 'America/New_York') = :today
-                  AND score >= 65
-                ORDER BY score DESC LIMIT 1
-            """), {"slot_et": slot.slot_et, "today": today}).fetchone()
-            no_trade_reasons[slot.slot_et] = (
-                reason_row.guardrail_reason if reason_row and reason_row.guardrail_reason
-                else "Kein Trade ausgeführt (Grund nicht ermittelbar)"
-            )
+    # Grund fürs Ausbleiben eines Trades je tradefreiem Slot (entweder kein
+    # Signal über Schwellwert, oder der bestbewertete freigegebene Kandidat
+    # wurde von einem Guardrail geblockt, siehe run_entry_cycle) wird NICHT
+    # mehr hier berechnet - Datenleck-Fix 2026-08-12 (gleiche Bug-Klasse wie
+    # der scan_log-guardrail_reason-Leak vom 2026-08-11, siehe a6e32b9/
+    # e7dcd3a): der Guardrail-Grund ist pro Nutzer unterschiedlich (eigenes
+    # Kapital/offene Positionen/Cooldown), ein hier global berechneter Text
+    # hätte einem Nutzer den Grund aus einem FREMDEN Account gezeigt. Wird
+    # jetzt pro Nutzer in _send_daily_summary_email_for_user() berechnet.
 
     for uid in get_connected_user_ids():
         try:
-            _send_daily_summary_email_for_user(uid, today, slots_heute, no_trade_reasons)
+            _send_daily_summary_email_for_user(uid, today, slots_heute)
         except Exception as e:
             print(f"🚨 Nutzer {uid}: Tages-Mail fehlgeschlagen ({e}) – andere Nutzer nicht betroffen.")
 
