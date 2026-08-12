@@ -355,6 +355,13 @@ DAILY_LOSS_LIMIT_PCT  = 0.05     # Bot pausiert bei -5% Tagesverlust auf Gesamtk
 # Tagesverlustlimit aktiv sein.
 MAX_CONSECUTIVE_LOSSES = 3
 COOLDOWN_HOURS_AFTER_LOSS_STREAK = 4.0
+# Mindest-Verlust-Schwelle (2026-08-12, in %, DIREKT vergleichbar mit
+# Trade.pnl_pct, nicht die sonst übliche Fraction-Konvention wie STOP_LOSS_
+# PCT): ein Exit zählt für obigen Zähler nur dann als "Verlust", wenn
+# pnl_pct <= -LOSS_STREAK_MIN_LOSS_PCT. Kleinere Verluste (egal ob Stop
+# Loss oder Time-Exit) sind neutral - zählen nicht, brechen eine bestehende
+# Serie aber auch nicht ab. Siehe database._record_loss_streak_result.
+LOSS_STREAK_MIN_LOSS_PCT = 1.0
 MIN_SIGNAL_SCORE      = 65       # Minimaler Rule-Engine-Score (0–100) für Trade-Freigabe
 
 # Markt-Kontext-Filter (KO-Kriterien)
@@ -417,6 +424,7 @@ _LIVE_CONFIG_SPEC = {
     "DAILY_LOSS_LIMIT_PCT":    (float, DAILY_LOSS_LIMIT_PCT),
     "MAX_CONSECUTIVE_LOSSES":  (int,   MAX_CONSECUTIVE_LOSSES),
     "COOLDOWN_HOURS_AFTER_LOSS_STREAK": (float, COOLDOWN_HOURS_AFTER_LOSS_STREAK),
+    "LOSS_STREAK_MIN_LOSS_PCT": (float, LOSS_STREAK_MIN_LOSS_PCT),
     "MIN_SIGNAL_SCORE":        (int,   MIN_SIGNAL_SCORE),
     "VIX_PAUSE_THRESHOLD":     (float, VIX_PAUSE_THRESHOLD),
     "MONITORING_INTERVAL_MIN": (int,   15),

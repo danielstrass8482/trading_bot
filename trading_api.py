@@ -835,6 +835,7 @@ USER_GUARDRAIL_DESCRIPTIONS = {
     "TRAILING_ACTIVATION_PCT":              "Trailing-Stop-Aktivierungsschwelle %",
     "MAX_CONSECUTIVE_LOSSES":               "Verlustserie-Cooldown: Anzahl Verluste in Folge",
     "COOLDOWN_HOURS_AFTER_LOSS_STREAK":     "Verlustserie-Cooldown: Pausendauer in Stunden",
+    "LOSS_STREAK_MIN_LOSS_PCT":             "Verlustserie-Cooldown: Mindest-Verlust % ab dem ein Exit als Verlust zählt",
     "MAX_HOLDING_DAYS":                     "Max. Haltedauer in Handelstagen",
     "MAX_HOLDING_DAYS_TRAILING_MULTIPLIER": "Harte Obergrenze bei aktivem Trailing-SL (× Max. Haltedauer)",
     "TIME_EXIT_GRACE_DAYS":                 "Schutzfrist für Gewinner ohne aktives Trailing (Handelstage)",

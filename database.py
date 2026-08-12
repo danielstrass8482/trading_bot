@@ -380,6 +380,7 @@ DEFAULT_CONFIG = {
     "DAILY_LOSS_LIMIT_PCT":    ("0.05",   "Tagesverlust-Limit %"),
     "MAX_CONSECUTIVE_LOSSES":  ("3",      "Verlustserie-Cooldown: Anzahl aufeinanderfolgender Verlust-Trades bis zur Pause"),
     "COOLDOWN_HOURS_AFTER_LOSS_STREAK": ("4.0", "Verlustserie-Cooldown: Pausendauer in Stunden"),
+    "LOSS_STREAK_MIN_LOSS_PCT": ("1.0",   "Verlustserie-Cooldown: Mindest-Verlust in % (pnl_pct-Skala, z.B. 1.0 = 1%), ab dem ein Exit als 'Verlust' zählt - kleinere Verluste sind neutral (zählen nicht, brechen die Serie aber auch nicht ab), unabhängig vom Exit-Grund (SL/Time-Exit/etc.)"),
     "MIN_SIGNAL_SCORE":        ("65",     "Minimaler Score"),
     "VIX_PAUSE_THRESHOLD":     ("30",     "VIX-Limit"),
     "MONITORING_INTERVAL_MIN": ("15",     "Monitoring-Intervall Minuten"),
@@ -561,6 +562,13 @@ DEFAULT_USER_CONFIG: dict = {
     "TRAILING_ACTIVATION_PCT":              (float, 0.06),
     "MAX_CONSECUTIVE_LOSSES":               (int,   3),
     "COOLDOWN_HOURS_AFTER_LOSS_STREAK":     (float, 4.0),
+    # Verlustserie-Cooldown-Fix (2026-08-12): vorher zählte JEDER Exit mit
+    # pnl_usd < 0 gleich, unabhängig von der Höhe - ein Time-Exit mit -0.1%
+    # (praktisch Rauschen) zählte genauso viel wie ein echter -3%-Stop-Loss.
+    # Schwelle in Prozent, DIREKT vergleichbar mit Trade.pnl_pct (dessen
+    # Skala, nicht die sonst übliche Fraction-Konvention wie STOP_LOSS_PCT=
+    # 0.03 - siehe _record_loss_streak_result-Docstring für die Begründung).
+    "LOSS_STREAK_MIN_LOSS_PCT":             (float, 1.0),
     "MAX_HOLDING_DAYS":                     (int,   5),
     "MAX_HOLDING_DAYS_TRAILING_MULTIPLIER": (int,   2),
     # TIME_EXIT_GRACE_DAYS lag bisher NUR in config._LIVE_CONFIG_SPEC (Fallback-
@@ -593,6 +601,7 @@ USER_CONFIG_BOUNDS: dict = {
     "TRAILING_ACTIVATION_PCT":              (0.005,  0.5),
     "MAX_CONSECUTIVE_LOSSES":               (1,      20),
     "COOLDOWN_HOURS_AFTER_LOSS_STREAK":     (0.1,    168.0),
+    "LOSS_STREAK_MIN_LOSS_PCT":             (0.0,    50.0),
     "MAX_HOLDING_DAYS":                     (1,      60),
     "MAX_HOLDING_DAYS_TRAILING_MULTIPLIER": (1,      10),
     "TIME_EXIT_GRACE_DAYS":                 (0,      30),
@@ -1556,7 +1565,7 @@ def close_trade(session: Session, trade: Trade, exit_price: float, reason: str) 
     # Verlustserie-Cooldown (2026-08-06): EINZIGER Aufrufpunkt für alle 4
     # close_trade()-Call-Sites in broker.py – zählt/pausiert unabhängig vom
     # jeweiligen Exit-Grund, siehe _record_loss_streak_result.
-    _record_loss_streak_result(session, trade.user_id, trade.pnl_usd)
+    _record_loss_streak_result(session, trade.user_id, trade.pnl_usd, trade.pnl_pct)
     return trade
 
 
@@ -1573,14 +1582,13 @@ def _loss_streak_cooldown_key(user_id: int = DEFAULT_USER_ID) -> str:
     return "loss_streak_cooldown_until" if user_id == DEFAULT_USER_ID else f"loss_streak_cooldown_until_user_{user_id}"
 
 
-def _record_loss_streak_result(session: Session, user_id: int, pnl_usd: float) -> None:
+def _record_loss_streak_result(session: Session, user_id: int, pnl_usd: float, pnl_pct: float) -> None:
     """
     Wird von close_trade() nach JEDEM geschlossenen Trade aufgerufen (AUFGABE 1,
-    2026-08-06). Zählt aufeinanderfolgende Verlust-Trades (pnl_usd < 0)
-    unabhängig von deren Höhe; ein Gewinn-Trade (pnl_usd >= 0) setzt den
-    Zähler zurück auf 0. Erreicht/überschreitet der Zähler
-    MAX_CONSECUTIVE_LOSSES, wird ein Cooldown-Ende (jetzt + COOLDOWN_HOURS_
-    AFTER_LOSS_STREAK Stunden) gesetzt bzw. verlängert – siehe
+    2026-08-06). Zählt aufeinanderfolgende ECHTE Verlust-Trades; ein Gewinn-
+    Trade (pnl_usd >= 0) setzt den Zähler zurück auf 0. Erreicht/überschreitet
+    der Zähler MAX_CONSECUTIVE_LOSSES, wird ein Cooldown-Ende (jetzt +
+    COOLDOWN_HOURS_AFTER_LOSS_STREAK Stunden) gesetzt bzw. verlängert – siehe
     broker.check_guardrails für die tatsächliche Entry-Sperre und
     get_loss_streak_state für die automatische Freigabe nach Ablauf.
     Committet NICHT selbst (wie close_trade() – der jeweilige Aufrufer in
@@ -1595,15 +1603,29 @@ def _record_loss_streak_result(session: Session, user_id: int, pnl_usd: float) -
     DEFAULT_USER_CONFIG). get_user_live_config(user_id) liefert für
     DEFAULT_USER_ID unverändert dieselbe globale bot_config wie vorher
     (kein Verhaltensunterschied für Daniel).
+
+    Mindest-Verlust-Schwelle (2026-08-12): bis dahin zählte JEDER Exit mit
+    pnl_usd < 0 gleich, unabhängig von der Höhe – ein Time-Exit mit -0.1%
+    (praktisch Rauschen um den Entry-Preis) zählte genauso viel wie ein
+    echter -3%-Stop-Loss zur selben Serie. "Verlust" im Sinne dieses Zählers
+    heißt jetzt: pnl_pct <= -LOSS_STREAK_MIN_LOSS_PCT. Ein Exit mit negativem,
+    aber betragsmäßig kleinerem pnl_pct ist NEUTRAL – zählt weder als Verlust
+    NOCH bricht er eine bestehende Serie ab (nur ein ECHTER Gewinn, pnl_usd
+    >= 0, setzt zurück). Gilt unabhängig vom Exit-Grund (SL/Time-Exit/
+    Trailing-SL/Manual) – reason wird hier bewusst nicht angesehen, exakt wie
+    schon vor diesem Fix.
     """
     cfg = get_user_live_config(user_id)
     count_key = _loss_streak_count_key(user_id)
     cooldown_key = _loss_streak_cooldown_key(user_id)
+    min_loss_pct = cfg["LOSS_STREAK_MIN_LOSS_PCT"]
 
-    if pnl_usd < 0:
-        count = int(BotState.get(session, count_key, "0")) + 1
-    else:
+    count = int(BotState.get(session, count_key, "0") or "0")
+    if pnl_usd >= 0:
         count = 0
+    elif pnl_pct <= -min_loss_pct:
+        count += 1
+    # else: Verlust unterhalb der Schwelle - neutral, count bleibt unverändert
     BotState.set(session, count_key, str(count))
 
     if count >= cfg["MAX_CONSECUTIVE_LOSSES"]:

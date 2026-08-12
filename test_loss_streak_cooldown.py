@@ -23,12 +23,16 @@ droppen (analog trading_bot_saxo/test_capital_guard_idempotency.py):
 DATABASE_URL kann per Env-Var überschrieben werden. NIEMALS gegen die echte
 Produktions-DB oder ein echtes Live-Konto ausführen.
 
-Deckt drei Szenarien ab (AUFGABE 3):
+Deckt vier Szenarien ab (AUFGABE 3, (d) ergänzt 2026-08-12):
   (a) MAX_CONSECUTIVE_LOSSES Verlust-Trades in Folge -> Cooldown aktiv,
       check_guardrails() blockiert neue Entries
   (b) Gewinn-Trade zwischendrin -> Zähler setzt korrekt zurück, kein Cooldown
   (c) abgelaufener Cooldown -> automatische Freigabe, Zähler zurück auf 0,
       Bot nimmt wieder normal Kandidaten an
+  (d) Mindest-Verlust-Schwelle LOSS_STREAK_MIN_LOSS_PCT: Exits mit einem
+      betragsmäßig kleineren Verlust als die Schwelle sind neutral (zählen
+      nicht, brechen eine bestehende Serie aber auch nicht ab) - unabhängig
+      vom Exit-Grund (Stop Loss vs. Time-Exit)
 """
 import os
 import sys
@@ -96,13 +100,14 @@ def make_open_trade(ticker, entry_price=100.0, quantity=1.0):
         return trade.id
 
 
-def close(trade_id, exit_price):
+def close(trade_id, exit_price, reason="CLOSED_MANUAL"):
     """Simuliert einen abgeschlossenen Trade über denselben Codepfad, den
     broker.py an allen 4 Call-Sites nutzt (database.close_trade), damit der
-    Test exakt die Produktionslogik trifft."""
+    Test exakt die Produktionslogik trifft. reason (CLOSED_SL/CLOSED_TIME_EXIT/
+    etc.) ist für den Verlustserie-Zähler bewusst irrelevant, siehe Szenario (d)."""
     with database.get_session() as session:
         trade = session.query(database.Trade).filter_by(id=trade_id).first()
-        database.close_trade(session, trade, exit_price, "CLOSED_MANUAL")
+        database.close_trade(session, trade, exit_price, reason)
         session.commit()
 
 
@@ -236,8 +241,67 @@ def test_c_cooldown_expiry_resumes_trading():
         record("c) check_guardrails() lässt Entry nach Cooldown-Ablauf wieder durch", False, repr(e))
 
 
+# ─────────────────────────────────────────────
+# (d) Mindest-Verlust-Schwelle (2026-08-12): kleine Verluste unter
+# LOSS_STREAK_MIN_LOSS_PCT sind neutral (zählen nicht, brechen aber auch
+# nicht ab) - unabhängig vom Exit-Grund (SL vs. Time-Exit)
+# ─────────────────────────────────────────────
+def test_d_small_losses_below_threshold_are_neutral():
+    wipe_all_state()
+    # set_bot_config (nicht set_user_bot_config!) - DEFAULT_USER_ID liest
+    # laut get_user_live_config()-Docstring IMMER 1:1 die globale bot_config,
+    # user_bot_config wird für ihn nie konsultiert.
+    with database.get_session() as session:
+        database.set_bot_config(session, "LOSS_STREAK_MIN_LOSS_PCT", "1.0")
+        session.commit()
+
+    # -0.3% (Entry 100 -> Exit 99.7) per Stop Loss UND per Time-Exit: beide
+    # bewusst deutlich unter der 1.0%-Schwelle, unabhängig vom Exit-Grund.
+    close(make_open_trade("SMALL_SL"), 99.7, reason="CLOSED_SL")
+    close(make_open_trade("SMALL_TIME"), 99.7, reason="CLOSED_TIME_EXIT")
+
+    with database.get_session() as session:
+        state = database.get_loss_streak_state(session, DEFAULT_USER_ID)
+    record(
+        "d) zwei -0.3%-Exits (SL + Time-Exit) erhöhen den Zähler NICHT",
+        state["consecutive_losses"] == 0 and not state["cooldown_active"],
+        f"consecutive_losses={state['consecutive_losses']} cooldown_active={state['cooldown_active']}"
+    )
+
+    # -1.5% (Entry 100 -> Exit 98.5) per Stop Loss UND per Time-Exit: beide
+    # deutlich über der Schwelle, MÜSSEN zählen - unabhängig vom Exit-Grund.
+    close(make_open_trade("BIG_SL"), 98.5, reason="CLOSED_SL")
+    with database.get_session() as session:
+        state = database.get_loss_streak_state(session, DEFAULT_USER_ID)
+    record("d) ein -1.5%-Stop-Loss erhöht den Zähler auf 1", state["consecutive_losses"] == 1, str(state["consecutive_losses"]))
+
+    close(make_open_trade("BIG_TIME"), 98.5, reason="CLOSED_TIME_EXIT")
+    with database.get_session() as session:
+        state = database.get_loss_streak_state(session, DEFAULT_USER_ID)
+    record("d) ein -1.5%-Time-Exit erhöht den Zähler weiter auf 2", state["consecutive_losses"] == 2, str(state["consecutive_losses"]))
+
+    # Ein neutraler kleiner Verlust ZWISCHEN zwei echten Verlusten darf die
+    # bestehende Serie nicht abbrechen (nur ein ECHTER Gewinn darf das).
+    close(make_open_trade("SMALL_MID"), 99.7, reason="CLOSED_SL")
+    with database.get_session() as session:
+        state = database.get_loss_streak_state(session, DEFAULT_USER_ID)
+    record(
+        "d) ein neutraler -0.3%-Verlust MITTEN in der Serie setzt sie NICHT zurück",
+        state["consecutive_losses"] == 2, str(state["consecutive_losses"])
+    )
+
+    # Ein ECHTER Gewinn setzt weiterhin zurück, auch nach neutralen Exits.
+    close(make_open_trade("WIN_AFTER"), 101.0, reason="CLOSED_TP")
+    with database.get_session() as session:
+        state = database.get_loss_streak_state(session, DEFAULT_USER_ID)
+    record("d) ein echter Gewinn setzt den Zähler weiterhin auf 0 zurück", state["consecutive_losses"] == 0, str(state["consecutive_losses"]))
+
+
 def main():
-    for fn in (test_a_loss_streak_triggers_cooldown, test_b_win_resets_counter, test_c_cooldown_expiry_resumes_trading):
+    for fn in (
+        test_a_loss_streak_triggers_cooldown, test_b_win_resets_counter,
+        test_c_cooldown_expiry_resumes_trading, test_d_small_losses_below_threshold_are_neutral,
+    ):
         print(f"\n--- {fn.__name__} ---")
         try:
             fn()
