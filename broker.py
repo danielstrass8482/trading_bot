@@ -22,6 +22,7 @@ from database import (
     get_trade_mode_for_user, get_bot_config,
     get_capital_allocations, set_capital_allocations,
     get_loss_streak_state, CapitalFlow,
+    ensure_company_name_cached,
 )
 from rule_engine import SignalResult
 from broker_interface import BrokerInterface
@@ -943,7 +944,17 @@ def _place_trade_locked(signal: SignalResult, llm_result: dict, user_id: int = D
         session.commit()
         session.refresh(trade)
         print(f"💾 Trade #{trade.id} in DB gespeichert")
-        return trade
+
+    # Firmenname garantiert cachen (Aufgabe "Firmenname (TICKER)"-Anzeige,
+    # 2026-08-13) - bewusst NACH dem Commit/außerhalb der obigen Transaktion,
+    # damit ein yfinance-Ausfall hier niemals den bereits abgeschlossenen
+    # Trade rückwirkend gefährden kann (siehe database.
+    # ensure_company_name_cached-Docstring). Deckt insbesondere Inverse ETFs
+    # ab, die den opportunistischen Scan-Pfad in rule_engine.analyze_ticker
+    # nie durchlaufen (kein Fundamentaldaten-Abruf für sie).
+    ensure_company_name_cached(trade.ticker)
+
+    return trade
 
 
 def _reconcile_pending_entry_fill(session, trade: Trade):

@@ -841,6 +841,32 @@ class ScanLog(Base):
     user_id         = Column(Integer, nullable=True)
 
 
+class TickerCompanyName(Base):
+    """
+    Ticker -> Firmenname-Cache (Aufgabe "Firmenname (TICKER)"-Anzeige,
+    2026-08-13). Firmennamen ändern sich praktisch nie, deshalb EIN Abruf
+    pro Ticker für immer statt einer erneuten yfinance-Abfrage bei jeder
+    Anzeige (Dashboard/Handelshistorie/Confirm-Tier, siehe trading_api.py).
+    Ticker-keyed statt pro Trade/PendingConfirmation dupliziert (analog zu
+    FairValueCache/SaxoInstrument) - ein einziger Ort, keine Backfill-
+    Wiederholung pro Tabelle.
+
+    Befüllt via ensure_company_name_cached() (siehe unten), aufgerufen genau
+    einmal beim Anlegen eines Trades (broker.place_trade) bzw. einer
+    Bestätigungsanfrage (confirm_execution.create_pending_confirmation) -
+    "beim erstmaligen Anlegen" im Sinne der Aufgabenstellung. Ältere,
+    bereits vor diesem Feature bestehende Trades bekommen ihren Namen beim
+    nächsten Scan, der denselben Ticker erneut betrifft, nachgetragen (siehe
+    rule_engine.analyze_ticker) - bis dahin zeigt das Frontend den reinen
+    Ticker als Fallback (kein Crash, keine leere Anzeige).
+    """
+    __tablename__ = "ticker_company_names"
+
+    ticker       = Column(String(20), primary_key=True)
+    company_name = Column(Text, nullable=False)
+    updated_at   = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class FairValueCache(Base):
     """
     Wöchentlich (siehe main.py: fair_value_update Job) neu berechneter Fair
@@ -1563,6 +1589,73 @@ def get_total_capital_in_trades(session: Session, user_id: int = DEFAULT_USER_ID
     """Gesamtkapital aktuell in offenen Positionen gebunden (siehe get_open_trades zum user_id-Default)."""
     result = session.query(func.sum(Trade.capital_used)).filter_by(status="OPEN", user_id=user_id).scalar()
     return result or 0.0
+
+
+def get_company_names(session: Session, tickers: list[str]) -> dict:
+    """
+    Bulk-Lookup für die Anzeige-Schicht (trading_api.py) - reiner DB-Read,
+    KEIN Netzwerk-Call. Fehlende Ticker fehlen einfach im Rückgabe-Dict, der
+    Aufrufer fällt dann auf den reinen Ticker zurück (siehe TickerCompanyName-
+    Docstring).
+    """
+    if not tickers:
+        return {}
+    rows = session.query(TickerCompanyName).filter(TickerCompanyName.ticker.in_(set(tickers))).all()
+    return {r.ticker: r.company_name for r in rows}
+
+
+def cache_company_name(session: Session, ticker: str, company_name: str):
+    """Reiner Schreib-Helper (kein Netzwerk-Call) - der Name muss dem
+    Aufrufer bereits vorliegen (z.B. aus einem ohnehin schon geladenen
+    yfinance-info-Dict, siehe rule_engine.fetch_fundamentals)."""
+    if not company_name:
+        return
+    row = session.query(TickerCompanyName).filter_by(ticker=ticker).first()
+    if row:
+        row.company_name = company_name
+        row.updated_at = datetime.utcnow()
+    else:
+        session.add(TickerCompanyName(ticker=ticker, company_name=company_name))
+    session.commit()
+
+
+def ensure_company_name_cached(ticker: str) -> str | None:
+    """
+    Garantierter Cache-Treffer für einen Ticker, der GERADE einen echten
+    Trade oder eine Bestätigungsanfrage auslöst (siehe broker.place_trade/
+    confirm_execution.create_pending_confirmation) - deckt insbesondere die
+    Fälle ab, die der opportunistische Scan-Pfad (cache_company_name via
+    rule_engine) verpasst (z.B. Inverse ETFs ohne Fundamentaldaten-Abruf).
+    Eigene Session (statt Session-Parameter) - wird von Aufrufern genutzt,
+    die selbst keine offene Session mehr haben (z.B. NACH dem Trade-Commit
+    in place_trade(), bewusst außerhalb der eigentlichen Order-Transaktion,
+    damit ein yfinance-Ausfall niemals einen Trade verhindern/verzögern kann).
+
+    Bei Cache-Treffer: reiner DB-Read, kein Netzwerk-Call. Bei Cache-Miss:
+    EIN yfinance-Versuch, Fehler werden abgefangen und geloggt (nie eine
+    Exception nach oben durchreichen) - kein Eintrag bei Fehlschlag, damit
+    ein späterer Aufruf (nächster Trade desselben Tickers) es erneut
+    versuchen kann statt dauerhaft leer zu bleiben.
+    """
+    with get_session() as session:
+        row = session.query(TickerCompanyName).filter_by(ticker=ticker).first()
+        if row:
+            return row.company_name
+
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info
+        name = info.get("longName") or info.get("shortName")
+    except Exception as e:
+        print(f"⚠️  ensure_company_name_cached({ticker}): yfinance-Fehler ({e}) – kein Firmenname, Fallback auf Ticker.")
+        return None
+
+    if not name:
+        return None
+
+    with get_session() as session:
+        cache_company_name(session, ticker, name)
+    return name
 
 
 # Alle Status-Werte eines abgeschlossenen Trades – zentral gepflegt, damit

@@ -22,7 +22,7 @@ from config import (
     EARNINGS_BUFFER_DAYS, MAX_5DAY_MOVE_PCT,
     ACTIVE_SHORT_INSTRUMENTS, get_live_config
 )
-from database import get_session, get_active_weights, get_open_trades
+from database import get_session, get_active_weights, get_open_trades, cache_company_name
 from fair_value import get_fair_value_for_ticker
 
 _THRESHOLDS = {
@@ -101,7 +101,13 @@ def fetch_market_data(ticker: str, period: str = "1y", min_rows: int = 50) -> Op
 
 
 def fetch_fundamentals(ticker: str) -> dict:
-    """Lädt Fundamentaldaten via yfinance info-Dict."""
+    """Lädt Fundamentaldaten via yfinance info-Dict.
+
+    "name" (Aufgabe "Firmenname (TICKER)"-Anzeige, 2026-08-13): derselbe
+    info-Call liefert bereits longName/shortName mit - kein zusätzlicher
+    Netzwerk-Call nötig. analyze_ticker() cached ihn opportunistisch in
+    TickerCompanyName (siehe database.cache_company_name), sobald ein
+    Ticker so weit kommt, dass Fundamentaldaten überhaupt abgerufen werden."""
     try:
         info = yf.Ticker(ticker).info
         return {
@@ -111,6 +117,7 @@ def fetch_fundamentals(ticker: str) -> dict:
             "earnings_date":  info.get("earningsTimestamp"),
             "sector":         info.get("sector"),
             "industry":       info.get("industry"),
+            "name":           info.get("longName") or info.get("shortName"),
         }
     except Exception as e:
         # Fund 14 (Code-Audit 2026-08-06): Sichtbarkeit statt stillem
@@ -434,6 +441,19 @@ def analyze_ticker(ticker: str) -> SignalResult:
 
     # Fundamentaldaten (nicht für Inverse ETFs relevant)
     fundamentals = {} if is_inverse_etf else fetch_fundamentals(ticker)
+
+    # Firmenname opportunistisch cachen (Aufgabe "Firmenname (TICKER)"-
+    # Anzeige, 2026-08-13) - derselbe info-Dict-Abruf wie oben, kein
+    # zusätzlicher Netzwerk-Call. Best effort: ein DB-Fehler hier darf den
+    # Scan nie abbrechen (broker.place_trade/confirm_execution holen den
+    # Namen bei Bedarf ohnehin garantiert nach, siehe database.
+    # ensure_company_name_cached).
+    if fundamentals.get("name"):
+        try:
+            with get_session() as _name_session:
+                cache_company_name(_name_session, ticker, fundamentals["name"])
+        except Exception as e:
+            print(f"⚠️  Firmenname-Cache für {ticker} fehlgeschlagen (nicht kritisch): {e}")
 
     # Branchen-Blacklist prüfen (vor der Score-Berechnung)
     sector = fundamentals.get("sector", "") or ""

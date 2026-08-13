@@ -28,6 +28,7 @@ from database import (
     get_trade_mode_for_user, set_capital_allocations,
     set_user_bot_config, DEFAULT_USER_CONFIG,
     USER_CONFIG_BOUNDS, USER_CONFIG_ENUM_BOUNDS, get_capital_allocations,
+    get_company_names,
 )
 from config import get_live_config, DEFAULT_USER_ID
 from broker import (
@@ -189,6 +190,23 @@ def _extract_score(signal_payload: Optional[str]) -> Optional[int]:
         return json.loads(signal_payload).get("score")
     except (ValueError, TypeError, AttributeError):
         return None
+
+
+def _attach_company_names(session, rows: list[dict]) -> list[dict]:
+    """
+    Ergänzt "company_name" auf jeder Zeile mit einem "ticker"-Feld (Aufgabe
+    "Firmenname (TICKER)"-Anzeige, 2026-08-13) - EIN Bulk-DB-Read für alle
+    Zeilen statt einer Query pro Ticker. None (statt fehlendem Key), falls
+    der Ticker noch nicht gecacht ist - Frontend fällt dann sauber auf den
+    reinen Ticker zurück (siehe TickerCompanyName-Docstring in database.py:
+    ältere Bestandstrades bzw. Ticker, die noch nie gescannt/gehandelt
+    wurden, haben anfangs keinen Eintrag).
+    """
+    tickers = {r["ticker"] for r in rows if r.get("ticker")}
+    names = get_company_names(session, list(tickers))
+    for r in rows:
+        r["company_name"] = names.get(r.get("ticker"))
+    return rows
 
 
 def _pending_details_html(pending) -> str:
@@ -529,6 +547,9 @@ def get_overview(user_id: int = Depends(get_current_user_id)):
 
         open_trades_out.append(row)
 
+    with get_session() as session:
+        _attach_company_names(session, open_trades_out)
+
     return {
         "portfolio_value": portfolio_value,
         "cash": cash,
@@ -684,6 +705,7 @@ def get_trade_history(limit: int = 50, user_id: int = Depends(get_current_user_i
                 row["unrealized_pnl_pct"] = None
             result.append(row)
 
+        _attach_company_names(session, result)
         return result
 
 
@@ -1246,6 +1268,8 @@ def list_pending_confirmations(user_id: int = Depends(get_current_user_id)):
         for r in rows
     ]
     entries.sort(key=lambda e: e["score"] if e["score"] is not None else -1, reverse=True)
+    with get_session() as session:
+        _attach_company_names(session, entries)
     return entries
 
 
@@ -1256,7 +1280,7 @@ def list_pending_confirmations(user_id: int = Depends(get_current_user_id)):
 @protected.get("/api/pending-confirmations/history")
 def list_confirmation_history(user_id: int = Depends(get_current_user_id)):
     rows = confirm_execution.list_recent_for_user(user_id)
-    return [
+    entries = [
         {
             "id": r.id, "ticker": r.ticker, "qty_or_amount": r.qty_or_amount,
             "signal_price": r.signal_price, "signal_timestamp": r.signal_timestamp.isoformat(),
@@ -1267,6 +1291,9 @@ def list_confirmation_history(user_id: int = Depends(get_current_user_id)):
         }
         for r in rows
     ]
+    with get_session() as session:
+        _attach_company_names(session, entries)
+    return entries
 
 
 @protected.post("/api/pending-confirmations/{pending_id}/confirm")

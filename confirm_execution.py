@@ -77,7 +77,7 @@ from sqlalchemy import text
 
 from trading_shared.confirm_execution import generate_confirmation_token
 
-from database import get_session, PendingConfirmation, get_user_live_config, get_user_email
+from database import get_session, PendingConfirmation, get_user_live_config, get_user_email, ensure_company_name_cached
 from notifications import send_email
 
 # Handelsschluss NYSE/Nasdaq für expires_at (Chunk 2d) - bewusst eine lokale
@@ -247,7 +247,13 @@ def create_pending_confirmation(
         session.add(pending)
         session.commit()
         session.refresh(pending)
-        return pending
+
+    # Firmenname garantiert cachen (Aufgabe "Firmenname (TICKER)"-Anzeige,
+    # 2026-08-13), analog broker.place_trade - außerhalb der obigen
+    # Transaktion, ein yfinance-Ausfall darf die Bestätigungsanfrage nicht
+    # gefährden.
+    ensure_company_name_cached(ticker)
+    return pending
 
 
 def update_pending_confirmation(
