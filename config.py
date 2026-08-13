@@ -364,6 +364,18 @@ COOLDOWN_HOURS_AFTER_LOSS_STREAK = 4.0
 LOSS_STREAK_MIN_LOSS_PCT = 1.0
 MIN_SIGNAL_SCORE      = 65       # Minimaler Rule-Engine-Score (0–100) für Trade-Freigabe
 
+# Trailing-Gewinnsicherung für den Tag-5-Grant (2026-08-13, ersetzt die alte
+# "hälftige Sicherung vom Momentan-Gewinn"-Logik, siehe broker.
+# monitor_open_positions): Basis ist ab jetzt der HÖCHSTE Gewinn seit Entry
+# (highest_price_since_entry) statt des Gewinns im Moment des Tag-5-Checks –
+# ein schneller Reversal zwischen zwei Monitoring-Zyklen (siehe LEA-Vorfall
+# 2026-08-12) zog den alten Stop sonst praktisch auf Entry-Niveau. Bewusst
+# GLOBAL/Klasse B (wie MIN_SIGNAL_SCORE), NICHT pro Nutzer – reine
+# Datensammlung läuft vorerst zentral, siehe Trade.trailing_lock_rule_applied.
+TRAILING_LOCK_SECURE_PCT     = 0.5     # Anteil des höchsten Gewinns, der als neuer Stop gesichert wird
+TRAILING_LOCK_MIN_BUFFER_PCT = 0.005   # Mindestabstand des neuen Stops zum aktuellen Kurs
+TRAILING_LOCK_MIN_PROFIT_PCT = 0.003   # Unterhalb dieses höchsten Gewinns: keine Schutzfrist-Sonderbehandlung
+
 # Markt-Kontext-Filter (KO-Kriterien)
 VIX_PAUSE_THRESHOLD   = 30       # Bot pausiert komplett wenn VIX > 30
 EARNINGS_BUFFER_DAYS  = 3        # Kein Trade wenn Earnings innerhalb N Tage
@@ -440,6 +452,9 @@ _LIVE_CONFIG_SPEC = {
     # zusätzlich Zeit bekommt, bevor sie doch hart verkauft wird - siehe
     # dortige Dokumentation zur Break-Even-Stop-Logik.
     "TIME_EXIT_GRACE_DAYS":    (int,   3),
+    "TRAILING_LOCK_SECURE_PCT":     (float, TRAILING_LOCK_SECURE_PCT),
+    "TRAILING_LOCK_MIN_BUFFER_PCT": (float, TRAILING_LOCK_MIN_BUFFER_PCT),
+    "TRAILING_LOCK_MIN_PROFIT_PCT": (float, TRAILING_LOCK_MIN_PROFIT_PCT),
     "VOLATILE_SEGMENT_PCT":    (float, 0.33),
     "VOLATILE_ATR_THRESHOLD":  (float, 0.025),
     "EARNINGS_BUFFER_DAYS":    (int,   EARNINGS_BUFFER_DAYS),

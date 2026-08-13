@@ -172,6 +172,27 @@ class Trade(Base):
     # CLOSED_TIME_EXIT ein regulärer (False) oder ein nach abgelaufener
     # Schutzfrist ausgelöster (True) Time-Exit war.
     time_exit_grace_used       = Column(Boolean, default=False)
+    # Trailing-Gewinnsicherung Tag-5-Grant (2026-08-13, siehe broker.
+    # monitor_open_positions) – reine Datensammlung für eine spätere manuelle
+    # Auswertung der TRAILING_LOCK_*-Startwerte, KEIN Lernmodus/Auto-Tuning.
+    # Gesetzt bei JEDER Tag-5-Auswertung dieser Position (auch wenn
+    # MIN_PROFIT_THRESHOLD griff und dadurch KEINE Schutzfrist gewährt wurde -
+    # gerade das ist für die spätere Auswertung der Schwelle relevant), sonst
+    # (Position noch nicht bei MAX_HOLDING_DAYS) None.
+    # trailing_lock_highest_profit_pct_at_grant: (highest_price_since_entry -
+    #   entry_price) / entry_price zum Grant-Zeitpunkt (Fraction, z.B. 0.02 = 2%).
+    # trailing_lock_calculated_stop: der REIN theoretische Stop aus der Formel
+    #   (entry + höchster Gewinn * TRAILING_LOCK_SECURE_PCT), UNABHÄNGIG davon,
+    #   ob Mindestabstand- oder Randfall-Regel den tatsächlich gesetzten
+    #   trade.stop_loss davon abweichen ließ – Vergleich beider Werte zeigt,
+    #   wie oft/wie stark die beiden Sonderregeln eingreifen.
+    # trailing_lock_rule_applied: welche der vier Regeln griff - "NORMAL"
+    #   (Formel direkt übernommen), "MIN_BUFFER" (Mindestabstand-Regel),
+    #   "EDGE_CASE_UNCHANGED" (Randfall, alter Stop blieb), oder
+    #   "MIN_PROFIT_THRESHOLD" (keine Sonderbehandlung, regulärer Time-Exit).
+    trailing_lock_highest_profit_pct_at_grant = Column(Float, nullable=True)
+    trailing_lock_calculated_stop             = Column(Float, nullable=True)
+    trailing_lock_rule_applied                = Column(String(30), nullable=True)
     broker                     = Column(String(20), default="alpaca")  # "alpaca" / "ibkr" (siehe broker.place_trade)
     # yfinance-Sektor zum Entry-Zeitpunkt (siehe rule_engine.SignalResult.sector) –
     # NULL bei Inverse ETFs und bei älteren Trades vor Einführung dieser Spalte
@@ -391,6 +412,12 @@ DEFAULT_CONFIG = {
     "ATR_MAX_SL_PCT":          ("0.08",   "Maximaler SL % (Sicherheitsnetz)"),
     "MAX_HOLDING_DAYS":        ("5",      "Max. Haltedauer in Handelstagen"),
     "MAX_HOLDING_DAYS_TRAILING_MULTIPLIER": ("2", "Harte Obergrenze bei aktivem Trailing-SL = MAX_HOLDING_DAYS x dieser Wert"),
+    # Trailing-Gewinnsicherung für den Tag-5-Grant (2026-08-13, siehe broker.
+    # monitor_open_positions) - bewusst GLOBAL/Klasse B wie MIN_SIGNAL_SCORE,
+    # NICHT pro Nutzer (reine Datensammlung läuft vorerst zentral).
+    "TRAILING_LOCK_SECURE_PCT":     ("0.5",   "Trailing-Gewinnsicherung Tag-5-Grant: Anteil des höchsten Gewinns seit Entry, der als neuer Stop gesichert wird"),
+    "TRAILING_LOCK_MIN_BUFFER_PCT": ("0.005", "Trailing-Gewinnsicherung Tag-5-Grant: Mindestabstand des neuen Stops zum aktuellen Kurs"),
+    "TRAILING_LOCK_MIN_PROFIT_PCT": ("0.003", "Trailing-Gewinnsicherung Tag-5-Grant: unterhalb dieses höchsten Gewinns keine Schutzfrist-Sonderbehandlung"),
     "VOLATILE_SEGMENT_PCT":    ("0.33",   "Anteil volatile Titel am Portfolio (0-1)"),
     "VOLATILE_ATR_THRESHOLD":  ("0.025",  "ATR/Preis Ratio ab dem ein Titel als volatil gilt (2.5%)"),
     "EARNINGS_BUFFER_DAYS":    ("3",      "Tage vor Earnings in denen nicht gekauft wird"),
@@ -982,6 +1009,7 @@ def init_db():
     _migrate_pending_order_attempts_user_id_column()
     _migrate_trades_entry_price_nullable()
     _migrate_trades_time_exit_grace_columns()
+    _migrate_trades_trailing_lock_columns()
     _migrate_trades_status_column_width()
     _migrate_daily_log_user_id_column()
     _migrate_daily_log_formula_version_column()
@@ -1254,6 +1282,20 @@ def _migrate_trades_time_exit_grace_columns():
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS time_exit_grace_deadline DATE"))
         conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS time_exit_grace_used BOOLEAN DEFAULT FALSE"))
+
+
+def _migrate_trades_trailing_lock_columns():
+    """
+    trailing_lock_highest_profit_pct_at_grant/trailing_lock_calculated_stop/
+    trailing_lock_rule_applied kamen nachträglich zur trades-Tabelle dazu
+    (Trailing-Gewinnsicherung Tag-5-Grant 2026-08-13, siehe broker.
+    monitor_open_positions) – idempotentes ADD COLUMN IF NOT EXISTS.
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trailing_lock_highest_profit_pct_at_grant FLOAT"))
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trailing_lock_calculated_stop FLOAT"))
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trailing_lock_rule_applied VARCHAR(30)"))
 
 
 def _migrate_trades_status_column_width():

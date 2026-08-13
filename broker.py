@@ -1430,28 +1430,51 @@ def monitor_open_positions(user_id: int = DEFAULT_USER_ID):
     danach verwaltet wird, ist jetzt pro Nutzer konfigurierbar.
     - Time-based Exit: Ohne aktiven Trailing-SL wird die Position nach
       MAX_HOLDING_DAYS Handelstagen geschlossen (CLOSED_TIME_EXIT) – AUSSER
-      (Schutzfrist-Feature, 2026-07-31) sie steht zu diesem Zeitpunkt im Plus:
-      dann bekommt sie statt des sofortigen harten Verkaufs einen nachgezogenen
-      Stop auf hälftige Gewinnsicherung (trade.stop_loss = entry_price +
-      halber bisheriger Kursgewinn, Korrektur 2026-07-31 - ursprünglich
-      Break-Even, siehe Commit c6a0df1) und bis zu TIME_EXIT_GRACE_DAYS
-      weitere Handelstage Zeit, entweder die Trailing-Aktivierungsschwelle
-      noch zu erreichen (dann übernimmt das normale Trailing-Verhalten
-      vollständig, inkl. dessen eigenem Hard-Cap) oder den nachgezogenen Stop
-      auszulösen (normaler CLOSED_SL-Exit, hälftiger Gewinn ggü. Entry bleibt
-      gesichert) – läuft
-      die Schutzfrist dagegen ab, ohne dass eines von beidem passiert ist,
-      wird hart verkauft (weiterhin CLOSED_TIME_EXIT, aber
+      (Schutzfrist-Feature, 2026-07-31, Stop-Berechnung ersetzt 2026-08-13)
+      der höchste Gewinn seit Entry (highest_price_since_entry) liegt zu
+      diesem Zeitpunkt mindestens bei TRAILING_LOCK_MIN_PROFIT_PCT: dann
+      bekommt sie statt des sofortigen harten Verkaufs einen nachgezogenen
+      Stop und bis zu TIME_EXIT_GRACE_DAYS weitere Handelstage Zeit, entweder
+      die Trailing-Aktivierungsschwelle noch zu erreichen (dann übernimmt das
+      normale Trailing-Verhalten vollständig, inkl. dessen eigenem Hard-Cap)
+      oder den nachgezogenen Stop auszulösen (normaler CLOSED_SL-Exit) –
+      läuft die Schutzfrist dagegen ab, ohne dass eines von beidem passiert
+      ist, wird hart verkauft (weiterhin CLOSED_TIME_EXIT, aber
       trade.time_exit_grace_used=True markiert diesen Fall als "nach
       abgelaufener Schutzfrist" für Backlook/post_exit_tracking). Nur EINMAL
-      pro Position gewährt (time_exit_grace_used-Flag). Mit aktivem
-      Trailing-SL wird der reguläre Time-Exit ausgesetzt (der Trade läuft
-      bereits profitabel mit eigenem adaptiven Schutz) – als Sicherheitsnetz
-      greift stattdessen eine harte Obergrenze bei MAX_HOLDING_DAYS *
-      MAX_HOLDING_DAYS_TRAILING_MULTIPLIER Handelstagen (CLOSED_TIME_EXIT_
-      HARD_CAP). Alle Time-Exit-Varianten legen einen post_exit_tracking-
-      Eintrag an (siehe post_exit_tracking.py), der den Kursverlauf danach
-      beobachtet, um die Schwellenwerte selbst zu evaluieren (Backlook).
+      pro Position gewährt (time_exit_grace_used-Flag).
+      Stop-Berechnung (2026-08-13, ersetzt die alte "hälftige Sicherung vom
+      MOMENTAN-Gewinn"-Logik – die zog den Stop bei einem schnellen Reversal
+      zwischen zwei Monitoring-Zyklen praktisch auf Entry-Niveau, siehe
+      LEA-Vorfall 2026-08-12): Basis ist jetzt der HÖCHSTE Gewinn seit Entry.
+        1. Höchster Gewinn < TRAILING_LOCK_MIN_PROFIT_PCT: keine Sonder-
+           behandlung, regulärer sofortiger CLOSED_TIME_EXIT (wie bei einer
+           Verlustposition) – ein einmal winziger Peak-Gewinn rechtfertigt
+           keine Schutzfrist.
+        2. Sonst theoretischer Stop = entry_price + höchster Kursgewinn *
+           TRAILING_LOCK_SECURE_PCT.
+        3. Liegt dieser theoretische Stop BEREITS ÜBER dem aktuellen Kurs
+           (Randfall: Position ist seit ihrem Peak schon wieder gefallen,
+           bevor der Tag-5-Check lief) – bestehenden trade.stop_loss
+           UNVERÄNDERT lassen (kein erzwungener Stop, der sofort zum
+           aktuellen Kurs verkaufen würde), nur die Schutzfrist gewähren.
+        4. Sonst, falls der theoretische Stop weniger als
+           TRAILING_LOCK_MIN_BUFFER_PCT unter dem aktuellen Kurs liegt (zu
+           knapp): Stop stattdessen auf genau diesen Mindestabstand setzen
+           (aktueller Kurs * (1 - TRAILING_LOCK_MIN_BUFFER_PCT)).
+        5. Sonst den theoretischen Stop direkt übernehmen.
+      Welche Regel griff sowie highest_profit_pct_at_grant/der theoretische
+      Stop werden auf dem Trade geloggt (trailing_lock_*-Spalten) – reine
+      Datenbasis für eine spätere manuelle Auswertung der Startwerte, KEIN
+      Lernmodus/Auto-Tuning.
+      Mit aktivem Trailing-SL wird der reguläre Time-Exit ausgesetzt (der
+      Trade läuft bereits profitabel mit eigenem adaptiven Schutz) – als
+      Sicherheitsnetz greift stattdessen eine harte Obergrenze bei
+      MAX_HOLDING_DAYS * MAX_HOLDING_DAYS_TRAILING_MULTIPLIER Handelstagen
+      (CLOSED_TIME_EXIT_HARD_CAP). Alle Time-Exit-Varianten legen einen
+      post_exit_tracking-Eintrag an (siehe post_exit_tracking.py), der den
+      Kursverlauf danach beobachtet, um die Schwellenwerte selbst zu
+      evaluieren (Backlook).
     - Solange kein Trailing SL aktiv ist: normaler fester Stop Loss. Trailing
       SL wird aktiviert, sobald der Kurs den NIEDRIGEREN der beiden Trigger
       erreicht: den fixen TRAILING_ACTIVATION_PCT ggü. Entry, oder das
@@ -1478,6 +1501,9 @@ def monitor_open_positions(user_id: int = DEFAULT_USER_ID):
     min_sl_pct = config.get("ATR_MIN_SL_PCT", 0.01)
     max_sl_pct = config.get("ATR_MAX_SL_PCT", 0.08)
     trailing_activation_pct = config.get("TRAILING_ACTIVATION_PCT", 0.06)
+    trailing_lock_secure_pct = config.get("TRAILING_LOCK_SECURE_PCT", 0.5)
+    trailing_lock_min_buffer_pct = config.get("TRAILING_LOCK_MIN_BUFFER_PCT", 0.005)
+    trailing_lock_min_profit_pct = config.get("TRAILING_LOCK_MIN_PROFIT_PCT", 0.003)
 
     def _clamped_trailing_distance(atr, reference_price):
         """ATR-basierte Trailing-Distanz – seit Audit Chunk 1 (2026-08-05) in
@@ -1570,31 +1596,62 @@ def monitor_open_positions(user_id: int = DEFAULT_USER_ID):
                         time_exit_reason = None
                 elif time_exit_allowed and days_held >= max_days:
                     # Regulärer Time-Exit-Trigger erreicht - Schutzfrist-
-                    # Unterscheidung (Fix 2026-07-31): nur Gewinner ohne
-                    # Trailing-Aktivierung bekommen statt des sofortigen
-                    # harten Verkaufs einen nachgezogenen Stop (hälftige
-                    # Gewinnsicherung, Korrektur 2026-07-31 - ursprünglich
-                    # Break-Even, siehe c6a0df1) + Aufschub.
-                    unrealized_pnl = (current_price - trade.entry_price) * trade.quantity
-                    if unrealized_pnl > 0:
-                        # Hälftige Gewinnsicherung statt Break-Even: die
-                        # Haelfte des bisher erreichten Kursgewinns bleibt bei
-                        # einem Stop-Treffer gesichert, statt Gewinn komplett
-                        # gegen Null abzugeben. Bei z.B. +4% liegt der neue
-                        # Stop bei ca. +2% ueber Entry, nicht bei 0%.
-                        half_gain_stop = round(trade.entry_price + (current_price - trade.entry_price) / 2, 2)
+                    # Unterscheidung (Fix 2026-07-31, Stop-Berechnung ersetzt
+                    # 2026-08-13, siehe Docstring oben): Basis ist der
+                    # HÖCHSTE Gewinn seit Entry, nicht der Gewinn im Moment
+                    # dieses Checks (trade.highest_price_since_entry ist zu
+                    # diesem Zeitpunkt bereits garantiert gesetzt, siehe
+                    # Tracking oben im selben Zyklus).
+                    highest_profit_pct = (trade.highest_price_since_entry - trade.entry_price) / trade.entry_price
+
+                    if highest_profit_pct < trailing_lock_min_profit_pct:
+                        # Regel 1 (Mindestschwelle): der Peak-Gewinn war zu
+                        # klein, um eine Schutzfrist zu rechtfertigen - auch
+                        # eine aktuell noch leicht positive Position wird wie
+                        # eine Verlustposition sofort hart verkauft.
+                        time_exit_reason = "CLOSED_TIME_EXIT"
+                        trade.trailing_lock_highest_profit_pct_at_grant = round(highest_profit_pct, 4)
+                        trade.trailing_lock_calculated_stop = None
+                        trade.trailing_lock_rule_applied = "MIN_PROFIT_THRESHOLD"
+                    else:
+                        theoretical_stop = round(
+                            trade.entry_price + (trade.highest_price_since_entry - trade.entry_price) * trailing_lock_secure_pct, 2
+                        )
+                        min_buffer_stop = round(current_price * (1 - trailing_lock_min_buffer_pct), 2)
+
+                        if current_price < theoretical_stop:
+                            # Regel 3 (Randfall): der Kurs ist seit seinem
+                            # Peak schon wieder unter das theoretische
+                            # Lock-Niveau gefallen - ein erzwungener Stop auf
+                            # Basis des jetzt schon gefallenen Kurses wäre
+                            # KEINE sinnvolle Gewinnsicherung mehr, sondern nur
+                            # ein künstlich enger Stop knapp unter dem
+                            # aktuellen (bereits gefallenen) Kurs. Bestehenden
+                            # Stop unverändert lassen, nur Zeit gewähren.
+                            new_stop = trade.stop_loss
+                            rule_applied = "EDGE_CASE_UNCHANGED"
+                        elif theoretical_stop > min_buffer_stop:
+                            # Regel 4 (Mindestabstand): theoretischer Stop
+                            # liegt zu knapp unter dem aktuellen Kurs.
+                            new_stop = min_buffer_stop
+                            rule_applied = "MIN_BUFFER"
+                        else:
+                            # Regel 5 (Normalfall): Formel direkt übernehmen.
+                            new_stop = theoretical_stop
+                            rule_applied = "NORMAL"
+
                         trade.time_exit_grace_deadline = add_trading_days(datetime.now().date(), grace_days)
                         trade.time_exit_grace_used = True
-                        trade.stop_loss = half_gain_stop
+                        trade.stop_loss = new_stop
+                        trade.trailing_lock_highest_profit_pct_at_grant = round(highest_profit_pct, 4)
+                        trade.trailing_lock_calculated_stop = theoretical_stop
+                        trade.trailing_lock_rule_applied = rule_applied
                         time_exit_reason = None
-                        print(f"🛡️  {trade.ticker}: Time-Exit fällig (Tag {days_held}), aber im Plus "
-                              f"(${unrealized_pnl:.2f}) und Trailing noch nicht aktiv – Schutzfrist bis "
-                              f"{trade.time_exit_grace_deadline} gewährt, Stop-Loss auf hälftige "
-                              f"Gewinnsicherung (${half_gain_stop}, Entry war ${trade.entry_price}) nachgezogen.")
-                    else:
-                        # Break-Even oder Verlust: unverändertes Verhalten,
-                        # sofortiger harter Verkauf wie vor diesem Fix.
-                        time_exit_reason = "CLOSED_TIME_EXIT"
+                        print(f"🛡️  {trade.ticker}: Time-Exit fällig (Tag {days_held}), höchster Gewinn "
+                              f"seit Entry {highest_profit_pct:.2%} – Schutzfrist bis "
+                              f"{trade.time_exit_grace_deadline} gewährt, Stop-Loss auf ${new_stop} "
+                              f"(Regel: {rule_applied}, theoretisch ${theoretical_stop}, Entry war "
+                              f"${trade.entry_price}) nachgezogen.")
                 else:
                     time_exit_reason = None
 
