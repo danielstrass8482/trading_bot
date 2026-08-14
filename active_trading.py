@@ -13,6 +13,8 @@ Fill-Bestätigung (kein asynchroner WAITING_FILL-Mechanismus wie beim Bot).
 Saxo-Seite bewusst NICHT Teil dieses Chunks – siehe ManualTrade-Docstring.
 """
 
+import concurrent.futures
+import re
 import time
 from datetime import datetime
 
@@ -209,9 +211,45 @@ def _get_asset_universe(user_id: int) -> list[dict]:
     return assets
 
 
+def _search_rank(asset: dict, q_upper: str, q_lower: str) -> int:
+    """
+    Einfache Relevanz-Heuristik statt eines komplexen Rankings (Fund
+    2026-08-14, Live-Test gegen den echten Paper-Account: Namenssuche nach
+    "Exxon" listete die obskure Mikrocap-Aktie "Texxon Holding Limited"
+    (Ticker NPT, $3,55) VOR "ExxonMobil Holdings Corporation" (Ticker XOM) -
+    reines Alphabet-Sortierungsartefakt ohne Relevanz-Gewichtung, "N" kommt
+    vor "X"). Je niedriger die Zahl, desto relevanter:
+      0 exakte Ticker-Übereinstimmung
+      1 Ticker beginnt mit dem Suchbegriff (bestehendes Verhalten für
+        Ticker-Präfix-Suchen wie "AA" -> AAPL bleibt erhalten)
+      2 Firmenname beginnt mit dem Suchbegriff
+      3 Firmenname enthält den Suchbegriff als EIGENSTÄNDIGES Wort
+        (Wortgrenzen-Regex - genau das unterscheidet "ExxonMobil" (Wort
+        "exxonmobil" enthält "exxon" nicht als eigenes Wort, aber der Name
+        STARTET damit -> Rang 2) von "Texxon" (enthält "exxon" nur als
+        Teilstring MITTEN in einem anderen Wort, keine Wortgrenze davor -
+        landet korrekt im niedrigsten Rang 4 statt fälschlich hoch).
+      4 sonstiger Teilstring-Treffer
+    Innerhalb jedes Rangs bleibt die bisherige alphabetische Sortierung
+    (nach Ticker) als Tie-Breaker - kein Overengineering, reicht um
+    offensichtliche Fälle wie das obige richtig zu priorisieren.
+    """
+    symbol = asset["symbol"].upper()
+    name_lower = asset["name"].lower()
+    if symbol == q_upper:
+        return 0
+    if symbol.startswith(q_upper):
+        return 1
+    if name_lower.startswith(q_lower):
+        return 2
+    if re.search(rf"\b{re.escape(q_lower)}\b", name_lower):
+        return 3
+    return 4
+
+
 def search_assets(query: str, user_id: int = DEFAULT_USER_ID, limit: int = 20) -> list[dict]:
     """Freitextsuche (Ticker-Präfix ODER Namens-Teilstring) gegen Alpaca-
-    handelbare US-Assets. Ticker-Präfix-Treffer zuerst, dann Namens-Treffer.
+    handelbare US-Assets, nach Relevanz sortiert (siehe _search_rank).
     Kurse werden NUR für die zurückgegebene Seite live geholt (gecacht,
     siehe get_quote) – nicht für das gesamte Universe."""
     query = (query or "").strip()
@@ -226,7 +264,7 @@ def search_assets(query: str, user_id: int = DEFAULT_USER_ID, limit: int = 20) -
         a for a in universe
         if a["symbol"].upper().startswith(q_upper) or q_lower in a["name"].lower()
     ]
-    matches.sort(key=lambda a: (not a["symbol"].upper().startswith(q_upper), a["symbol"]))
+    matches.sort(key=lambda a: (_search_rank(a, q_upper, q_lower), a["symbol"]))
     matches = matches[:limit]
 
     results = []
@@ -246,6 +284,42 @@ def search_assets(query: str, user_id: int = DEFAULT_USER_ID, limit: int = 20) -
     return results
 
 
+# KRITISCHER FUND (2026-08-14, Live-Test gegen den echten Paper-Account):
+# sector_recommendation() lief bis hierhin strikt SEQUENZIELL durch alle
+# 383 LONG_WATCHLIST-Ticker - live gemessen 327,9s (~5,5 Min.) für eine
+# einzelne Anfrage, obwohl get_analysis() bereits denselben _ANALYSIS_CACHE
+# nutzt wie /api/active/analysis (die Caching-Schicht war also schon
+# geteilt, half aber bei einem KALTEN Cache kaum, da bei der ersten Anfrage
+# fast alle 383 Ticker ohnehin frisch abgerufen werden müssen). Kein
+# Timeout einer echten HTTP-Kette (Browser/nginx/axios) überlebt das.
+#
+# ERSTE Version dieses Fixes gab jedem sector_recommendation()-Aufruf einen
+# EIGENEN ThreadPoolExecutor(max_workers=10) - live mit 3 GLEICHZEITIGEN
+# Sektor-Anfragen getestet (Aufgabe Punkt "Rate-Limit-Risiko"): effektiv
+# 30 parallele yfinance-Calls, KEIN einzelner Rate-Limit-Fehler, aber keine
+# der drei Anfragen kam innerhalb von 150s durch - reine Ressourcen-
+# Überlastung statt eines sauberen Fehlers, für mehrere gleichzeitige
+# Nutzer damit faktisch unbenutzbar. Fix: EIN geteilter, prozessweiter
+# Executor (unten, außerhalb der Funktion angelegt) statt eines neuen Pools
+# pro Aufruf - bindet die GESAMTE gleichzeitige yfinance-Last über ALLE
+# parallelen Sektor-Anfragen hinweg auf denselben Wert, weitere Anfragen
+# reihen sich in dieselbe begrenzte Warteschlange ein statt die Last pro
+# zusätzlichem Nutzer zu vervielfachen (langsamer bei echter Nebenläufigkeit,
+# aber sicher begrenzt statt eskalierend).
+#
+# Wert selbst bewusst NIEDRIGER als scan_watchlist_parallel (15, siehe
+# rule_engine.py): der Bot-Scan läuft kontrolliert im festen 5-Minuten-
+# Zyklus mit genau einem laufenden Prozess, dieser geteilte Pool läuft
+# dagegen dauerhaft parallel zum Bot-Scan und ist nutzergetrieben - 10
+# zusätzliche Worker on top vom Bot-Scan bleiben in derselben
+# Größenordnung wie dessen eigene 15, kein neues Rate-Limit-Risiko
+# gegenüber dem bereits produktiv laufenden Muster.
+_SECTOR_SCAN_MAX_WORKERS = 10
+# Modul-weit EINMAL angelegt (nicht pro Request) - siehe Docstring oben,
+# das ist der eigentliche Fix für die Mehrnutzer-Überlastung.
+_sector_scan_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_SECTOR_SCAN_MAX_WORKERS)
+
+
 def sector_recommendation(sector_query: str) -> dict:
     """
     Top 5 aus LONG_WATCHLIST (383 Ticker, siehe Konzept-Dokument-Korrektur)
@@ -253,6 +327,13 @@ def sector_recommendation(sector_query: str) -> dict:
     Feature 1, aber bereits auf die SEKTOR-ANFRAGE SELBST angewendet -
     "Pharma" zeigt den Warnhinweis schon bevor überhaupt Kandidaten
     zurückkommen.
+
+    Parallelisiert über get_analysis() + den geteilten _sector_scan_executor
+    (siehe _SECTOR_SCAN_MAX_WORKERS-Docstring oben) - jeder Aufruf nutzt
+    weiterhin zuerst den bestehenden _ANALYSIS_CACHE, nur tatsächlich
+    nötige Live-Abrufe laufen parallel statt sequenziell, UND teilen sich
+    den Pool mit etwaigen gleichzeitigen anderen Sektor-Anfragen statt
+    jeweils eigene zusätzliche Worker aufzumachen.
     """
     sector_query = (sector_query or "").strip()
     if not sector_query:
@@ -260,12 +341,23 @@ def sector_recommendation(sector_query: str) -> dict:
 
     query_blacklist_flag = shared_scoring.is_sector_blacklisted(sector_query, sector_query)
 
-    candidates = []
-    q_lower = sector_query.lower()
-    for ticker in LONG_WATCHLIST:
+    def _safe_analysis(ticker: str) -> dict | None:
         try:
-            analysis = get_analysis(ticker)
+            return get_analysis(ticker)
         except ActiveTradingError:
+            return None
+
+    q_lower = sector_query.lower()
+    candidates = []
+    futures = {_sector_scan_executor.submit(_safe_analysis, ticker): ticker for ticker in LONG_WATCHLIST}
+    for future in concurrent.futures.as_completed(futures):
+        ticker = futures[future]
+        try:
+            analysis = future.result(timeout=60)
+        except Exception as e:
+            print(f"⚠️  Sektor-Empfehlung: {ticker} übersprungen ({e}).")
+            continue
+        if analysis is None:
             continue
         sector = (analysis.get("sector") or "")
         if q_lower not in sector.lower():
