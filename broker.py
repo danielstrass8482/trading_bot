@@ -44,7 +44,7 @@ class GuardrailViolation(Exception):
         self.reason_code = reason_code
 
 
-def get_broker(user_id: int = None) -> BrokerInterface:
+def get_broker(user_id: int = None) -> BrokerInterface | None:
     """
     Broker-Factory (siehe broker_interface.py): liest bot_config.ACTIVE_BROKER
     ("alpaca"/"ibkr") und gibt die passende BrokerInterface-Implementierung
@@ -52,6 +52,28 @@ def get_broker(user_id: int = None) -> BrokerInterface:
     weiterhin das bisherige, fest auf Alpaca zugeschnittene Guardrail+DB-
     Logging übernehmen – get_broker() ist der Broker-agnostische Einstieg für
     neuen Code (z.B. künftige IBKR-Order-Platzierung, Konto-/Positionsabfragen).
+
+    KRITISCHER SICHERHEITSFIX 2026-08-14 (Fund beim Bau des Direkthandel-
+    Features, Chunk 1, 2026-08-14): hatte bisher – anders als
+    _get_alpaca_client() oben – KEINEN Schutz gegen den globalen .env-
+    Fallback für Nutzer ohne eigene verbundene Alpaca-Keys. Der Alpaca-Zweig
+    unten prüfte zwar `if user_id: ... if client: return AlpacaBroker(...)`,
+    hatte aber KEINEN else-Zweig für "user_id gesetzt, aber kein eigener
+    Client" – fiel dadurch für JEDEN unverbundenen Nutzer still auf
+    `AlpacaBroker()` mit Daniels echten .env-Keys zurück (dieselbe Bug-
+    Klasse, die _get_alpaca_client() bereits am 2026-07-31 nach einem
+    echten Leak-Vorfall bekam, siehe dortige Docstring). Fix: exakt
+    dasselbe Fail-Closed-Muster wie dort – für JEDEN ANDEREN user_id als
+    DEFAULT_USER_ID ohne eigene verbundene Keys wird jetzt None
+    zurückgegeben statt eines Fallback-Clients auf ein fremdes Konto.
+    Rückgabetyp entsprechend auf `BrokerInterface | None` erweitert;
+    Aufrufer MÜSSEN das None-Ergebnis behandeln (kein Kunden-eigenes Konto
+    verbunden), statt sich blind auf eine immer gültige Instanz zu
+    verlassen. Einziger bestehender Aufrufer zum Zeitpunkt dieses Fixes ist
+    active_trading.py (Direkthandel) – dessen lokaler Guard davor
+    (_resolve_broker_or_raise) ist dadurch redundant geworden und wurde
+    entsprechend vereinfacht (übersetzt jetzt nur noch None in eine klare
+    Fehlermeldung, prüft nicht mehr selbst vor).
     """
     from broker_alpaca import AlpacaBroker
     from broker_ibkr import IBKRBroker
@@ -62,11 +84,15 @@ def get_broker(user_id: int = None) -> BrokerInterface:
     if broker_type == "ibkr":
         return IBKRBroker()
 
-    # Alpaca (Standard)
-    if user_id:
+    # Alpaca (Standard) – exakt dasselbe Fail-Closed-Muster wie
+    # _get_alpaca_client() oben (siehe dortige Docstring für die volle
+    # Begründung/den ursprünglichen Sicherheitsvorfall).
+    if user_id is not None:
         client = get_alpaca_api_for_user(user_id)
         if client:
             return AlpacaBroker(client=client)
+        if user_id != DEFAULT_USER_ID:
+            return None
     return AlpacaBroker()
 
 

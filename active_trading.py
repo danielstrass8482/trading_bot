@@ -28,7 +28,7 @@ from database import (
     get_session, ManualTrade, DEFAULT_USER_ID,
     get_manual_trade_by_id_for_user, get_manual_trade_by_client_order_id,
     get_open_manual_trades_with_sltp, get_manual_trade_history,
-    get_alpaca_api_for_user, cache_company_name,
+    cache_company_name,
 )
 from config import LONG_WATCHLIST
 
@@ -40,30 +40,22 @@ class ActiveTradingError(Exception):
 
 def _resolve_broker_or_raise(user_id: int):
     """
-    KRITISCHER FUND (2026-08-14, beim Bau dieses Chunks): get_broker(user_id)
-    hat – anders als broker._get_alpaca_client() – KEINEN Schutz gegen den
-    globalen .env-Fallback für Nutzer ohne eigene verbundene Keys. Für JEDEN
-    user_id ohne eigenen Client fällt es still auf `AlpacaBroker()` mit
-    Daniels echten .env-Keys zurück (siehe broker.get_broker()-Quelltext:
-    `if user_id: client = get_alpaca_api_for_user(user_id); if client:
-    return AlpacaBroker(client=client)` – OHNE else-Zweig, der Aufrufer
-    landet danach im `return AlpacaBroker()` darunter). Das ist exakt die
-    Bug-Klasse, die _get_alpaca_client() im Juli 2026 nach einem echten
-    Leak-Vorfall bekam (siehe dortige Docstring) – get_broker() bekam diesen
-    Schutz nie, vermutlich weil es bisher nur für schreibgeschützte/globale
-    Zwecke genutzt wurde. Direkthandel-Käufe/-Verkäufe sind echtes Geld und
-    dürfen NIEMALS über ein fremdes Konto laufen – daher hier ein expliziter
-    Guard VOR jedem get_broker()-Aufruf in diesem Modul, statt sich allein
-    auf get_broker() zu verlassen. Sollte langfristig in get_broker() selbst
-    gefixt werden (außerhalb dieses Chunks – andere bestehende Aufrufer von
-    get_broker() sind lesend/global und daher hier nicht mit untersucht).
+    broker.get_broker() ist seit dem Sicherheitsfix vom 2026-08-14 (siehe
+    dortige Docstring) selbst fail-closed: gibt None zurück statt eines
+    Fallback-Clients auf ein fremdes Konto, falls user_id != DEFAULT_USER_ID
+    keine eigenen verbundenen Alpaca-Keys hat. Der vorherige, hier lokal
+    duplizierte Vor-Check (eigener get_alpaca_api_for_user()-Aufruf VOR
+    get_broker()) ist dadurch redundant geworden und wurde entfernt – dieser
+    Wrapper übersetzt das None-Ergebnis nur noch in eine klare, kunden-
+    freundliche Fehlermeldung statt einer zweiten (identischen) DB-Abfrage.
     """
-    if user_id != DEFAULT_USER_ID and not get_alpaca_api_for_user(user_id):
+    broker_client = get_broker(user_id)
+    if broker_client is None:
         raise ActiveTradingError(
             "Kein eigenes Alpaca-Konto verbunden – bitte zuerst in den Einstellungen verbinden, "
             "bevor du im Direkthandel kaufst oder verkaufst."
         )
-    return get_broker(user_id)
+    return broker_client
 
 
 # ── Caching (ticker-basiert, NICHT nutzerbasiert – mehrere gleichzeitige ──
