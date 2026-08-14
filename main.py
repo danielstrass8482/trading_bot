@@ -35,6 +35,7 @@ from broker import (
     sync_capital_flows, calculate_quantity,
 )
 import confirm_execution
+import active_trading
 from backlook import run_backlook
 from fair_value import update_fair_value_cache, get_undervalued_tickers
 from saxo_client import get_valid_access_token
@@ -1228,6 +1229,12 @@ def run_monitoring_cycle():
         try:
             monitor_open_positions(user_id)
             check_position_consistency(user_id)
+            # Direkthandel (Chunk 1, Alpaca-only): einfache SL/TP-Prüfung für
+            # manuelle Positionen mit vom Kunden gesetzten Verkaufsgrenzen -
+            # bewusst eigene, viel schlankere Funktion statt in
+            # monitor_open_positions() verwoben (kein ATR/Trailing/Time-Exit
+            # hier), siehe active_trading.monitor_manual_positions()-Docstring.
+            active_trading.monitor_manual_positions(user_id)
         except Exception as e:
             print(f"🚨 Nutzer {user_id}: unerwarteter Fehler im Monitoring-Zyklus ({e}) – "
                   f"andere Nutzer nicht betroffen.")

@@ -23,6 +23,7 @@ from database import (
     get_capital_allocations, set_capital_allocations,
     get_loss_streak_state, CapitalFlow,
     ensure_company_name_cached,
+    get_total_capital_in_manual_trades,
 )
 from rule_engine import SignalResult
 from broker_interface import BrokerInterface
@@ -259,6 +260,53 @@ def get_effective_max_capital_total_bot_costbasis(user_id: int, real_snapshot: d
     bot_pct = allocations.get("bot", 100.0)
     real_capital_costbasis = real_snapshot["cash"] + capital_used_sum
     return round(real_capital_costbasis * bot_pct / 100, 2)
+
+
+def get_effective_max_capital_total_active_trading_costbasis(
+    user_id: int, real_snapshot: dict, manual_capital_used_sum: float
+) -> float:
+    """
+    Direkthandel-Pendant zu get_effective_max_capital_total_bot_costbasis()
+    (siehe dortige Docstring für die volle Begründung der Cost-Basis-Wahl –
+    dieselbe equity-vs-cost-basis-Bug-Klasse wie beim Bot-Kapital-Guard vom
+    2026-08-04 wird hier von Anfang an vermieden statt später nachgezogen).
+
+    Nutzt DIESELBE CapitalAllocation-Kategorie "active_trading", die
+    get_or_seed_capital_allocations() bereits seit der Kapital-Einstellungen-
+    Umstellung vom 2026-08-05 automatisch mitseedet (Rest von 100% nach
+    Abzug von "bot") – kein neuer Kategorie-Name, keine neue Migration.
+
+    Da bot_pct + active_trading_pct grundsätzlich 100 ergibt (von der API
+    validiert, siehe update_capital_allocations), teilen sich Bot und
+    Direkthandel EIN gemeinsames Gesamtkapital: eine höhere Direkthandel-
+    Zuteilung reduziert automatisch das verfügbare Bot-Budget und umgekehrt
+    – kein unabhängiger zweiter Topf. Der Kunde legt diesen Split selbst
+    über /api/capital-allocations fest.
+    """
+    allocations = get_or_seed_capital_allocations(user_id, real_snapshot["equity"])
+    active_trading_pct = allocations.get("active_trading", 0.0)
+    real_capital_costbasis = real_snapshot["cash"] + manual_capital_used_sum
+    return round(real_capital_costbasis * active_trading_pct / 100, 2)
+
+
+def get_active_trading_remaining_budget(user_id: int) -> tuple[float, float] | None:
+    """
+    Freies Direkthandel-Budget für POST /api/active/buy – Budget-Check MUSS
+    VOR jeder Order-Platzierung passieren (nicht danach), siehe active_trading.buy().
+    Gibt (effective_budget, remaining_budget) zurück, oder None falls der
+    Broker gerade nicht erreichbar ist (Aufrufer lehnt den Kauf dann mit
+    klarer Fehlermeldung ab statt zu raten).
+    """
+    real_snapshot = get_alpaca_account_snapshot(user_id)
+    if real_snapshot is None:
+        return None
+    with get_session() as session:
+        manual_capital_used_sum = get_total_capital_in_manual_trades(session, user_id)
+    effective_budget = get_effective_max_capital_total_active_trading_costbasis(
+        user_id, real_snapshot, manual_capital_used_sum
+    )
+    remaining_budget = round(effective_budget - manual_capital_used_sum, 2)
+    return effective_budget, remaining_budget
 
 
 def _user_pause_key(user_id: int) -> str:

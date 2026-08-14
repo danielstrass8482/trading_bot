@@ -28,8 +28,9 @@ from database import (
     get_trade_mode_for_user, set_capital_allocations,
     set_user_bot_config, DEFAULT_USER_CONFIG,
     USER_CONFIG_BOUNDS, USER_CONFIG_ENUM_BOUNDS, get_capital_allocations,
-    get_company_names,
+    get_company_names, get_manual_trade_history,
 )
+import active_trading
 from config import get_live_config, DEFAULT_USER_ID
 from broker import (
     get_effective_max_capital_total_bot, get_or_seed_capital_allocations,
@@ -1312,6 +1313,141 @@ def reject_pending_confirmation(pending_id: int, user_id: int = Depends(get_curr
     if pending is None:
         raise HTTPException(status_code=404, detail="Nicht gefunden")
     return _resolve_confirmation(pending, "reject")
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Direkthandel (Konzept-Dokument 2026-08-14, Build Chunk 1, Alpaca-only) -
+# manuelle, freie Aktienkäufe/-verkäufe für Kunden, unabhängig vom Bot.
+# Geschäftslogik lebt in active_trading.py (siehe dortige Docstrings),
+# hier nur die übliche protected-Router-Anbindung + Fehler-Übersetzung
+# (ActiveTradingError -> HTTPException(400), analog GuardrailViolation).
+# ════════════════════════════════════════════════════════════════════════
+
+@protected.get("/api/active/search")
+def active_search(q: str, user_id: int = Depends(get_current_user_id)):
+    try:
+        return active_trading.search_assets(q, user_id)
+    except active_trading.ActiveTradingError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@protected.get("/api/active/quote/{ticker}")
+def active_quote(ticker: str, user_id: int = Depends(get_current_user_id)):
+    try:
+        return active_trading.get_quote(ticker)
+    except active_trading.ActiveTradingError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@protected.get("/api/active/analysis/{ticker}")
+def active_analysis(ticker: str, user_id: int = Depends(get_current_user_id)):
+    try:
+        return active_trading.get_analysis(ticker)
+    except active_trading.ActiveTradingError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@protected.get("/api/active/sector-recommendation")
+def active_sector_recommendation(sector: str, user_id: int = Depends(get_current_user_id)):
+    try:
+        return active_trading.sector_recommendation(sector)
+    except active_trading.ActiveTradingError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@protected.post("/api/active/buy")
+def active_buy(body: dict, user_id: int = Depends(get_current_user_id)):
+    """
+    Body: {ticker, quantity?, notional?, client_order_id, stop_loss_price?,
+    take_profit_price?, origin?}. Genau eines von quantity/notional muss
+    gesetzt sein (siehe active_trading.buy()). client_order_id ist Pflicht -
+    Klick-Guard/Idempotenz von Anfang an, nicht nachträglich.
+    """
+    ticker = body.get("ticker")
+    client_order_id = body.get("client_order_id")
+    if not ticker or not client_order_id:
+        raise HTTPException(status_code=400, detail="ticker und client_order_id sind Pflicht.")
+
+    origin = body.get("origin", "SEARCH")
+    if origin not in ("SEARCH", "SECTOR_RECOMMENDATION"):
+        raise HTTPException(status_code=400, detail="origin muss 'SEARCH' oder 'SECTOR_RECOMMENDATION' sein.")
+
+    try:
+        trade = active_trading.buy(
+            user_id=user_id, ticker=ticker, client_order_id=client_order_id,
+            quantity=body.get("quantity"), notional=body.get("notional"),
+            stop_loss_price=body.get("stop_loss_price"), take_profit_price=body.get("take_profit_price"),
+            origin=origin,
+        )
+    except active_trading.ActiveTradingError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return _manual_trade_to_dict(trade)
+
+
+@protected.post("/api/active/sell")
+def active_sell(body: dict, user_id: int = Depends(get_current_user_id)):
+    """Body: {trade_id, client_order_id}. Ownership-Check läuft in
+    active_trading.sell() (get_manual_trade_by_id_for_user) - Pflicht,
+    kein optionaler Schritt."""
+    trade_id = body.get("trade_id")
+    client_order_id = body.get("client_order_id")
+    if not trade_id or not client_order_id:
+        raise HTTPException(status_code=400, detail="trade_id und client_order_id sind Pflicht.")
+
+    try:
+        trade = active_trading.sell(user_id=user_id, trade_id=trade_id, client_order_id=client_order_id)
+    except active_trading.ActiveTradingError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return _manual_trade_to_dict(trade)
+
+
+_MANUAL_TRADE_EXIT_GRUND = {
+    "OPEN": "Offen",
+    "CLOSED_MANUAL": "Manuell",
+    "CLOSED_SL": "Stop Loss",
+    "CLOSED_TP": "Take Profit",
+    "FAILED_ENTRY": "Kauf nie gefüllt",
+}
+
+
+def _manual_trade_to_dict(trade) -> dict:
+    return {
+        "id": trade.id, "ticker": trade.ticker, "company_name": trade.company_name,
+        "quantity": trade.quantity, "entry_price": trade.entry_price,
+        "capital_used": trade.capital_used, "status": trade.status,
+        "exit_grund": _MANUAL_TRADE_EXIT_GRUND.get(trade.status, trade.status),
+        "exit_price": trade.exit_price,
+        "closed_at": trade.closed_at.isoformat() if trade.closed_at else None,
+        "pnl_usd": trade.pnl_usd, "pnl_pct": trade.pnl_pct,
+        "broker": trade.broker, "sector": trade.sector,
+        "rule_score_at_purchase": trade.rule_score_at_purchase,
+        "blacklist_flag_at_purchase": trade.blacklist_flag_at_purchase,
+        "origin": trade.origin, "created_at": trade.created_at.isoformat(),
+        "stop_loss_price": trade.stop_loss_price, "take_profit_price": trade.take_profit_price,
+    }
+
+
+@protected.get("/api/active/manual-trades")
+def get_manual_trades(limit: int = 50, user_id: int = Depends(get_current_user_id)):
+    """Eigene Kaufhistorie (offen + geschlossen), Form analog /api/trades/history."""
+    with get_session() as session:
+        rows = get_manual_trade_history(session, user_id, limit)
+        result = [_manual_trade_to_dict(r) for r in rows]
+
+    for row in result:
+        if row["status"] == "OPEN" and row["entry_price"] is not None:
+            try:
+                current_price = active_trading.get_quote(row["ticker"])["price"]
+            except active_trading.ActiveTradingError:
+                current_price = row["entry_price"]
+            row["current_price"] = current_price
+            row["unrealized_pnl"] = round((current_price - row["entry_price"]) * row["quantity"], 2)
+            row["unrealized_pnl_pct"] = round((current_price - row["entry_price"]) / row["entry_price"] * 100, 2)
+        else:
+            row["current_price"] = None
+            row["unrealized_pnl"] = None
+            row["unrealized_pnl_pct"] = None
+    return result
 
 
 app.include_router(protected)

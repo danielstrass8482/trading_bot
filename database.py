@@ -272,6 +272,142 @@ class Trade(Base):
         return f"<Trade {self.ticker} {self.direction} {self.status} PnL={self.pnl_usd}>"
 
 
+class ManualTrade(Base):
+    """
+    Direkthandel-Feature (Konzept 2026-08-14, Build Chunk 1, Alpaca-only):
+    Kunden können hierüber manuell, frei wählbar Aktien kaufen – unabhängig
+    vom Bot. PHYSISCH getrennt von `Trade` (eigene Tabelle statt eines
+    Status-Flags), damit get_total_pnl()/get_daily_pnl() diese Zeilen NIE
+    sehen können, ohne dass irgendwo ein Filter vergessen werden könnte –
+    dieselbe Kategorie Bug (ein globales Feld, das an einer Stelle nicht
+    gefiltert wird) hat in diesem Projekt bereits mehrfach zu Datenlecks
+    zwischen Nutzern geführt (siehe scan_log/daily_log-Vorfälle).
+
+    Bewusst schlanker als `Trade`: keine ATR-Berechnung, kein Trailing-
+    State, keine status_detail-State-Machine, kein LLM-Kommentar – SL/TP
+    sind hier (anders als beim Bot) optional und vom Kunden frei als
+    ABSOLUTER Preis gewählt statt ATR-basiert berechnet, siehe
+    stop_loss_price/take_profit_price. Feldvokabular folgt trotzdem
+    bewusst `Trade` (ticker/entry_price/quantity/sector/rule_score), damit
+    ein späterer "Aktiv vs. Passiv"-Vergleich ohne Übersetzungsschicht
+    auskommt (Query-Zeit-UNION mit einem trade_kind-Diskriminator, siehe
+    Konzept-Dokument – hier nichts weiter vorzubereiten außer das
+    Vokabular nicht auseinanderlaufen zu lassen).
+
+    Saxo-Pendant (saxo_manual_trades) bewusst NICHT Teil dieses Chunks:
+    Saxo ist laut Projekt-Historie Single-Tenant (kein Kunden-eigener
+    OAuth-Connect-Flow) – ein Saxo-Kauf würde heute zwangsläufig über
+    Daniels echtes Konto laufen.
+    """
+    __tablename__ = "manual_trades"
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    # Anders als Trade.user_id (nullable, Altdaten-Backfill) bewusst NOT
+    # NULL – diese Tabelle ist neu, jede Zeile kennt ihren Besitzer von
+    # Anfang an. Kein FK-Constraint (pos_users lebt in einer anderen DB/
+    # einem anderen Service, portfolio_os), gleiches Muster wie Trade.user_id.
+    user_id        = Column(Integer, nullable=False)
+    created_at     = Column(DateTime, default=datetime.utcnow)
+    ticker         = Column(String(10), nullable=False)
+    company_name   = Column(String(200), nullable=True)  # Snapshot zum Kaufzeitpunkt, Anzeige ohne Re-Fetch
+    quantity       = Column(Float, nullable=False)        # Fractional erlaubt (Alpaca-Konvention)
+    # Nullable bis Fill bestätigt – analog Trade.entry_price (kein
+    # geratener Preis wird je als "der" Einstiegspreis übernommen).
+    entry_price    = Column(Float, nullable=True)
+    capital_used   = Column(Float, nullable=False)
+    # OPEN / CLOSED_MANUAL / CLOSED_SL / CLOSED_TP / FAILED_ENTRY – bewusst
+    # KEIN CLOSED_TRAILING_SL/CLOSED_TIME_EXIT wie bei Trade, da es diese
+    # Mechanik hier nicht gibt (kein Trailing, kein Time-Exit für manuelle
+    # Positionen in diesem Chunk).
+    status         = Column(String(20), default="OPEN")
+    exit_price     = Column(Float, nullable=True)
+    closed_at      = Column(DateTime, nullable=True)
+    pnl_usd        = Column(Float, nullable=True)
+    pnl_pct        = Column(Float, nullable=True)
+    broker         = Column(String(20), default="alpaca")  # fix "alpaca" in diesem Chunk, Spalte nur für Schema-Symmetrie
+    sector         = Column(String(50), nullable=True)     # yfinance-Sektor zum Kaufzeitpunkt
+    # Score aus /api/active/analysis zum Kaufzeitpunkt, rein informativ –
+    # steuert NICHTS (kein Gate), dient nur der späteren Auswertung "hätte
+    # der Bot das genommen?".
+    rule_score_at_purchase      = Column(Integer, nullable=True)
+    # Branchen-Key aus trading_shared.scoring.BLACKLIST_MAPPING (z.B.
+    # "pharma"), falls beim Kauf ein Warnhinweis stand – nicht blockierend,
+    # nur geloggt für "X% des Direkthandel-Kapitals liegt in vom Bot
+    # ausgeschlossenen Branchen".
+    blacklist_flag_at_purchase  = Column(String(20), nullable=True)
+    origin         = Column(String(30), nullable=False)  # "SEARCH" / "SECTOR_RECOMMENDATION"
+    # Idempotenz-Key für den KAUF – Pflicht (nicht nullable), UNIQUE erzwingt
+    # auf DB-Ebene, dass ein doppelter Request (Doppel-Klick/Netzwerk-Retry
+    # mit demselben Key) nie zu zwei Zeilen führt, selbst wenn der
+    # Advisory-Lock (siehe broker._user_trade_guardrail_lock) aus irgendeinem
+    # Grund nicht greifen sollte – Verteidigung in der Tiefe, dieses Projekt
+    # hatte bereits mehrfach echte Mehrfach-Ausführungs-Vorfälle dieser Form.
+    client_order_id = Column(String(64), nullable=False, unique=True)
+    # Vom Kunden frei gewählte, ABSOLUTE Verkaufsgrenzen (kein ATR, keine
+    # automatische Berechnung) – optional, beide oder keine gesetzt.
+    # broker.monitor_manual_positions() prüft offene Positionen mit
+    # gesetzten Werten im bestehenden 5-Minuten-Monitoring-Loop.
+    stop_loss_price   = Column(Float, nullable=True)
+    take_profit_price = Column(Float, nullable=True)
+    # Idempotenz-Key für den VERKAUF – separat vom Kauf-Key, da eine
+    # Position genau einmal gekauft, aber (nach einem fehlgeschlagenen
+    # ersten Verkaufsversuch) potenziell mehrfach mit unterschiedlichen
+    # Requests verkauft werden könnte. Nullable (nur gesetzt sobald
+    # tatsächlich ein Verkauf versucht wurde), UNIQUE aus demselben Grund
+    # wie client_order_id oben. Nicht Teil der ursprünglichen Schema-Liste,
+    # aber nötig um dieselbe "Klick-Guard/Idempotenz von Anfang an"-Vorgabe
+    # auch für POST /api/active/sell einzuhalten (das laut Aufgabe ebenfalls
+    # einen client_order_id im Request-Body trägt).
+    sell_client_order_id = Column(String(64), nullable=True, unique=True)
+
+    def __repr__(self):
+        return f"<ManualTrade {self.ticker} {self.status} user={self.user_id}>"
+
+
+def get_manual_trade_by_id_for_user(session: Session, trade_id: int, user_id: int) -> ManualTrade | None:
+    """Ownership-gescopte Lookup, analog confirm_execution.get_pending_by_id_for_user
+    – Pflicht vor jeder Aktion auf einem manual_trades-Datensatz (siehe
+    Sicherheitsvorfälle in der Projekt-Historie zu genau dieser Bug-Klasse)."""
+    return session.query(ManualTrade).filter_by(id=trade_id, user_id=user_id).first()
+
+
+def get_manual_trade_by_client_order_id(session: Session, user_id: int, client_order_id: str) -> ManualTrade | None:
+    """Idempotenz-Lookup für POST /api/active/buy – client_order_id ist global
+    UNIQUE (siehe Spalte), user_id hier nur als zusätzliche defensive Prüfung."""
+    return session.query(ManualTrade).filter_by(client_order_id=client_order_id, user_id=user_id).first()
+
+
+def get_open_manual_trades(session: Session, user_id: int = DEFAULT_USER_ID) -> list[ManualTrade]:
+    return session.query(ManualTrade).filter_by(status="OPEN", user_id=user_id).all()
+
+
+def get_open_manual_trades_with_sltp(session: Session, user_id: int = DEFAULT_USER_ID) -> list[ManualTrade]:
+    """Für broker.monitor_manual_positions() – nur Positionen mit mindestens
+    einer gesetzten Verkaufsgrenze müssen im Monitoring-Loop überhaupt
+    geprüft werden."""
+    return session.query(ManualTrade).filter(
+        ManualTrade.status == "OPEN",
+        ManualTrade.user_id == user_id,
+        (ManualTrade.stop_loss_price.isnot(None)) | (ManualTrade.take_profit_price.isnot(None)),
+    ).all()
+
+
+def get_total_capital_in_manual_trades(session: Session, user_id: int = DEFAULT_USER_ID) -> float:
+    """Gesamtkapital aktuell in offenen manuellen Positionen gebunden – Pendant
+    zu get_total_capital_in_trades(), für den Active-Trading-Budget-Check
+    (broker.get_effective_max_capital_total_active_trading_costbasis)."""
+    result = session.query(func.sum(ManualTrade.capital_used)).filter_by(status="OPEN", user_id=user_id).scalar()
+    return result or 0.0
+
+
+def get_manual_trade_history(session: Session, user_id: int = DEFAULT_USER_ID, limit: int = 50) -> list[ManualTrade]:
+    """Eigene Kaufhistorie (offen + geschlossen) für GET /api/active/manual-trades,
+    Form analog get_trade_history()."""
+    return session.query(ManualTrade).filter_by(user_id=user_id).order_by(
+        ManualTrade.created_at.desc()
+    ).limit(limit).all()
+
+
 class PostExitTracking(Base):
     """
     Schwellenwert-Wirksamkeitsprüfung (siehe post_exit_tracking.py): verfolgt
