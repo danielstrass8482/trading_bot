@@ -400,12 +400,19 @@ def get_total_capital_in_manual_trades(session: Session, user_id: int = DEFAULT_
     return result or 0.0
 
 
-def get_manual_trade_history(session: Session, user_id: int = DEFAULT_USER_ID, limit: int = 50) -> list[ManualTrade]:
+def get_manual_trade_history(
+    session: Session, user_id: int = DEFAULT_USER_ID, limit: int = 50, all_time: bool = False
+) -> list[ManualTrade]:
     """Eigene Kaufhistorie (offen + geschlossen) für GET /api/active/manual-trades,
-    Form analog get_trade_history()."""
-    return session.query(ManualTrade).filter_by(user_id=user_id).order_by(
+    Form analog get_trade_history(). `all_time` (Fix 2026-08-18, Parität zu
+    trading_api.get_trade_history): liefert ungekappt, für die KPI-Aggregation
+    in Performance.tsx getrennt von der limitierten Tabellen-Anzeige."""
+    query = session.query(ManualTrade).filter_by(user_id=user_id).order_by(
         ManualTrade.created_at.desc()
-    ).limit(limit).all()
+    )
+    if not all_time:
+        query = query.limit(limit)
+    return query.all()
 
 
 class PostExitTracking(Base):

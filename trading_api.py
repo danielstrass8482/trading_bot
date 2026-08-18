@@ -636,7 +636,7 @@ def _parse_json_field(raw, default):
 
 
 @protected.get("/api/trades/history")
-def get_trade_history(limit: int = 50, user_id: int = Depends(get_current_user_id)):
+def get_trade_history(limit: int = 50, all_time: bool = False, user_id: int = Depends(get_current_user_id)):
     """
     Alle Positionen (offen + geschlossen) für die Handelshistorie-Ansicht,
     NUR des eingeloggten Nutzers (Fix 2026-07-31 – vorher komplett
@@ -652,9 +652,29 @@ def get_trade_history(limit: int = 50, user_id: int = Depends(get_current_user_i
     – hier NICHT angefasst). Für OPEN-Trades kommen current_price/
     unrealized_pnl/unrealized_pnl_pct als zusätzliche, separate Felder dazu
     (analog zu get_overview()'s open_trades-Anreicherung).
+
+    `all_time` (Fix 2026-08-18, Folgeauftrag "combined-Werte ohne Saxo" +
+    "KPI-Limit-Lücke"): `limit` ist reines UI-Pagination-Anliegen für die
+    sichtbare Tabelle in Performance.tsx - die KPI-Summen (Trades gesamt,
+    Trefferquote, Ø P&L, bester/schlechtester Trade, realisierter/
+    unrealisierter P&L) wurden bisher aus GENAU DIESER limitierten Liste
+    berechnet, wodurch Nutzer mit >50 Trades insgesamt (offen+geschlossen
+    zusammen, da das Limit VOR dem Status-Split greift) ältere realisierte
+    Trades unbemerkt aus den KPI-Summen verloren. `all_time=true` liefert
+    dieselbe Zeilenform OHNE Limit, ausschließlich für die Aggregation im
+    Frontend gedacht (Performance.tsx ruft diesen Endpoint zusätzlich mit
+    `all_time=true` auf, getrennt vom limit=50-Aufruf für die Tabellenzeilen
+    - siehe dortigen Kommentar). Kein Skalierungsproblem: nur CLOSED-Trades
+    wachsen unbegrenzt, die brauchen keinen current_price/yfinance-Call
+    unten (nur OPEN-Trades tun das, deren Anzahl durch MAX_OPEN_POSITIONS
+    strukturell klein bleibt).
     """
+    limit_clause = "" if all_time else "LIMIT :limit"
+    params = {"user_id": user_id}
+    if not all_time:
+        params["limit"] = limit
     with get_session() as session:
-        rows = session.execute(text("""
+        rows = session.execute(text(f"""
             SELECT
                 ticker, direction, quantity,
                 entry_price, exit_price,
@@ -678,8 +698,8 @@ def get_trade_history(limit: int = 50, user_id: int = Depends(get_current_user_i
             FROM trades
             WHERE status != 'PENDING' AND user_id = :user_id
             ORDER BY created_at DESC
-            LIMIT :limit
-        """), {"limit": limit, "user_id": user_id}).fetchall()
+            {limit_clause}
+        """), params).fetchall()
 
         result = []
         for r in rows:
@@ -1428,10 +1448,12 @@ def _manual_trade_to_dict(trade) -> dict:
 
 
 @protected.get("/api/active/manual-trades")
-def get_manual_trades(limit: int = 50, user_id: int = Depends(get_current_user_id)):
-    """Eigene Kaufhistorie (offen + geschlossen), Form analog /api/trades/history."""
+def get_manual_trades(limit: int = 50, all_time: bool = False, user_id: int = Depends(get_current_user_id)):
+    """Eigene Kaufhistorie (offen + geschlossen), Form analog /api/trades/history.
+    `all_time` (Fix 2026-08-18): siehe get_trade_history()-Docstring, gleiche
+    Entkopplung Anzeige-Limit vs. KPI-Vollständigkeit."""
     with get_session() as session:
-        rows = get_manual_trade_history(session, user_id, limit)
+        rows = get_manual_trade_history(session, user_id, limit, all_time)
         result = [_manual_trade_to_dict(r) for r in rows]
 
     for row in result:
