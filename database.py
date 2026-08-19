@@ -241,6 +241,15 @@ class Trade(Base):
     # der Entry-Seite (Fix 2026-07-31) – dient dort als Diskriminator gegen
     # das Exit-Pendant (siehe status_detail-Docstring oben).
     pending_exit_reason     = Column(String(30), nullable=True)
+    # Freitext-Vermerk zum tatsächlichen Exit-Grund, zusätzlich zum
+    # maschinenlesbaren `status` (2026-08-18, Diagnose Trade #133/AVB) - für
+    # Fälle, die keiner der festen CLOSED_STATUSES-Kategorien entsprechen
+    # (z.B. Broker-seitige Corporate Actions/Merger), aber trotzdem eine
+    # nachvollziehbare Begründung brauchen. `status` bleibt in diesen Fällen
+    # der nächstpassende bestehende Wert (z.B. CLOSED_MANUAL) - exit_reason
+    # ergänzt nur die menschenlesbare Erklärung, ersetzt keine bestehende
+    # Spalte und wird von keiner Bot-Logik gelesen (rein informativ).
+    exit_reason             = Column(Text, nullable=True)
 
     def get_llm_risks(self) -> list:
         """Deserialisiert llm_risks JSON-String zu Liste."""
@@ -1180,6 +1189,7 @@ def init_db():
     _migrate_trades_time_exit_grace_columns()
     _migrate_trades_trailing_lock_columns()
     _migrate_trades_status_column_width()
+    _migrate_trades_exit_reason_column()
     _migrate_daily_log_user_id_column()
     _migrate_daily_log_formula_version_column()
     _migrate_daily_position_snapshot_user_id_column()
@@ -1327,6 +1337,18 @@ def _migrate_trades_state_machine_columns():
         conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS status_detail VARCHAR(20)"))
         conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS pending_client_order_id VARCHAR(64)"))
         conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS pending_exit_reason VARCHAR(30)"))
+
+
+def _migrate_trades_exit_reason_column():
+    """
+    exit_reason (Freitext, siehe Trade-Klasse) kam nachträglich zur trades-
+    Tabelle dazu (2026-08-18, Diagnose Trade #133/AVB-Merger) - idempotentes
+    ALTER TABLE ... ADD COLUMN IF NOT EXISTS wie bei allen anderen additiven
+    Migrationen hier.
+    """
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_reason TEXT"))
 
 
 def _migrate_scan_log_regime_column():
