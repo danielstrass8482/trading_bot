@@ -37,6 +37,7 @@ from broker import (
     CAPITAL_ALLOCATION_CATEGORIES,
     get_portfolio_value, get_alpaca_account_snapshot, count_trading_days,
     get_pause_status, place_trade, GuardrailViolation,
+    get_active_trading_remaining_budget,
 )
 from rule_engine import get_market_regime, SignalResult
 import confirm_execution
@@ -1470,6 +1471,19 @@ def get_manual_trades(limit: int = 50, all_time: bool = False, user_id: int = De
             row["unrealized_pnl"] = None
             row["unrealized_pnl_pct"] = None
     return result
+
+
+@protected.get("/api/active/budget")
+def get_active_trading_budget(user_id: int = Depends(get_current_user_id)):
+    """Verfügbares Direkthandel-Restbudget für die Übersicht-Kachel - liest
+    dieselbe Formel, gegen die active_trading.buy() bereits VOR jeder Order
+    prüft (siehe get_active_trading_remaining_budget()), keine eigene
+    Neuberechnung im Frontend."""
+    budget = get_active_trading_remaining_budget(user_id)
+    if budget is None:
+        raise HTTPException(status_code=503, detail="Kontostand aktuell nicht abrufbar.")
+    effective_budget, remaining_budget = budget
+    return {"effective_budget": effective_budget, "remaining_budget": remaining_budget}
 
 
 app.include_router(protected)
