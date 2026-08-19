@@ -250,6 +250,16 @@ class Trade(Base):
     # ergänzt nur die menschenlesbare Erklärung, ersetzt keine bestehende
     # Spalte und wird von keiner Bot-Logik gelesen (rein informativ).
     exit_reason             = Column(Text, nullable=True)
+    # Kommissionslücke-Diagnose 2026-08-19 (Saxo-Pendant siehe
+    # trading_bot_saxo/database.py::SaxoTrade): Alpaca berechnet nach
+    # aktuellem Kontostand KEINE Kommissionen (anders als Saxo) - diese
+    # Spalten existieren NUR für Schema-/Anzeige-Parität, damit die
+    # "Gebühren"-Kachel in Uebersicht.tsx bei allen Brokern gleich aussieht,
+    # und bleiben dauerhaft 0.0 (Column-Default), bis Alpaca (anderer
+    # Kontotyp/Broker-Wechsel) tatsächlich Kosten berechnet - kein
+    # Insert-/Update-Code in broker.py setzt sie explizit.
+    entry_commission_usd    = Column(Float, nullable=True, default=0.0)
+    exit_commission_usd     = Column(Float, nullable=True, default=0.0)
 
     def get_llm_risks(self) -> list:
         """Deserialisiert llm_risks JSON-String zu Liste."""
@@ -344,6 +354,11 @@ class ManualTrade(Base):
     # nur geloggt für "X% des Direkthandel-Kapitals liegt in vom Bot
     # ausgeschlossenen Branchen".
     blacklist_flag_at_purchase  = Column(String(20), nullable=True)
+    # Kommissionslücke-Diagnose 2026-08-19, Schema-Parität zu Trade (siehe
+    # dortigen Kommentar) - Direkthandel läuft über denselben Alpaca-Broker,
+    # bleibt also aus demselben Grund dauerhaft 0.0.
+    entry_commission_usd    = Column(Float, nullable=True, default=0.0)
+    exit_commission_usd     = Column(Float, nullable=True, default=0.0)
     origin         = Column(String(30), nullable=False)  # "SEARCH" / "SECTOR_RECOMMENDATION"
     # Idempotenz-Key für den KAUF – Pflicht (nicht nullable), UNIQUE erzwingt
     # auf DB-Ebene, dass ein doppelter Request (Doppel-Klick/Netzwerk-Retry
@@ -1190,6 +1205,7 @@ def init_db():
     _migrate_trades_trailing_lock_columns()
     _migrate_trades_status_column_width()
     _migrate_trades_exit_reason_column()
+    _migrate_commission_columns()
     _migrate_daily_log_user_id_column()
     _migrate_daily_log_formula_version_column()
     _migrate_daily_position_snapshot_user_id_column()
@@ -1349,6 +1365,21 @@ def _migrate_trades_exit_reason_column():
     from sqlalchemy import text
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_reason TEXT"))
+
+
+def _migrate_commission_columns():
+    """entry_commission_usd/exit_commission_usd (siehe Trade/ManualTrade-
+    Klassen, Kommissionslücke-Diagnose 2026-08-19, Saxo-Pendant siehe
+    trading_bot_saxo::_migrate_saxo_trades_commission_columns) - idempotentes
+    ADD COLUMN IF NOT EXISTS wie bei allen anderen additiven Migrationen hier.
+    Bleiben dauerhaft 0.0 (Alpaca berechnet keine Kommissionen, siehe
+    Modell-Kommentare) - reine Schema-/Anzeige-Parität."""
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry_commission_usd FLOAT DEFAULT 0.0"))
+        conn.execute(text("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_commission_usd FLOAT DEFAULT 0.0"))
+        conn.execute(text("ALTER TABLE manual_trades ADD COLUMN IF NOT EXISTS entry_commission_usd FLOAT DEFAULT 0.0"))
+        conn.execute(text("ALTER TABLE manual_trades ADD COLUMN IF NOT EXISTS exit_commission_usd FLOAT DEFAULT 0.0"))
 
 
 def _migrate_scan_log_regime_column():

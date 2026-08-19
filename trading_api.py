@@ -447,6 +447,21 @@ def get_overview(user_id: int = Depends(get_current_user_id)):
                     'CLOSED_MANUAL')
             """), {"user_id": user_id}).scalar() or 0)
 
+        # Gebühren-Kachel (Kommissionslücke-Diagnose 2026-08-19, Saxo-Pendant
+        # siehe trading_bot_saxo/database.py::get_total_fees_eur) - bewusst
+        # über ALLE Status (auch OPEN), nicht nur die geschlossenen wie
+        # realized_pnl oben: Entry-Kommission fällt bereits beim Kauf an,
+        # unabhängig vom aktuellen Status. Bleibt für Alpaca dauerhaft 0
+        # (siehe Trade.entry_commission_usd-Kommentar), reale SUM() statt
+        # hartkodierter 0.0 - falls Alpaca künftig Kosten berechnet, greift
+        # die Kachel ohne Codeänderung.
+        fees_usd = float(
+            session.execute(text("""
+                SELECT COALESCE(SUM(COALESCE(entry_commission_usd, 0) + COALESCE(exit_commission_usd, 0)), 0)
+                FROM trades
+                WHERE user_id = :user_id
+            """), {"user_id": user_id}).scalar() or 0)
+
         # Tages-Trades – über den existierenden Helper statt eigener Raw-SQL,
         # damit die Definition ("heute erstellte Trades, OPEN + CLOSED")
         # exakt mit main.py/dashboard.py übereinstimmt. user_id durchreichen
@@ -558,6 +573,7 @@ def get_overview(user_id: int = Depends(get_current_user_id)):
         "long_market_value": long_market_value,
         "unrealized_pnl": unrealized_pnl_total,
         "realized_pnl": realized_pnl,
+        "fees_usd": fees_usd,
         "open_trades": open_trades_out,
         "daily_trades": daily_trades,
         "max_trades_per_day": int(config.get("MAX_TRADES_PER_DAY", 5)),
@@ -1445,6 +1461,10 @@ def _manual_trade_to_dict(trade) -> dict:
         "blacklist_flag_at_purchase": trade.blacklist_flag_at_purchase,
         "origin": trade.origin, "created_at": trade.created_at.isoformat(),
         "stop_loss_price": trade.stop_loss_price, "take_profit_price": trade.take_profit_price,
+        # Gebühren-Kachel-Parität (Kommissionslücke-Diagnose 2026-08-19) -
+        # bleibt 0.0, siehe ManualTrade.entry_commission_usd-Kommentar.
+        "entry_commission_usd": trade.entry_commission_usd or 0.0,
+        "exit_commission_usd": trade.exit_commission_usd or 0.0,
     }
 
 
