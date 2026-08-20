@@ -903,13 +903,23 @@ def _place_trade_locked(signal: SignalResult, llm_result: dict, user_id: int = D
         else:
             try:
                 if is_whole_share:
+                    # Fix 2026-08-20 (Diagnose AEO/APTV/Trade #121): "day" statt
+                    # "gtc" ließ die broker-seitigen SL/TP-Legs bereits am ersten
+                    # Handelsschluss nach Entry verfallen (expired/canceled) -
+                    # die Position lief danach ungeschützt, bis der 5-Min-
+                    # Software-Monitor irgendwann reagierte. alpaca-trade-api
+                    # kennt pro Bracket-Order nur EIN time_in_force (kein
+                    # separates Feld in den stop_loss/take_profit-Dicts, siehe
+                    # rest.py:submit_order) - die Legs erben zwingend denselben
+                    # Wert wie die Parent-Order, ein GTC auf der Parent-Order
+                    # macht die Legs also automatisch GTC mit.
                     order, client_order_id = _submit_order_idempotent(
                         client, signal.ticker, user_id,
                         symbol=signal.ticker,
                         qty=int(quantity),
                         side="buy",
                         type="market",
-                        time_in_force="day",
+                        time_in_force="gtc",
                         order_class="bracket",
                         stop_loss={"stop_price": sl_price},
                         take_profit={"limit_price": tp_price},
