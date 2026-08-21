@@ -512,6 +512,22 @@ def get_overview(user_id: int = Depends(get_current_user_id)):
     # Frontend, siehe Positions-Karten in Uebersicht.tsx) – analog zu
     # broker.get_portfolio_value()s Unrealisiert-Schleife, hier zusätzlich
     # pro Ticker statt nur aggregiert zurückgegeben.
+    #
+    # Fix 2026-08-21 (Diagnose "Alpaca UNREALISIERT-Diskrepanz"): current_price
+    # kam hier bisher von yfinance (yf.Ticker(...).fast_info), während die
+    # GESAMT-Kachel (unrealized_pnl_total oben) bereits Alpacas eigenen,
+    # live Broker-Preis nutzte (get_alpaca_account_snapshot) - zwei Quellen
+    # für dieselbe Kennzahl, live verifiziert bis zu 6,60$ Abweichung pro
+    # Position (v.a. im Pre-Market, wo yfinance spürbar hinterherhinkt).
+    # positions_by_symbol kommt aus DEMSELBEN list_positions()-Call, den
+    # get_alpaca_account_snapshot() oben ohnehin schon macht - kein
+    # zusätzlicher API-Call. yfinance bewusst KOMPLETT entfernt (nicht nur
+    # als Fallback), sonst schleicht sich die alte Diskrepanz bei jedem
+    # Alpaca-API-Hänger wieder ein; ohne Snapshot (Alpaca down) bleibt
+    # current_price=entry_price (0 Unrealisiert) - dieselbe Verhaltensweise,
+    # die der alte except-Zweig unten schon für einen fehlgeschlagenen
+    # Preis-Call hatte, hier nur konsistent auf "keine Live-Daten" gezogen.
+    positions_by_symbol = alpaca_account["positions_by_symbol"] if alpaca_account else {}
     open_trades_out = []
     for t in open_trades:
         row = dict(t._mapping)
@@ -524,10 +540,7 @@ def get_overview(user_id: int = Depends(get_current_user_id)):
             row["unrealized_pnl"] = None
             row["unrealized_pnl_pct"] = None
         else:
-            try:
-                current_price = float(yf.Ticker(row["ticker"]).fast_info.get("lastPrice", row["entry_price"]))
-            except Exception:
-                current_price = row["entry_price"]
+            current_price = positions_by_symbol.get(row["ticker"], row["entry_price"])
             row["current_price"] = current_price
             row["unrealized_pnl"] = round((current_price - row["entry_price"]) * row["quantity"], 2)
             row["unrealized_pnl_pct"] = round((current_price - row["entry_price"]) / row["entry_price"] * 100, 2) if row["entry_price"] else 0
@@ -1472,17 +1485,28 @@ def _manual_trade_to_dict(trade) -> dict:
 def get_manual_trades(limit: int = 50, all_time: bool = False, user_id: int = Depends(get_current_user_id)):
     """Eigene Kaufhistorie (offen + geschlossen), Form analog /api/trades/history.
     `all_time` (Fix 2026-08-18): siehe get_trade_history()-Docstring, gleiche
-    Entkopplung Anzeige-Limit vs. KPI-Vollständigkeit."""
+    Entkopplung Anzeige-Limit vs. KPI-Vollständigkeit.
+
+    Fix 2026-08-21 (Direkthandel-Parität zur get_overview()-Diagnose "Alpaca
+    UNREALISIERT-Diskrepanz"): current_price kam hier bisher aus
+    active_trading.get_quote() -> yfinance fast_info.lastPrice (TTL-gecacht),
+    dieselbe Diskrepanzklasse wie beim Bot. Direkthandel-Positionen laufen
+    über DENSELBEN Alpaca-Account wie der Bot, daher hier derselbe
+    get_alpaca_account_snapshot()-Lookup statt yfinance für bereits offene
+    Positionen. get_quote() bleibt für Suche/Analyse/neue Käufe unverändert
+    (siehe /api/active/search, /api/active/quote/{ticker}) - dort gibt es
+    keine list_positions()-Alternative, ein noch nicht gekaufter Ticker
+    taucht dort naturgemäß nicht auf.
+    """
     with get_session() as session:
         rows = get_manual_trade_history(session, user_id, limit, all_time)
         result = [_manual_trade_to_dict(r) for r in rows]
 
+    alpaca_account = get_alpaca_account_snapshot(user_id)
+    positions_by_symbol = alpaca_account["positions_by_symbol"] if alpaca_account else {}
     for row in result:
         if row["status"] == "OPEN" and row["entry_price"] is not None:
-            try:
-                current_price = active_trading.get_quote(row["ticker"])["price"]
-            except active_trading.ActiveTradingError:
-                current_price = row["entry_price"]
+            current_price = positions_by_symbol.get(row["ticker"], row["entry_price"])
             row["current_price"] = current_price
             row["unrealized_pnl"] = round((current_price - row["entry_price"]) * row["quantity"], 2)
             row["unrealized_pnl_pct"] = round((current_price - row["entry_price"]) / row["entry_price"] * 100, 2)

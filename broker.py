@@ -142,6 +142,23 @@ def get_alpaca_account_snapshot(user_id: int = None) -> dict | None:
     und suggerierte damit mehr frei verfügbares Kapital als tatsächlich da war.
     None falls Alpaca nicht erreichbar (Aufrufer fällt dann auf
     get_portfolio_value() zurück, siehe trading_api.get_overview).
+
+    "positions_by_symbol" (Fix 2026-08-21, Diagnose "Alpaca UNREALISIERT-
+    Diskrepanz"): derselbe list_positions()-Call, den diese Funktion ohnehin
+    schon macht, zusätzlich als Symbol->Live-Preis-Lookup zurückgegeben -
+    trading_api.get_overview() nutzte für die einzelnen offenen Positionen
+    bisher yf.Ticker(...).fast_info.get("lastPrice") (yfinance, verzögert/
+    ungenau v.a. im Pre-Market - live verifiziert bis zu 6,60$ Abweichung
+    ggü. Alpacas eigenem current_price bei CB), während diese Funktion für
+    die GESAMT-Kachel bereits Alpacas EIGENEN current_price/unrealized_pl
+    nutzte - zwei Quellen für dieselbe Kennzahl. current_price (nicht
+    unrealized_pl direkt) wird durchgereicht, weil unrealized_pl pro Symbol
+    aggregiert ist (falls je ein Ticker gleichzeitig von einem Bot-Trade UND
+    einem Direkthandel-Trade gehalten würde, wäre Alpacas p.unrealized_pl
+    die KOMBINIERTE Summe, nicht die des einzelnen DB-Trades) - der Aufrufer
+    rechnet unrealized_pnl weiterhin selbst aus current_price * eigener
+    entry_price/quantity, jetzt nur mit dem richtigen Live-Preis statt
+    yfinance.
     """
     client = _get_alpaca_client(user_id)
     if not client:
@@ -159,6 +176,7 @@ def get_alpaca_account_snapshot(user_id: int = None) -> dict | None:
         "equity": float(account.equity),
         "long_market_value": float(account.long_market_value),
         "unrealized_pl": round(sum(float(p.unrealized_pl) for p in positions), 2),
+        "positions_by_symbol": {p.symbol: float(p.current_price) for p in positions},
     }
 
 
