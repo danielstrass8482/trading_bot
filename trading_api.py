@@ -695,10 +695,24 @@ def get_trade_history(limit: int = 50, all_time: bool = False, user_id: int = De
     Frontend gedacht (Performance.tsx ruft diesen Endpoint zusätzlich mit
     `all_time=true` auf, getrennt vom limit=50-Aufruf für die Tabellenzeilen
     - siehe dortigen Kommentar). Kein Skalierungsproblem: nur CLOSED-Trades
-    wachsen unbegrenzt, die brauchen keinen current_price/yfinance-Call
-    unten (nur OPEN-Trades tun das, deren Anzahl durch MAX_OPEN_POSITIONS
-    strukturell klein bleibt).
+    wachsen unbegrenzt, die brauchen keinen current_price-Call unten (nur
+    OPEN-Trades tun das, deren Anzahl durch MAX_OPEN_POSITIONS strukturell
+    klein bleibt).
+
+    Fix 2026-08-21 (Parität zur get_overview()-Diagnose "Alpaca UNREALISIERT-
+    Diskrepanz"): current_price kam hier bisher aus yfinance fast_info -
+    dieselbe Bug-Klasse, dieselbe Ursache (verzögert/ungenau v.a. im
+    Pre-Market). Jetzt derselbe get_alpaca_account_snapshot()-Lookup wie in
+    get_overview()/get_manual_trades() - EIN zusätzlicher list_positions()-
+    Call pro Request (dieser Endpoint ist ein eigener HTTP-Request,
+    unabhängig von /api/overview - es gibt nichts Bestehendes aus DIESEM
+    Request zum Wiederverwenden, ein Cache über Requests hinweg würde nur
+    neue Staleness einführen und wurde nicht verlangt). Direkthandel-Trades
+    sind NICHT Teil dieser Response (separate Tabelle/Endpoint, siehe
+    get_manual_trades() oben - dort bereits gefixt).
     """
+    alpaca_account = get_alpaca_account_snapshot(user_id)
+    positions_by_symbol = alpaca_account["positions_by_symbol"] if alpaca_account else {}
     limit_clause = "" if all_time else "LIMIT :limit"
     params = {"user_id": user_id}
     if not all_time:
@@ -737,10 +751,7 @@ def get_trade_history(limit: int = 50, all_time: bool = False, user_id: int = De
             row["llm_risks"] = _parse_json_field(row.get("llm_risks"), default=[])
             row["score_breakdown"] = _parse_json_field(row.get("score_breakdown"), default={})
             if row["status"] == "OPEN" and row["entry_price"] is not None:
-                try:
-                    current_price = float(yf.Ticker(row["ticker"]).fast_info.get("lastPrice", row["entry_price"]))
-                except Exception:
-                    current_price = row["entry_price"]
+                current_price = positions_by_symbol.get(row["ticker"], row["entry_price"])
                 row["current_price"] = current_price
                 row["unrealized_pnl"] = round((current_price - row["entry_price"]) * row["quantity"], 2)
                 row["unrealized_pnl_pct"] = (
